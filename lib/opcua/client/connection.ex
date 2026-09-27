@@ -5,7 +5,7 @@ defmodule OPCUA.Client.Connection do
   # the client switches the socket to active mode. Also the request header
   # and reply helpers the running client shares.
 
-  alias OPCUA.{SecureChannel, StatusCode, Transport}
+  alias OPCUA.{Certificate, SecureChannel, SecurityPolicy, StatusCode, Transport}
   alias OPCUA.Types
 
   @receive_buffer 65_535
@@ -22,26 +22,40 @@ defmodule OPCUA.Client.Connection do
   def receive_buffer, do: @receive_buffer
 
   @doc false
-  # Connects, says Hello and opens a secure channel.
-  def connect(url, timeout, lifetime) do
+  # Connects, says Hello and opens a secure channel. `security` has the
+  # policy and mode, and for a secure one our certificate and key and the
+  # server's certificate.
+  def connect(url, timeout, lifetime, security \\ %{policy: :none, mode: :none}) do
     with {:ok, {host, port}} <- Transport.endpoint(url),
          {:ok, socket} <-
            :gen_tcp.connect(host, port, [:binary, active: false, nodelay: true], timeout),
-         state = new(socket, url, timeout, lifetime),
+         state = new(socket, url, timeout, lifetime, security),
          :ok <-
            :gen_tcp.send(socket, Transport.frame(:hello, :final, Transport.hello(@limits, url))),
-         {:ok, limits, state} <- acknowledge(state),
-         state = %{state | channel: SecureChannel.new(limits, receive_max_message: @max_message)} do
-      open(state)
+         {:ok, limits, state} <- acknowledge(state) do
+      channel =
+        SecureChannel.new(limits,
+          receive_max_message: @max_message,
+          policy: security.policy,
+          mode: security.mode,
+          certificate: security[:certificate],
+          private_key: security[:private_key],
+          remote_certificate: security[:server_certificate]
+        )
+
+      open(%{state | channel: channel})
     end
   end
 
-  defp new(socket, url, timeout, lifetime) do
+  defp new(socket, url, timeout, lifetime, security) do
     %{
       socket: socket,
       url: url,
       timeout: timeout,
       lifetime: lifetime,
+      security: security,
+      nonce: nil,
+      server_nonce: nil,
       buffer: <<>>,
       chunks: [],
       channel: nil,
@@ -78,25 +92,43 @@ defmodule OPCUA.Client.Connection do
 
   defp open(state) do
     {id, channel} = SecureChannel.next_request_id(state.channel)
+    {request, state} = open_request(state, :issue)
 
-    with {:ok, frames, channel} <-
-           SecureChannel.encode(channel, :open, id, open_request(state, :issue)),
+    with {:ok, frames, channel} <- SecureChannel.encode(channel, :open, id, request),
          :ok <- :gen_tcp.send(state.socket, frames),
-         {:ok, %Types.OpenSecureChannelResponse{security_token: token}, state} <-
+         {:ok, %Types.OpenSecureChannelResponse{} = response, state} <-
            await(%{state | channel: channel}, id) do
-      {:ok, %{state | channel: SecureChannel.token(state.channel, token), token: token}}
+      {:ok, opened(state, response)}
     end
   end
 
   @doc false
+  # An OpenSecureChannel request, with a new nonce to derive keys from.
   def open_request(state, type) do
-    %Types.OpenSecureChannelRequest{
+    nonce = :crypto.strong_rand_bytes(SecurityPolicy.nonce_length(state.security.policy))
+
+    request = %Types.OpenSecureChannelRequest{
       request_header: header(state, 0),
       client_protocol_version: 0,
       request_type: type,
-      security_mode: :none,
-      client_nonce: "",
+      security_mode: state.security.mode,
+      client_nonce: nonce,
       requested_lifetime: state.lifetime
+    }
+
+    {request, %{state | nonce: nonce}}
+  end
+
+  @doc false
+  # The channel's new token, with keys from our nonce and the server's.
+  def opened(state, %Types.OpenSecureChannelResponse{
+        security_token: token,
+        server_nonce: server_nonce
+      }) do
+    %{
+      state
+      | channel: SecureChannel.token(state.channel, token, state.nonce, server_nonce),
+        token: token
     }
   end
 
@@ -112,57 +144,137 @@ defmodule OPCUA.Client.Connection do
       },
       endpoint_url: state.url,
       session_name: Keyword.get(opts, :session_name, "yaopcua"),
-      client_nonce: :crypto.strong_rand_bytes(32),
+      client_nonce: nonce = :crypto.strong_rand_bytes(32),
+      client_certificate: state.security[:certificate],
       requested_session_timeout: Keyword.get(opts, :session_timeout, 60_000) * 1.0,
       max_response_message_size: @max_message
     }
 
     with {:ok, created, state} <- exchange(state, create),
+         :ok <- server_signature(state, created, nonce),
          state = %{
            state
            | auth: created.authentication_token,
-             session_timeout: created.revised_session_timeout
+             session_timeout: created.revised_session_timeout,
+             server_nonce: created.server_nonce
          },
-         {:ok, token} <- identity(created.server_endpoints, Keyword.get(opts, :user, :anonymous)),
-         activate = %Types.ActivateSessionRequest{user_identity_token: token, locale_ids: ["en"]},
-         {:ok, _, state} <- exchange(state, activate) do
-      {:ok, state}
+         {:ok, token, token_signature} <-
+           identity(state, created, Keyword.get(opts, :user, :anonymous)),
+         activate = %Types.ActivateSessionRequest{
+           client_signature: client_signature(state, created),
+           user_identity_token: token,
+           user_token_signature: token_signature,
+           locale_ids: ["en"]
+         },
+         {:ok, activated, state} <- exchange(state, activate) do
+      {:ok, %{state | server_nonce: activated.server_nonce}}
     end
   end
 
-  defp identity(endpoints, user) do
-    none = SecureChannel.none()
+  # The server proves it holds its certificate's key by signing ours and our nonce.
+  defp server_signature(%{security: %{policy: :none}}, _, _), do: :ok
 
-    policies =
-      for %{security_policy_uri: ^none, user_identity_tokens: tokens} <- endpoints || [],
-          token <- tokens || [],
-          do: token
+  defp server_signature(%{security: security}, created, nonce) do
+    signature = created.server_signature && created.server_signature.signature
+    data = security.certificate <> nonce
+    key = Certificate.public_key(security.server_certificate)
 
-    case user do
-      :anonymous ->
-        policy = Enum.find(policies, &(&1.token_type == :anonymous))
-        id = if policy, do: policy.policy_id, else: "anonymous"
-        {:ok, %Types.AnonymousIdentityToken{policy_id: id}}
+    if is_binary(signature) and SecurityPolicy.verify(security.policy, data, signature, key),
+      do: :ok,
+      else: {:error, :bad_application_signature_invalid}
+  end
 
-      {name, password} ->
-        case Enum.find(policies, &(&1.token_type == :user_name)) do
+  # And we sign the server's certificate and nonce.
+  defp client_signature(%{security: %{policy: :none}}, _), do: nil
+
+  defp client_signature(%{security: security}, created) do
+    %Types.SignatureData{
+      algorithm: SecurityPolicy.signature_uri(security.policy),
+      signature:
+        SecurityPolicy.sign(
+          security.policy,
+          security.server_certificate <> created.server_nonce,
+          security.private_key
+        )
+    }
+  end
+
+  # The user token, and its signature for a certificate login.
+  defp identity(state, created, user) do
+    policy_uri = SecurityPolicy.uri(state.security.policy)
+
+    endpoint =
+      Enum.find(
+        created.server_endpoints || [],
+        &(&1.security_policy_uri == policy_uri and &1.security_mode == state.security.mode)
+      )
+
+    tokens = (endpoint && endpoint.user_identity_tokens) || []
+    server_certificate = created.server_certificate || (endpoint && endpoint.server_certificate)
+
+    # A token policy without a security policy of its own uses the channel's.
+    token_policy = fn token ->
+      case token.security_policy_uri do
+        uri when uri in [nil, ""] -> state.security.policy
+        uri -> SecurityPolicy.from_uri(uri)
+      end
+    end
+
+    case {user, Enum.find(tokens, &(&1.token_type == token_type(user)))} do
+      {:anonymous, policy} ->
+        {:ok,
+         %Types.AnonymousIdentityToken{
+           policy_id: if(policy, do: policy.policy_id, else: "anonymous")
+         }, nil}
+
+      {_, nil} ->
+        {:error, :bad_identity_token_rejected}
+
+      {{name, password}, policy} ->
+        case token_policy.(policy) do
           nil ->
-            {:error, :bad_identity_token_rejected}
+            {:error, :bad_security_policy_rejected}
 
-          %{security_policy_uri: uri} = policy when uri in [nil, "", none] ->
+          :none ->
             {:ok,
              %Types.UserNameIdentityToken{
                policy_id: policy.policy_id,
                user_name: name,
                password: password
-             }}
+             }, nil}
 
-          _ ->
-            # The server wants the password encrypted; that comes with security.
-            {:error, :bad_security_policy_rejected}
+          secure ->
+            key = Certificate.public_key(server_certificate)
+            password = SecurityPolicy.encrypt_secret(secure, password, state.server_nonce, key)
+            algorithm = SecurityPolicy.encryption_uri(secure)
+
+            {:ok,
+             %Types.UserNameIdentityToken{
+               policy_id: policy.policy_id,
+               user_name: name,
+               password: password,
+               encryption_algorithm: algorithm
+             }, nil}
         end
+
+      {{:certificate, certificate, private_key}, policy} ->
+        secure = with(:none <- token_policy.(policy), do: :basic256sha256)
+        data = server_certificate <> state.server_nonce
+
+        signature = %Types.SignatureData{
+          algorithm: SecurityPolicy.signature_uri(secure),
+          signature: SecurityPolicy.sign(secure, data, private_key)
+        }
+
+        {:ok,
+         %Types.X509IdentityToken{policy_id: policy.policy_id, certificate_data: certificate},
+         signature}
     end
   end
+
+  defp token_type(:anonymous), do: :anonymous
+  defp token_type({:certificate, _, _}), do: :certificate
+  defp token_type({_, _}), do: :user_name
 
   @doc false
   # Sends a request and waits for its response.

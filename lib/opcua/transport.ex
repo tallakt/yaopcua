@@ -38,6 +38,12 @@ defmodule OPCUA.Transport do
   # The spec's minimum buffer size, which a Hello or Acknowledge may not go below.
   @min_buffer 8192
 
+  @doc "The 8-byte header of a chunk whose body is `body_size` bytes."
+  @spec header(type, chunk, non_neg_integer) :: binary
+  def header(type, chunk, body_size) do
+    Map.fetch!(@names, type) <> <<Map.fetch!(@chunk_bytes, chunk), body_size + 8::little-32>>
+  end
+
   @doc "Wraps a chunk body in the 8-byte header."
   @spec frame(type, chunk, iodata) :: iodata
   def frame(type, chunk, body) do

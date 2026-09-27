@@ -17,8 +17,22 @@ defmodule OPCUA.Server do
   `OPCUA.Schema.version/0`. Each client connection gets its own process, so a
   misbehaving client can't disturb the others.
 
-  Only the None security policy is supported so far. Sessions live as long as
-  the connection that made them.
+  Sessions live as long as the connection that made them.
+
+  ## Security
+
+      OPCUA.Server.start_link(
+        security: [:basic256sha256, :aes256_sha256_rsa_pss],
+        certificate: OPCUA.Certificate.read("server.der"),
+        private_key: OPCUA.Certificate.read_key("server.pem"),
+        trust: [OPCUA.Certificate.read("scada.der")])
+
+  The server offers an endpoint for each policy and mode in `:security`, and
+  opens secure channels only with clients whose certificate it trusts. A
+  None channel is always allowed for clients to ask for the endpoints, but
+  sessions only on the endpoints offered. Passwords are decrypted when the
+  client encrypts them; on a None endpoint the server asks for them to be
+  encrypted with its strongest policy.
 
   ## Options
 
@@ -29,8 +43,15 @@ defmodule OPCUA.Server do
     * `:application_uri`, `:product_name` - how the server presents itself
     * `:anonymous` - whether clients may log in without a user (default true)
     * `:users` - a map of usernames to passwords, or a function of username
-      and password returning true for a valid login. Passwords arrive in
-      plain text under the None policy, so only use this on a trusted network.
+      and password returning true for a valid login
+    * `:security` - the endpoints to offer: `:none`, a policy such as
+      `:basic256sha256` (both modes), or `{policy, mode}` (default `[:none]`)
+    * `:trust` - the client certificates to trust, or `:any`; required with
+      a secure policy
+    * `:certificate`, `:private_key` - the server's own; a self-signed one is
+      made if not given, which clients must trust anew on each start
+    * `:user_certificates` - the user certificates to accept for certificate
+      logins, or `:any`
     * `:name` - to register the process
   """
 
@@ -56,7 +77,31 @@ defmodule OPCUA.Server do
   @doc "Starts the server. See the module doc for the options."
   @spec start_link(keyword) :: GenServer.on_start()
   def start_link(opts \\ []),
-    do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
+    do: GenServer.start_link(__MODULE__, check(opts), Keyword.take(opts, [:name]))
+
+  # A secure server needs a decision about which clients to trust; that
+  # mistake raises here, in the caller.
+  defp check(opts) do
+    secure = Enum.any?(security(opts), fn {policy, _} -> policy != :none end)
+
+    if secure and not Keyword.has_key?(opts, :trust) do
+      raise ArgumentError,
+            "a secure server needs :trust, the client certificates to trust (a list, or :any)"
+    end
+
+    opts
+  end
+
+  # The endpoints to offer, as {policy, mode}.
+  defp security(opts) do
+    opts
+    |> Keyword.get(:security, [:none])
+    |> Enum.flat_map(fn
+      :none -> [{:none, :none}]
+      {policy, mode} -> [{policy, mode}]
+      policy -> [{policy, :sign}, {policy, :sign_and_encrypt}]
+    end)
+  end
 
   @doc false
   def child_spec(opts),
@@ -398,6 +443,22 @@ defmodule OPCUA.Server do
       url = Keyword.get(opts, :endpoint_url, "opc.tcp://#{host}:#{port}")
       application_uri = Keyword.get(opts, :application_uri, "urn:yaopcua:server")
       space = AddressSpace.new()
+      security = security(opts)
+
+      {certificate, private_key} =
+        case {opts[:certificate], opts[:private_key]} do
+          {nil, _} ->
+            # Only made when something needs it: making an RSA key takes a moment.
+            if Enum.any?(security, &(&1 != {:none, :none})) or opts[:user_certificates],
+              do:
+                OPCUA.Certificate.self_signed(application_uri,
+                  hostnames: [List.to_string(host), "localhost"]
+                ),
+              else: {nil, nil}
+
+          pair ->
+            pair
+        end
 
       config = %{
         space: space,
@@ -411,6 +472,11 @@ defmodule OPCUA.Server do
         },
         anonymous: Keyword.get(opts, :anonymous, true),
         users: Keyword.get(opts, :users),
+        security: security,
+        certificate: certificate,
+        private_key: private_key,
+        trust: Keyword.get(opts, :trust, []),
+        user_certificates: opts[:user_certificates],
         # channel, token and subscription ids, unique across the server's connections
         ids: :atomics.new(3, signed: false),
         server: self()

@@ -1,6 +1,7 @@
 # An asyncua OPC UA server for yaopcua's interop tests. The tests start it as a
 # separate process with the port as argument; it prints "ready" once it listens
-# and exits when its stdin closes.
+# and exits when its stdin closes. With a certificate and key file as the next
+# arguments, it offers the secure policies as well as None.
 import asyncio, sys
 from asyncua import Server, ua, uamethod
 from asyncua.server.user_managers import UserManager
@@ -21,12 +22,18 @@ def multiply(parent, a, b):
     return a * b
 
 
-async def main(port):
+async def main(port, certificate=None, key=None):
     server = Server(user_manager=Users())
     await server.init()
     server.set_endpoint(f"opc.tcp://127.0.0.1:{port}/yaopcua/")
     server.set_server_name("yaopcua test server")
-    server.set_security_policy([ua.SecurityPolicyType.NoSecurity])
+
+    if certificate:
+        await server.load_certificate(certificate)
+        await server.load_private_key(key)
+        server.set_security_policy([ua.SecurityPolicyType.NoSecurity] + [p for p in ua.SecurityPolicyType if p.name.startswith(("Basic256Sha256", "Aes"))])
+    else:
+        server.set_security_policy([ua.SecurityPolicyType.NoSecurity])
     ns = await server.register_namespace("urn:yaopcua:test")
 
     plant = await server.nodes.objects.add_object(ua.NodeId("Plant", ns), ua.QualifiedName("Plant", ns))
@@ -75,4 +82,4 @@ async def main(port):
         await asyncio.get_running_loop().run_in_executor(None, sys.stdin.read)
 
 
-asyncio.run(main(int(sys.argv[1])))
+asyncio.run(main(int(sys.argv[1]), *sys.argv[2:4]))

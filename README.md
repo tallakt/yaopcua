@@ -12,8 +12,8 @@ Foundation's machine-readable definitions, not from another stack's code. It
 speaks the binary protocol over TCP only; the XML and JSON encodings are out.
 
 **Status:** a client and a server that read, write, browse, call methods,
-subscribe to value changes and events, and handle alarms, without security
-yet. Security comes next; see [the roadmap](#roadmap).
+subscribe to value changes and events, and handle alarms, over signed and
+encrypted channels. PubSub comes next; see [the roadmap](#roadmap).
 
 ## Client
 
@@ -60,7 +60,8 @@ end
 | `request/3` | sends any service request from `OPCUA.Types` |
 | `endpoints/2` | asks a server which endpoints and logins it offers, without a session |
 
-Log in with `user: {"operator", "secret"}`; anonymous is the default.
+Log in with `user: {"operator", "secret"}` or `user: {:certificate, der, key}`;
+anonymous is the default.
 
 The client keeps the session alive and renews the secure channel before it
 expires. When the connection drops it stops with `{:shutdown, reason}`, so run
@@ -128,7 +129,49 @@ Event filters take select clauses by browse path (including ConditionId) and
 where clauses with OfType, And, Or, Not, the comparisons, Between, InList and
 IsNull. Enable, Disable and AddComment work too; Confirm and shelving don't.
 
-Not yet: security, history, and sessions that outlive their connection.
+Not yet: history, and sessions that outlive their connection.
+
+## Security
+
+Both the client and the server sign, or sign and encrypt, their channels with
+the current security policies, using only OTP's `:crypto` and `:public_key`:
+
+| Policy | Name here |
+|---|---|
+| Basic256Sha256 | `:basic256sha256` |
+| Aes128_Sha256_RsaOaep | `:aes128_sha256_rsa_oaep` |
+| Aes256_Sha256_RsaPss | `:aes256_sha256_rsa_pss` |
+
+```elixir
+# once, and keep the files: peers trust a certificate, not a name
+{cert, key} = OPCUA.Certificate.self_signed("urn:plant:server", hostnames: ["plc1.local"])
+OPCUA.Certificate.write("server.der", cert)
+OPCUA.Certificate.write_key("server.pem", key)
+
+{:ok, server} = OPCUA.Server.start_link(
+  security: [:basic256sha256, :aes256_sha256_rsa_pss],
+  certificate: cert, private_key: key,
+  trust: [OPCUA.Certificate.read("scada.der")],
+  users: %{"operator" => "secret"})
+
+{:ok, client} = OPCUA.Client.start_link(
+  url: "opc.tcp://plc1.local:4840",
+  security: {:aes256_sha256_rsa_pss, :sign_and_encrypt},
+  trust: [OPCUA.Certificate.read("server.der")],
+  certificate: scada_cert, private_key: scada_key,
+  user: {"operator", "secret"})
+```
+
+| | Client | Server |
+|---|---|---|
+| Channels | the policy and mode asked for; the server's certificate must be in `:trust` | an endpoint per policy and mode in `:security`; the client's certificate must be in `:trust` |
+| Sessions | checks the server's signature, signs its own | checks the client's signature and application URI, signs its own |
+| Passwords | encrypted for the server whenever it asks, even over None | decrypted; over None it asks for its strongest policy |
+| User certificates | signs with the user's key | accepts those in `:user_certificates` |
+
+A secure client or server won't start without being told what to trust
+(`:trust`, a list of certificates or `:any`). The deprecated Basic128Rsa15 and
+Basic256 aren't supported.
 
 ## Encoding
 
@@ -206,8 +249,9 @@ a Python OPC UA stack written independently of this one, in two ways:
   yaopcua must decode each one and encode it back to the same bytes. These run
   with every `mix test`; `test/vectors/generate_asyncua.py` regenerates them.
 * The interop tests run the client against an asyncua server, and asyncua's
-  client against the server, as separate processes from `test/support/`. They
-  need a Python with asyncua, and are skipped without one:
+  client against the server, as separate processes from `test/support/`,
+  with and without every security policy and mode. They need a Python with
+  asyncua, and are skipped without one:
 
   ```
   python3 -m venv ~/.venvs/asyncua && ~/.venvs/asyncua/bin/pip install asyncua
@@ -227,7 +271,7 @@ Python only ever runs in tests, never inside yaopcua.
 | | Client: custom structures, reconnecting | Part 4 |
 | ✅ | Server: address space with namespace 0, callback variables, methods, subscriptions | Parts 3, 4, 5 |
 | ✅ | Events and alarms in the server: event filters, conditions, acknowledge, ConditionRefresh | Parts 4, 9 |
-| | Security: Basic256Sha256 and Aes128_Sha256_RsaOaep, username and certificate login, with OTP's `:crypto` and `:public_key` only | Parts 2, 6, 7 |
+| ✅ | Security: Basic256Sha256, Aes128_Sha256_RsaOaep and Aes256_Sha256_RsaPss, encrypted passwords and certificate logins, with OTP's `:crypto` and `:public_key` only | Parts 2, 4, 6, 7 |
 | | PubSub: UADP over UDP, for PLC to PLC | Part 14 |
 | | Fuzzing with [StreamData](https://github.com/whatyouhide/stream_data): random and mutated bytes into the decoder, the secure channel and the server | |
 

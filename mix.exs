@@ -14,7 +14,8 @@ defmodule OPCUA.MixProject do
 
   def application do
     [
-      extra_applications: [:logger]
+      # OTP's own crypto, for the security policies
+      extra_applications: [:logger, :crypto, :public_key]
     ]
   end
 

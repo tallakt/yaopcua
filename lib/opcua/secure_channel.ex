@@ -10,21 +10,32 @@ defmodule OPCUA.SecureChannel do
   the request id. A message bigger than the other side's buffer is split into
   chunks, and reassembled on the way in.
 
-  Only the None security policy is implemented so far: no signing, no
-  encryption.
+  With a security policy other than None (see `OPCUA.SecurityPolicy`):
+
+    * OpenSecureChannel chunks are signed with the sender's private key and
+      encrypted with the receiver's public key, whatever the mode.
+    * Other chunks are signed with HMAC-SHA256 in the `:sign` mode, and also
+      encrypted with AES-CBC in `:sign_and_encrypt`, with keys derived from the
+      nonces the two sides exchanged when they opened or renewed the channel.
   """
 
-  alias OPCUA.{Binary, NodeId, Transport}
-
-  @none "http://opcfoundation.org/UA/SecurityPolicy#None"
+  alias OPCUA.{Binary, Certificate, NodeId, SecurityPolicy, Transport}
 
   # Sequence numbers wrap to below 1024 after this (Part 6, 6.7.2.4).
   @wrap 4_294_966_271
 
-  defstruct policy_uri: @none,
+  defstruct policy: :none,
+            mode: :none,
+            # The policies a server lets a client open a channel with.
+            policies: [:none],
+            certificate: nil,
+            private_key: nil,
+            remote_certificate: nil,
             channel_id: 0,
             token_id: 0,
             previous_token_id: nil,
+            # The derived keys, by token id: %{send: keys, receive: keys}.
+            keys: %{},
             send_sequence: 0,
             receive_sequence: nil,
             request_id: 0,
@@ -41,16 +52,33 @@ defmodule OPCUA.SecureChannel do
   @type kind :: :open | :message | :close
 
   @doc "The URI of the None security policy."
-  def none, do: @none
+  def none, do: SecurityPolicy.uri(:none)
 
   @doc """
   A new channel. `limits` are what the other side said it accepts (from its
-  Hello or Acknowledge); `receive_max_message` and `receive_max_chunks` in
-  `opts` cap what we accept.
+  Hello or Acknowledge).
+
+  ## Options
+
+    * `:policy`, `:mode` - the security a client asks for
+    * `:policies` - the policies a server accepts; the client's choice is
+      learned from its first OpenSecureChannel
+    * `:certificate`, `:private_key` - our own
+    * `:remote_certificate` - the other side's, which a client knows before
+      it opens the channel
+    * `:receive_max_message`, `:receive_max_chunks` - what we accept
   """
   @spec new(Transport.limits(), keyword) :: t
   def new(limits, opts \\ []) do
+    policy = Keyword.get(opts, :policy, :none)
+
     %__MODULE__{
+      policy: policy,
+      mode: Keyword.get(opts, :mode, :none),
+      policies: Keyword.get(opts, :policies, [policy]),
+      certificate: opts[:certificate],
+      private_key: opts[:private_key],
+      remote_certificate: opts[:remote_certificate],
       send_chunk_size: limits.receive_buffer_size,
       send_max_message: limits.max_message_size,
       send_max_chunks: limits.max_chunk_count,
@@ -67,13 +95,39 @@ defmodule OPCUA.SecureChannel do
   end
 
   @doc """
-  Records the security token of an OpenSecureChannel response. A client calls
-  this with the response it received; a server with the one it sends.
+  Records the security token of an OpenSecureChannel response, and derives
+  its keys from the two nonces. A client calls this with the response it
+  received; a server with the one it sends.
   """
-  @spec token(t, OPCUA.Types.ChannelSecurityToken.t()) :: t
-  def token(channel, %{channel_id: channel_id, token_id: token_id}) do
+  @spec token(t, OPCUA.Types.ChannelSecurityToken.t(), binary | nil, binary | nil) :: t
+  def token(
+        channel,
+        %{channel_id: channel_id, token_id: token_id},
+        local_nonce \\ nil,
+        remote_nonce \\ nil
+      ) do
     previous = if channel.token_id != 0 and channel.token_id != token_id, do: channel.token_id
-    %{channel | channel_id: channel_id, token_id: token_id, previous_token_id: previous}
+
+    keys =
+      if channel.policy == :none do
+        %{}
+      else
+        # Each side sends with keys from P_SHA256(other nonce, own nonce).
+        current = %{
+          send: SecurityPolicy.derive(channel.policy, remote_nonce, local_nonce),
+          receive: SecurityPolicy.derive(channel.policy, local_nonce, remote_nonce)
+        }
+
+        channel.keys |> Map.take([channel.token_id]) |> Map.put(token_id, current)
+      end
+
+    %{
+      channel
+      | channel_id: channel_id,
+        token_id: token_id,
+        previous_token_id: previous,
+        keys: keys
+    }
   end
 
   @doc """
@@ -88,8 +142,8 @@ defmodule OPCUA.SecureChannel do
         module.encode(message)
       ])
 
-    header = security_header(channel, kind)
-    room = channel.send_chunk_size - 8 - 4 - IO.iodata_length(header) - 8
+    security = security(channel, kind)
+    room = room(channel, kind, security)
     count = max(1, div(byte_size(body) + room - 1, room))
 
     cond do
@@ -100,7 +154,7 @@ defmodule OPCUA.SecureChannel do
         {:error, too_large(kind)}
 
       true ->
-        {frames, channel} = chunks(channel, kind, header, request_id, body, room, [])
+        {frames, channel} = chunks(channel, kind, security, request_id, body, room, [])
         {:ok, frames, channel}
     end
   end
@@ -108,7 +162,39 @@ defmodule OPCUA.SecureChannel do
   defp too_large(:message), do: :bad_request_too_large
   defp too_large(_), do: :bad_encoding_limits_exceeded
 
-  defp chunks(channel, kind, header, request_id, body, room, acc) do
+  defp security(%{policy: policy}, :open) when policy != :none, do: :asymmetric
+  defp security(%{mode: mode}, kind) when kind != :open and mode != :none, do: :symmetric
+  defp security(_, _), do: :plain
+
+  # How much of a message fits in one chunk, after the headers, padding and
+  # signature, and rounded to the cipher's blocks.
+  defp room(channel, kind, :plain),
+    do: channel.send_chunk_size - 12 - IO.iodata_length(plain_header(channel, kind)) - 8
+
+  defp room(channel, _, :asymmetric) do
+    remote = Certificate.public_key(channel.remote_certificate)
+    cipher = SecurityPolicy.key_size(remote)
+    plain = SecurityPolicy.plain_block(channel.policy, remote)
+    blocks = div(channel.send_chunk_size - 12 - byte_size(asymmetric_header(channel)), cipher)
+    blocks * plain - 8 - SecurityPolicy.key_size(channel.private_key) - padding_bytes(plain)
+  end
+
+  defp room(%{mode: :sign} = channel, _, :symmetric),
+    do: channel.send_chunk_size - 16 - 8 - SecurityPolicy.symmetric_signature_size()
+
+  defp room(channel, _, :symmetric) do
+    block = SecurityPolicy.block_size()
+
+    div(channel.send_chunk_size - 16, block) * block - 8 -
+      SecurityPolicy.symmetric_signature_size() - 1
+  end
+
+  # The PaddingSize byte, and ExtraPaddingSize when a block can hold more
+  # than 256 bytes (keys over 2048 bits).
+  defp padding_bytes(plain_block) when plain_block > 256, do: 2
+  defp padding_bytes(_), do: 1
+
+  defp chunks(channel, kind, security, request_id, body, room, acc) do
     {part, rest, chunk} =
       if byte_size(body) > room,
         do:
@@ -117,32 +203,110 @@ defmodule OPCUA.SecureChannel do
         else: {body, <<>>, :final}
 
     sequence = next_sequence(channel.send_sequence)
-
-    payload = [
-      <<channel.channel_id::little-32>>,
-      header,
-      <<sequence::little-32, request_id::little-32>>,
-      part
-    ]
-
-    frame = Transport.frame(kind, chunk, payload)
+    plain = <<sequence::little-32, request_id::little-32, part::binary>>
+    frame = frame(channel, kind, chunk, security, plain)
     channel = %{channel | send_sequence: sequence}
 
     case chunk do
       :final -> {Enum.reverse([frame | acc]), channel}
-      :continued -> chunks(channel, kind, header, request_id, rest, room, [frame | acc])
+      :continued -> chunks(channel, kind, security, request_id, rest, room, [frame | acc])
     end
   end
 
-  defp security_header(channel, :open) do
+  defp frame(channel, kind, chunk, :plain, plain) do
+    Transport.frame(kind, chunk, [
+      <<channel.channel_id::little-32>>,
+      plain_header(channel, kind),
+      plain
+    ])
+  end
+
+  defp frame(channel, kind, chunk, :asymmetric, plain) do
+    remote = Certificate.public_key(channel.remote_certificate)
+    block = SecurityPolicy.plain_block(channel.policy, remote)
+    signature_size = SecurityPolicy.key_size(channel.private_key)
+    padded = pad(plain, signature_size, block)
+    security = asymmetric_header(channel)
+
+    body_size =
+      4 + byte_size(security) +
+        div(byte_size(padded) + signature_size, block) * SecurityPolicy.key_size(remote)
+
+    signed =
+      Transport.header(kind, chunk, body_size) <>
+        <<channel.channel_id::little-32>> <> security <> padded
+
+    signature = SecurityPolicy.sign(channel.policy, signed, channel.private_key)
+
     [
-      Binary.encode(channel.policy_uri, :string),
-      Binary.encode(nil, :byte_string),
-      Binary.encode(nil, :byte_string)
+      binary_part(signed, 0, 12 + byte_size(security)),
+      SecurityPolicy.encrypt(channel.policy, padded <> signature, remote)
     ]
   end
 
-  defp security_header(channel, _), do: <<channel.token_id::little-32>>
+  defp frame(channel, kind, chunk, :symmetric, plain) do
+    keys = channel.keys[channel.token_id].send
+    signature_size = SecurityPolicy.symmetric_signature_size()
+    encrypt = channel.mode == :sign_and_encrypt
+    padded = if encrypt, do: pad(plain, signature_size, SecurityPolicy.block_size()), else: plain
+
+    prefix =
+      Transport.header(kind, chunk, 8 + byte_size(padded) + signature_size) <>
+        <<channel.channel_id::little-32, channel.token_id::little-32>>
+
+    signed = padded <> SecurityPolicy.mac(keys, prefix <> padded)
+
+    [
+      prefix,
+      if(encrypt,
+        do: SecurityPolicy.encrypt_symmetric(channel.policy, keys, signed),
+        else: signed
+      )
+    ]
+  end
+
+  # Padding so that the plain text and the signature fill whole blocks: a
+  # PaddingSize byte, that many bytes of it, and the high byte after them
+  # when blocks are bigger than 256 bytes.
+  defp pad(plain, signature_size, block) do
+    extra = padding_bytes(block) - 1
+    count = rem(block - rem(byte_size(plain) + 1 + extra + signature_size, block), block)
+    low = Bitwise.band(count, 0xFF)
+    high = if extra == 1, do: <<Bitwise.bsr(count, 8)>>, else: <<>>
+    plain <> <<low>> <> :binary.copy(<<low>>, count) <> high
+  end
+
+  defp unpad(data, block) do
+    size = byte_size(data)
+
+    count =
+      if padding_bytes(block) == 2,
+        do: :binary.at(data, size - 1) * 256 + :binary.at(data, size - 2),
+        else: :binary.at(data, size - 1)
+
+    keep = size - count - padding_bytes(block)
+
+    if keep >= 8,
+      do: {:ok, binary_part(data, 0, keep)},
+      else: {:error, :bad_security_checks_failed}
+  end
+
+  defp plain_header(_channel, :open),
+    do: [
+      Binary.encode(none(), :string),
+      Binary.encode(nil, :byte_string),
+      Binary.encode(nil, :byte_string)
+    ]
+
+  defp plain_header(channel, _), do: <<channel.token_id::little-32>>
+
+  defp asymmetric_header(channel) do
+    IO.iodata_to_binary([
+      Binary.encode(SecurityPolicy.uri(channel.policy), :string),
+      Binary.encode(channel.certificate, :byte_string),
+      Binary.encode(Certificate.thumbprint(channel.remote_certificate), :byte_string)
+    ])
+  end
 
   defp next_sequence(n) when n >= @wrap, do: 1
   defp next_sequence(n), do: n + 1
@@ -153,19 +317,26 @@ defmodule OPCUA.SecureChannel do
   Returns `{:ok, channel}` while a message is incomplete, and
   `{:ok, {kind, request_id, message}, channel}` once it's whole. An aborted
   message gives `{:abort, request_id, status, reason, channel}`. Anything that
-  breaks the channel, such as a sequence number out of order, is
-  `{:error, status}`, after which the connection should be closed.
+  breaks the channel, such as a sequence number out of order or a signature
+  that doesn't verify, is `{:error, status}`, after which the connection
+  should be closed.
+
+  A server learns the client's security policy and certificate from its first
+  OpenSecureChannel; they're in `channel.policy` and
+  `channel.remote_certificate` for it to check.
   """
   @spec receive(t, {kind, Transport.chunk(), binary}) ::
           {:ok, t}
           | {:ok, {kind, non_neg_integer, struct}, t}
           | {:abort, non_neg_integer, integer, String.t() | nil, t}
           | {:error, atom}
-  def receive(channel, {kind, chunk, <<channel_id::little-32, rest::binary>>})
+  def receive(channel, {kind, chunk, <<channel_id::little-32, rest::binary>> = body})
       when kind in [:open, :message, :close] do
+    prefix = Transport.header(kind, chunk, byte_size(body)) <> <<channel_id::little-32>>
+
     with :ok <- check_channel(channel, kind, channel_id),
-         {:ok, rest} <- check_security(channel, kind, rest),
-         <<sequence::little-32, request_id::little-32, body::binary>> <- rest,
+         {:ok, channel, plain} <- unsecure(channel, kind, prefix, rest),
+         <<sequence::little-32, request_id::little-32, body::binary>> <- plain,
          :ok <- check_sequence(channel, sequence) do
       channel = %{channel | receive_sequence: sequence}
       assemble(channel, kind, chunk, request_id, body)
@@ -182,21 +353,105 @@ defmodule OPCUA.SecureChannel do
   defp check_channel(%{channel_id: id}, _, id), do: :ok
   defp check_channel(_, _, _), do: {:error, :bad_secure_channel_id_invalid}
 
-  defp check_security(channel, :open, rest) do
-    with {:ok, uri, rest} <- Binary.decode(rest, :string),
-         {:ok, _certificate, rest} <- Binary.decode(rest, :byte_string),
-         {:ok, _thumbprint, rest} <- Binary.decode(rest, :byte_string) do
-      if uri == channel.policy_uri, do: {:ok, rest}, else: {:error, :bad_security_policy_rejected}
+  defp unsecure(channel, :open, prefix, rest) do
+    with {:ok, uri, after_uri} <- Binary.decode(rest, :string),
+         {:ok, certificate, after_certificate} <- Binary.decode(after_uri, :byte_string),
+         {:ok, thumbprint, encrypted} <- Binary.decode(after_certificate, :byte_string),
+         {:ok, channel} <- accept_policy(channel, SecurityPolicy.from_uri(uri), certificate) do
+      header = binary_part(rest, 0, byte_size(rest) - byte_size(encrypted))
+
+      if channel.policy == :none,
+        do: {:ok, channel, encrypted},
+        else: open_secured(channel, prefix <> header, thumbprint, encrypted)
     end
   end
 
-  defp check_security(channel, _, <<token::little-32, rest::binary>>) do
-    if token == channel.token_id or token == channel.previous_token_id,
-      do: {:ok, rest},
-      else: {:error, :bad_secure_channel_token_unknown}
+  defp unsecure(channel, _, prefix, <<token::little-32, rest::binary>>) do
+    cond do
+      token != channel.token_id and token != channel.previous_token_id ->
+        {:error, :bad_secure_channel_token_unknown}
+
+      channel.mode == :none ->
+        {:ok, channel, rest}
+
+      true ->
+        symmetric_secured(
+          channel,
+          channel.keys[token].receive,
+          prefix <> <<token::little-32>>,
+          rest
+        )
+    end
   end
 
-  defp check_security(_, _, _), do: {:error, :bad_decoding_error}
+  defp unsecure(_, _, _, _), do: {:error, :bad_decoding_error}
+
+  # The policy must be one we accept, and stay the same when the channel is renewed.
+  defp accept_policy(channel, policy, certificate) do
+    cond do
+      policy not in channel.policies ->
+        {:error, :bad_security_policy_rejected}
+
+      channel.token_id != 0 and policy != channel.policy ->
+        {:error, :bad_security_policy_rejected}
+
+      policy == :none ->
+        {:ok, %{channel | policy: :none}}
+
+      certificate in [nil, ""] ->
+        {:error, :bad_certificate_invalid}
+
+      channel.remote_certificate not in [nil, certificate] ->
+        {:error, :bad_certificate_invalid}
+
+      true ->
+        {:ok, %{channel | policy: policy, remote_certificate: certificate}}
+    end
+  end
+
+  defp open_secured(channel, signed_prefix, thumbprint, encrypted) do
+    public_key = SecurityPolicy.public_key(channel.private_key)
+    sender = Certificate.public_key(channel.remote_certificate)
+    signature_size = SecurityPolicy.key_size(sender)
+
+    with true <-
+           thumbprint == Certificate.thumbprint(channel.certificate) ||
+             {:error, :bad_certificate_invalid},
+         {:ok, plain} <- SecurityPolicy.decrypt(channel.policy, encrypted, channel.private_key),
+         true <- byte_size(plain) > signature_size || {:error, :bad_security_checks_failed},
+         data = binary_part(plain, 0, byte_size(plain) - signature_size),
+         signature = binary_part(plain, byte_size(data), signature_size),
+         true <-
+           SecurityPolicy.verify(channel.policy, signed_prefix <> data, signature, sender) ||
+             {:error, :bad_security_checks_failed},
+         {:ok, plain} <- unpad(data, SecurityPolicy.plain_block(channel.policy, public_key)) do
+      {:ok, channel, plain}
+    end
+  rescue
+    _ -> {:error, :bad_security_checks_failed}
+  end
+
+  defp symmetric_secured(channel, keys, prefix, rest) do
+    signature_size = SecurityPolicy.symmetric_signature_size()
+    encrypted = channel.mode == :sign_and_encrypt
+
+    with {:ok, plain} <-
+           if(encrypted,
+             do: SecurityPolicy.decrypt_symmetric(channel.policy, keys, rest),
+             else: {:ok, rest}
+           ),
+         true <- byte_size(plain) > signature_size || {:error, :bad_security_checks_failed},
+         data = binary_part(plain, 0, byte_size(plain) - signature_size),
+         signature = binary_part(plain, byte_size(data), signature_size),
+         true <-
+           :crypto.hash_equals(SecurityPolicy.mac(keys, prefix <> data), signature) ||
+             {:error, :bad_security_checks_failed} do
+      if encrypted,
+        do:
+          with({:ok, data} <- unpad(data, SecurityPolicy.block_size()), do: {:ok, channel, data}),
+        else: {:ok, channel, data}
+    end
+  end
 
   defp check_sequence(%{receive_sequence: nil}, _), do: :ok
 

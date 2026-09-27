@@ -120,7 +120,15 @@ defmodule OPCUA.Server.Connection do
             max_chunk_count: hello.max_chunk_count
         }
 
-        channel = SecureChannel.new(limits, receive_max_message: @max_message)
+        channel =
+          SecureChannel.new(limits,
+            receive_max_message: @max_message,
+            # None is always allowed for the channel, so clients can ask for
+            # the endpoints; sessions check the endpoint they're made on.
+            policies: Enum.uniq([:none | Enum.map(state.config.security, &elem(&1, 0))]),
+            certificate: state.config.certificate,
+            private_key: state.config.private_key
+          )
 
         :ok =
           :gen_tcp.send(
@@ -167,13 +175,25 @@ defmodule OPCUA.Server.Connection do
 
   defp open(state, id, request) do
     renew = request.request_type == :renew
+    policy = state.channel.policy
+    offered = policy == :none or {policy, request.security_mode} in state.config.security
 
     cond do
-      request.security_mode != :none ->
-        {:halt, {:close, fail(state, :bad_security_mode_rejected)}}
-
       renew != (state.phase == :running) ->
         {:halt, {:close, fail(state, :bad_request_type_invalid)}}
+
+      not offered or (policy == :none and request.security_mode != :none) ->
+        {:halt, {:close, fail(state, :bad_security_mode_rejected)}}
+
+      renew and request.security_mode != state.channel.mode ->
+        {:halt, {:close, fail(state, :bad_security_mode_rejected)}}
+
+      policy != :none and
+          not OPCUA.Certificate.trusted?(state.channel.remote_certificate, state.config.trust) ->
+        {:halt, {:close, fail(state, :bad_certificate_untrusted)}}
+
+      byte_size(request.client_nonce || "") != OPCUA.SecurityPolicy.nonce_length(policy) ->
+        {:halt, {:close, fail(state, :bad_nonce_invalid)}}
 
       true ->
         channel_id =
@@ -188,14 +208,20 @@ defmodule OPCUA.Server.Connection do
           revised_lifetime: lifetime
         }
 
+        nonce = :crypto.strong_rand_bytes(OPCUA.SecurityPolicy.nonce_length(policy))
+
         response = %Types.OpenSecureChannelResponse{
           response_header: Services.header(request, 0),
           server_protocol_version: 0,
           security_token: token,
-          server_nonce: ""
+          server_nonce: nonce
         }
 
-        channel = SecureChannel.token(state.channel, token)
+        channel = %{
+          SecureChannel.token(state.channel, token, nonce, request.client_nonce)
+          | mode: request.security_mode
+        }
+
         # The client should renew at 75% of the lifetime; give it until 125%.
         Process.send_after(self(), {:token_expired, token.token_id}, trunc(lifetime * 1.25))
 

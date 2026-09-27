@@ -10,7 +10,20 @@ defmodule OPCUA.SecureChannelTest do
     max_message_size: 0,
     max_chunk_count: 0
   }
-  @token %Types.ChannelSecurityToken{channel_id: 7, token_id: 3, revised_lifetime: 60_000.0}
+  @token %Types.ChannelSecurityToken{channel_id: 7, token_id: 3, revised_lifetime: 60_000}
+
+  # Certificates for the security tests.
+  setup_all do
+    {client_cert, client_key} = OPCUA.Certificate.self_signed("urn:client")
+    {server_cert, server_key} = OPCUA.Certificate.self_signed("urn:server")
+
+    %{
+      client_cert: client_cert,
+      client_key: client_key,
+      server_cert: server_cert,
+      server_key: server_key
+    }
+  end
 
   # A client and a server that have exchanged an OpenSecureChannel.
   defp pair do
@@ -173,5 +186,167 @@ defmodule OPCUA.SecureChannelTest do
 
     assert SecureChannel.encode(%{client | send_max_chunks: 2}, :message, 1, read(2000)) ==
              {:error, :bad_request_too_large}
+  end
+
+  describe "security" do
+    # A client and a server that have opened a channel with this policy and
+    # mode, the way the client and server modules do it.
+    defp secure_pair(keys, policy, mode) do
+      client =
+        SecureChannel.new(@limits,
+          policy: policy,
+          mode: mode,
+          certificate: keys.client_cert,
+          private_key: keys.client_key,
+          remote_certificate: keys.server_cert
+        )
+
+      server =
+        SecureChannel.new(@limits,
+          policies: [:none, policy],
+          certificate: keys.server_cert,
+          private_key: keys.server_key
+        )
+
+      client_nonce = :crypto.strong_rand_bytes(32)
+      server_nonce = :crypto.strong_rand_bytes(32)
+
+      request = %Types.OpenSecureChannelRequest{
+        request_type: :issue,
+        security_mode: mode,
+        client_nonce: client_nonce
+      }
+
+      {:ok, frames, client} = SecureChannel.encode(client, :open, 1, request)
+      {server, {:open, 1, %{client_nonce: ^client_nonce}}} = deliver(server, chunks(frames))
+      assert server.policy == policy
+      assert server.remote_certificate == keys.client_cert
+
+      server = %{SecureChannel.token(server, @token, server_nonce, client_nonce) | mode: mode}
+
+      response = %Types.OpenSecureChannelResponse{
+        security_token: @token,
+        server_nonce: server_nonce
+      }
+
+      {:ok, frames, server} = SecureChannel.encode(server, :open, 1, response)
+      {client, {:open, 1, %{server_nonce: ^server_nonce}}} = deliver(client, chunks(frames))
+      {SecureChannel.token(client, @token, client_nonce, server_nonce), server}
+    end
+
+    for policy <- [:basic256sha256, :aes128_sha256_rsa_oaep, :aes256_sha256_rsa_pss],
+        mode <- [:sign, :sign_and_encrypt] do
+      test "#{policy} #{mode}: messages in chunks both ways", keys do
+        {client, server} = secure_pair(keys, unquote(policy), unquote(mode))
+        request = read(1500)
+        {:ok, frames, client} = SecureChannel.encode(client, :message, 2, request)
+        parts = chunks(frames)
+        assert length(parts) > 1
+        assert Enum.all?(parts, fn {_, _, body} -> byte_size(body) + 8 <= 8192 end)
+
+        {server, {:message, 2, received}} = deliver(server, parts)
+        assert received.nodes_to_read == request.nodes_to_read
+
+        {:ok, frames, _} =
+          SecureChannel.encode(server, :message, 2, %Types.ReadResponse{results: []})
+
+        assert {_, {:message, 2, %Types.ReadResponse{}}} = deliver(client, chunks(frames))
+        _ = client
+      end
+    end
+
+    test "encryption hides the body, signing alone doesn't", keys do
+      secret = "Pump1.SecretSpeed"
+
+      message = %Types.ReadRequest{
+        nodes_to_read: [
+          %Types.ReadValueId{node_id: %OPCUA.NodeId{ns: 2, id: secret}, attribute_id: 13}
+        ]
+      }
+
+      {client, _} = secure_pair(keys, :basic256sha256, :sign)
+      {:ok, frames, _} = SecureChannel.encode(client, :message, 2, message)
+      assert IO.iodata_to_binary(frames) =~ secret
+
+      {client, _} = secure_pair(keys, :basic256sha256, :sign_and_encrypt)
+      {:ok, frames, _} = SecureChannel.encode(client, :message, 2, message)
+      refute IO.iodata_to_binary(frames) =~ secret
+    end
+
+    test "a changed byte fails the signature", keys do
+      for mode <- [:sign, :sign_and_encrypt] do
+        {client, server} = secure_pair(keys, :aes256_sha256_rsa_pss, mode)
+        {:ok, frames, _} = SecureChannel.encode(client, :message, 2, read(1))
+        [{kind, chunk, body}] = chunks(frames)
+
+        flipped =
+          binary_part(body, 0, 20) <>
+            <<Bitwise.bxor(:binary.at(body, 20), 1)>> <>
+            binary_part(body, 21, byte_size(body) - 21)
+
+        assert SecureChannel.receive(server, {kind, chunk, flipped}) ==
+                 {:error, :bad_security_checks_failed}
+      end
+    end
+
+    test "an open for another certificate, or with a policy not offered, is refused", keys do
+      {other, _} = OPCUA.Certificate.self_signed("urn:other")
+
+      client =
+        SecureChannel.new(@limits,
+          policy: :basic256sha256,
+          mode: :sign,
+          certificate: keys.client_cert,
+          private_key: keys.client_key,
+          remote_certificate: other
+        )
+
+      {:ok, frames, _} =
+        SecureChannel.encode(client, :open, 1, %Types.OpenSecureChannelRequest{
+          client_nonce: :crypto.strong_rand_bytes(32)
+        })
+
+      server =
+        SecureChannel.new(@limits,
+          policies: [:basic256sha256],
+          certificate: keys.server_cert,
+          private_key: keys.server_key
+        )
+
+      assert SecureChannel.receive(server, hd(chunks(frames))) ==
+               {:error, :bad_certificate_invalid}
+
+      strict =
+        SecureChannel.new(@limits,
+          policies: [:none, :aes256_sha256_rsa_pss],
+          certificate: keys.server_cert,
+          private_key: keys.server_key
+        )
+
+      client = %{client | remote_certificate: keys.server_cert}
+
+      {:ok, frames, _} =
+        SecureChannel.encode(client, :open, 1, %Types.OpenSecureChannelRequest{
+          client_nonce: :crypto.strong_rand_bytes(32)
+        })
+
+      assert SecureChannel.receive(strict, hd(chunks(frames))) ==
+               {:error, :bad_security_policy_rejected}
+    end
+
+    test "a renewed token brings new keys, and the old ones still work until then", keys do
+      {client, server} = secure_pair(keys, :basic256sha256, :sign_and_encrypt)
+      {:ok, old, client} = SecureChannel.encode(client, :message, 2, read(1))
+
+      renewed = %{@token | token_id: 4}
+      [client_nonce, server_nonce] = for _ <- 1..2, do: :crypto.strong_rand_bytes(32)
+      server = SecureChannel.token(server, renewed, server_nonce, client_nonce)
+      client = SecureChannel.token(client, renewed, client_nonce, server_nonce)
+      assert client.keys[4] != client.keys[3]
+      {:ok, new, _} = SecureChannel.encode(client, :message, 3, read(1))
+
+      {server, {:message, 2, _}} = deliver(server, chunks(old))
+      assert {_, {:message, 3, _}} = deliver(server, chunks(new))
+    end
   end
 end

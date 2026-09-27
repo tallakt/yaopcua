@@ -20,13 +20,30 @@ defmodule OPCUA.Client do
   couldn't get there. When the connection drops the client stops with
   `{:shutdown, reason}`, so run it under a supervisor to reconnect.
 
-  Only the None security policy is supported so far, with anonymous or
-  username login.
+  ## Security
+
+      OPCUA.Client.start_link(url: url, security: {:basic256sha256, :sign_and_encrypt},
+        trust: [OPCUA.Certificate.read("server.der")],
+        certificate: cert, private_key: key)
+
+  With a security policy (see `OPCUA.SecurityPolicy`), the client signs, and
+  in `:sign_and_encrypt` mode encrypts, everything it exchanges with the
+  server. It needs the server's certificate, given as `:server_certificate`
+  or fetched from the server's endpoints and checked against `:trust`, and a
+  certificate of its own for the server to trust. Passwords are encrypted
+  for the server whenever it asks, even over a None channel.
 
   ## Options
 
     * `:url` - the endpoint, `opc.tcp://host:port/path` (required)
-    * `:user` - `{username, password}`, or `:anonymous` (the default)
+    * `:user` - `{username, password}`, `{:certificate, der, private_key}`,
+      or `:anonymous` (the default)
+    * `:security` - `:none` (the default), a policy such as
+      `:basic256sha256` (with `:sign_and_encrypt`), or `{policy, mode}`
+    * `:trust` - the server certificates to trust, or `:any`
+    * `:server_certificate` - the server's certificate, instead of fetching it
+    * `:certificate`, `:private_key` - the client's own; a self-signed one is
+      made for the connection if not given
     * `:timeout` - how long a request may take, in ms (default 5000)
     * `:session_timeout` - how long the server keeps an idle session, in ms
       (default 60000); the client keeps it alive
@@ -62,11 +79,26 @@ defmodule OPCUA.Client do
 
   @doc "Connects and activates a session. See the module doc for the options."
   @spec start_link(keyword) :: GenServer.on_start()
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
+  def start_link(opts),
+    do: GenServer.start_link(__MODULE__, check(opts), Keyword.take(opts, [:name]))
 
   @doc "Like `start_link/1`, without linking to the caller."
   @spec start(keyword) :: GenServer.on_start()
-  def start(opts), do: GenServer.start(__MODULE__, opts, Keyword.take(opts, [:name]))
+  def start(opts), do: GenServer.start(__MODULE__, check(opts), Keyword.take(opts, [:name]))
+
+  # A secure connection needs a decision about which server to trust; that
+  # mistake raises here, in the caller.
+  defp check(opts) do
+    secure = Keyword.get(opts, :security, :none) != :none
+
+    if secure and not Keyword.has_key?(opts, :server_certificate) and
+         not Keyword.has_key?(opts, :trust) do
+      raise ArgumentError,
+            "a secure connection needs :server_certificate, or :trust (a list of certificates, or :any)"
+    end
+
+    opts
+  end
 
   @doc "Closes the session and the connection."
   @spec close(client) :: :ok
@@ -552,6 +584,63 @@ defmodule OPCUA.Client do
 
   ## The process
 
+  # The policy, mode and certificates for Connection.connect/4. Without a
+  # server certificate given, the client asks the server's endpoints for it,
+  # and checks it against :trust.
+  defp security(url, timeout, opts) do
+    {policy, mode} =
+      case Keyword.get(opts, :security, :none) do
+        :none -> {:none, :none}
+        {policy, mode} -> {policy, mode}
+        policy -> {policy, :sign_and_encrypt}
+      end
+
+    if policy == :none do
+      {:ok, %{policy: :none, mode: :none}}
+    else
+      {certificate, key} =
+        case {opts[:certificate], opts[:private_key]} do
+          {nil, _} ->
+            OPCUA.Certificate.self_signed(
+              Keyword.get(opts, :application_uri, "urn:yaopcua:client")
+            )
+
+          pair ->
+            pair
+        end
+
+      with {:ok, server} <- server_certificate(url, timeout, policy, mode, opts) do
+        {:ok,
+         %{
+           policy: policy,
+           mode: mode,
+           certificate: certificate,
+           private_key: key,
+           server_certificate: server
+         }}
+      end
+    end
+  end
+
+  defp server_certificate(url, timeout, policy, mode, opts) do
+    case opts[:server_certificate] do
+      nil ->
+        uri = OPCUA.SecurityPolicy.uri(policy)
+
+        with {:ok, endpoints} <- endpoints(url, timeout: timeout),
+             %{server_certificate: certificate} <-
+               Enum.find(endpoints, &(&1.security_policy_uri == uri and &1.security_mode == mode)) ||
+                 {:error, :bad_security_policy_rejected} do
+          if OPCUA.Certificate.trusted?(certificate, Keyword.fetch!(opts, :trust)),
+            do: {:ok, certificate},
+            else: {:error, :bad_certificate_untrusted}
+        end
+
+      certificate ->
+        {:ok, certificate}
+    end
+  end
+
   @impl true
   def init(opts) do
     Process.flag(:trap_exit, true)
@@ -559,7 +648,8 @@ defmodule OPCUA.Client do
     timeout = Keyword.get(opts, :timeout, 5000)
     lifetime = Keyword.get(opts, :channel_lifetime, 3_600_000)
 
-    with {:ok, state} <- Connection.connect(url, timeout, lifetime),
+    with {:ok, security} <- security(url, timeout, opts),
+         {:ok, state} <- Connection.connect(url, timeout, lifetime, security),
          {:ok, state} <- Connection.session(state, opts),
          # Chunks that came with the last handshake reply still go through the channel.
          {:noreply, state} <- chunks(state.chunks, %{state | chunks: []}) do
@@ -678,7 +768,7 @@ defmodule OPCUA.Client do
 
   def handle_info(:renew, state) do
     {id, channel} = SecureChannel.next_request_id(state.channel)
-    request = Connection.open_request(state, :renew)
+    {request, state} = Connection.open_request(state, :renew)
 
     case send_message(%{state | channel: channel}, :open, id, request) do
       {:ok, state} -> {:noreply, put_pending(state, id, :renew, nil)}
@@ -741,8 +831,8 @@ defmodule OPCUA.Client do
     end
   end
 
-  defp handle_reply(state, :renew, {:ok, %Types.OpenSecureChannelResponse{security_token: token}}) do
-    schedule_renew(%{state | channel: SecureChannel.token(state.channel, token), token: token})
+  defp handle_reply(state, :renew, {:ok, %Types.OpenSecureChannelResponse{} = response}) do
+    schedule_renew(Connection.opened(state, response))
   end
 
   defp handle_reply(state, :renew, reply) do

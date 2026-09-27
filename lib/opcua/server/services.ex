@@ -6,7 +6,7 @@ defmodule OPCUA.Server.Services do
 
   require Logger
 
-  alias OPCUA.{NodeId, SecureChannel, StatusCode, Variant}
+  alias OPCUA.{Certificate, NodeId, SecurityPolicy, StatusCode, Variant}
   alias OPCUA.Server.{AddressSpace, Conditions, Node, Subscriptions}
   alias OPCUA.Types
 
@@ -91,44 +91,59 @@ defmodule OPCUA.Server.Services do
   end
 
   defp service(%Types.CreateSessionRequest{} = request, state) do
-    timeout = request.requested_session_timeout |> max(1000.0) |> min(3_600_000.0)
-    auth = %NodeId{ns: 0, id: {:opaque, :crypto.strong_rand_bytes(32)}}
+    channel = state.channel
+    config = state.config
 
-    session =
-      Subscriptions.new_session(%{
-        id: %NodeId{ns: 1, id: {:guid, guid()}},
-        auth: auth,
-        name: request.session_name,
-        timeout: timeout,
-        activated: false,
-        user: nil,
-        continuation: %{},
-        last: nil
-      })
+    with :ok <- offered(channel, config),
+         :ok <- client_certificate(request, channel) do
+      timeout = request.requested_session_timeout |> max(1000.0) |> min(3_600_000.0)
+      auth = %NodeId{ns: 0, id: {:opaque, :crypto.strong_rand_bytes(32)}}
+      nonce = :crypto.strong_rand_bytes(32)
 
-    response = %Types.CreateSessionResponse{
-      response_header: header(request, 0),
-      session_id: session.id,
-      authentication_token: auth,
-      revised_session_timeout: timeout,
-      server_nonce: :crypto.strong_rand_bytes(32),
-      server_endpoints: endpoints(state.config),
-      max_request_message_size: 0
-    }
+      session =
+        Subscriptions.new_session(%{
+          id: %NodeId{ns: 1, id: {:guid, guid()}},
+          auth: auth,
+          name: request.session_name,
+          timeout: timeout,
+          activated: false,
+          user: nil,
+          nonce: nonce,
+          continuation: %{},
+          last: nil
+        })
 
-    {response, %{state | sessions: Map.put(state.sessions, auth, touch(session))}}
+      response = %Types.CreateSessionResponse{
+        response_header: header(request, 0),
+        session_id: session.id,
+        authentication_token: auth,
+        revised_session_timeout: timeout,
+        server_nonce: nonce,
+        server_certificate: config.certificate,
+        server_endpoints: endpoints(config),
+        server_signature: server_signature(request, channel, config),
+        max_request_message_size: 0
+      }
+
+      {response, %{state | sessions: Map.put(state.sessions, auth, touch(session))}}
+    else
+      {:error, status} -> {fault(request, status), state}
+    end
   end
 
   defp service(%Types.ActivateSessionRequest{} = request, state) do
     auth = request.request_header.authentication_token
 
     with %{} = session <- state.sessions[auth] || {:error, :bad_session_id_invalid},
-         {:ok, user} <- login(request.user_identity_token, state.config) do
-      session = touch(%{session | activated: true, user: user})
+         :ok <- client_signature(request, session, state),
+         {:ok, user} <-
+           login(request.user_identity_token, request.user_token_signature, session, state) do
+      nonce = :crypto.strong_rand_bytes(32)
+      session = touch(%{session | activated: true, user: user, nonce: nonce})
 
       response = %Types.ActivateSessionResponse{
         response_header: header(request, 0),
-        server_nonce: :crypto.strong_rand_bytes(32)
+        server_nonce: nonce
       }
 
       {response, %{state | sessions: Map.put(state.sessions, auth, session)}}
@@ -137,48 +152,212 @@ defmodule OPCUA.Server.Services do
     end
   end
 
-  defp login(nil, config), do: login(%Types.AnonymousIdentityToken{}, config)
-  defp login(%Types.AnonymousIdentityToken{}, %{anonymous: true}), do: {:ok, :anonymous}
-  defp login(%Types.AnonymousIdentityToken{}, _), do: {:error, :bad_identity_token_rejected}
-
-  defp login(%Types.UserNameIdentityToken{encryption_algorithm: algorithm} = token, config)
-       when algorithm in [nil, ""] do
-    valid =
-      case config.users do
-        nil -> false
-        users when is_map(users) -> Map.fetch(users, token.user_name) == {:ok, token.password}
-        fun when is_function(fun, 2) -> fun.(token.user_name, token.password) == true
-      end
-
-    if valid, do: {:ok, token.user_name}, else: {:error, :bad_user_access_denied}
+  # A session is only made on an endpoint the server offers; without a None
+  # endpoint, a None channel is only for asking the endpoints.
+  defp offered(channel, config) do
+    if {channel.policy, channel.mode} in config.security,
+      do: :ok,
+      else: {:error, :bad_security_policy_rejected}
   end
 
-  defp login(%Types.UserNameIdentityToken{}, _), do: {:error, :bad_identity_token_invalid}
-  defp login(_, _), do: {:error, :bad_identity_token_invalid}
+  # On a secure channel, the session is the application whose certificate
+  # opened the channel.
+  defp client_certificate(_, %{policy: :none}), do: :ok
+
+  defp client_certificate(request, channel) do
+    uri = Certificate.application_uri(channel.remote_certificate)
+
+    cond do
+      request.client_certificate != channel.remote_certificate ->
+        {:error, :bad_certificate_invalid}
+
+      byte_size(request.client_nonce || "") < 32 ->
+        {:error, :bad_nonce_invalid}
+
+      uri && uri != request.client_description.application_uri ->
+        {:error, :bad_certificate_uri_invalid}
+
+      true ->
+        :ok
+    end
+  end
+
+  # The server proves it holds its key by signing the client's certificate and nonce...
+  defp server_signature(_, %{policy: :none}, _), do: nil
+
+  defp server_signature(request, channel, config) do
+    %Types.SignatureData{
+      algorithm: SecurityPolicy.signature_uri(channel.policy),
+      signature:
+        SecurityPolicy.sign(
+          channel.policy,
+          request.client_certificate <> request.client_nonce,
+          config.private_key
+        )
+    }
+  end
+
+  # ...and the client by signing the server's.
+  defp client_signature(_, _, %{channel: %{policy: :none}}), do: :ok
+
+  defp client_signature(request, session, %{channel: channel, config: config}) do
+    signature = request.client_signature && request.client_signature.signature
+    key = Certificate.public_key(channel.remote_certificate)
+
+    if is_binary(signature) and
+         SecurityPolicy.verify(
+           channel.policy,
+           config.certificate <> session.nonce,
+           signature,
+           key
+         ),
+       do: :ok,
+       else: {:error, :bad_application_signature_invalid}
+  end
+
+  defp login(nil, signature, session, state),
+    do: login(%Types.AnonymousIdentityToken{}, signature, session, state)
+
+  defp login(%Types.AnonymousIdentityToken{}, _, _, %{config: %{anonymous: true}}),
+    do: {:ok, :anonymous}
+
+  defp login(%Types.AnonymousIdentityToken{}, _, _, _), do: {:error, :bad_identity_token_rejected}
+
+  defp login(%Types.UserNameIdentityToken{} = token, _, session, %{
+         channel: channel,
+         config: config
+       }) do
+    password =
+      case token.encryption_algorithm do
+        # In plain text only where the endpoint doesn't ask for encryption,
+        # or the channel encrypts everything anyway.
+        algorithm when algorithm in [nil, ""] ->
+          if channel.mode == :sign_and_encrypt or token_policy(config, channel) == :none,
+            do: {:ok, token.password},
+            else: {:error, :bad_identity_token_invalid}
+
+        algorithm ->
+          case Enum.find(
+                 SecurityPolicy.all() -- [:none],
+                 &(SecurityPolicy.encryption_uri(&1) == algorithm)
+               ) do
+            nil ->
+              {:error, :bad_identity_token_invalid}
+
+            policy ->
+              SecurityPolicy.decrypt_secret(
+                policy,
+                token.password || "",
+                session.nonce,
+                config.private_key
+              )
+          end
+      end
+
+    with {:ok, password} <- password do
+      valid =
+        case config.users do
+          nil -> false
+          users when is_map(users) -> Map.fetch(users, token.user_name) == {:ok, password}
+          fun when is_function(fun, 2) -> fun.(token.user_name, password) == true
+        end
+
+      if valid, do: {:ok, token.user_name}, else: {:error, :bad_user_access_denied}
+    end
+  end
+
+  # A user certificate: trusted, and the user proves they hold its key by
+  # signing the server's certificate and nonce.
+  defp login(%Types.X509IdentityToken{certificate_data: certificate}, signature, session, %{
+         config: config
+       }) do
+    policy =
+      Enum.find(
+        SecurityPolicy.all() -- [:none],
+        &(signature && SecurityPolicy.signature_uri(&1) == signature.algorithm)
+      )
+
+    cond do
+      config.user_certificates == nil or not is_binary(certificate) ->
+        {:error, :bad_identity_token_rejected}
+
+      not Certificate.trusted?(certificate, config.user_certificates) ->
+        {:error, :bad_identity_token_rejected}
+
+      policy == nil or not is_binary(signature.signature) or
+          not SecurityPolicy.verify(
+            policy,
+            config.certificate <> session.nonce,
+            signature.signature,
+            Certificate.public_key(certificate)
+          ) ->
+        {:error, :bad_user_signature_invalid}
+
+      true ->
+        {:ok,
+         Certificate.application_uri(certificate) ||
+           Base.encode16(Certificate.thumbprint(certificate))}
+    end
+  end
+
+  defp login(_, _, _, _), do: {:error, :bad_identity_token_invalid}
+
+  # The policy that protects user secrets on an endpoint: a secure channel's
+  # own, and on a None endpoint the strongest the server has.
+  defp token_policy(_config, %{policy: policy}) when policy != :none, do: policy
+
+  defp token_policy(config, _) do
+    offered = for {policy, _} <- config.security, do: policy
+    SecurityPolicy.all() |> Enum.filter(&(&1 in offered)) |> List.last()
+  end
 
   defp endpoints(config) do
-    tokens =
-      if(config.anonymous,
-        do: [%Types.UserTokenPolicy{policy_id: "anonymous", token_type: :anonymous}],
-        else: []
-      ) ++
-        if(config.users,
-          do: [%Types.UserTokenPolicy{policy_id: "username", token_type: :user_name}],
-          else: []
-        )
+    for {policy, mode} <- config.security do
+      # On secure endpoints tokens use the channel's policy; on None the strongest one.
+      token_uri =
+        case {policy, token_policy(config, %{policy: policy})} do
+          {:none, secure} when secure != :none -> SecurityPolicy.uri(secure)
+          _ -> nil
+        end
 
-    [
+      tokens =
+        if(config.anonymous,
+          do: [%Types.UserTokenPolicy{policy_id: "anonymous", token_type: :anonymous}],
+          else: []
+        ) ++
+          if(config.users,
+            do: [
+              %Types.UserTokenPolicy{
+                policy_id: "username",
+                token_type: :user_name,
+                security_policy_uri: token_uri
+              }
+            ],
+            else: []
+          ) ++
+          if(config.user_certificates,
+            do: [
+              %Types.UserTokenPolicy{
+                policy_id: "certificate",
+                token_type: :certificate,
+                security_policy_uri: token_uri
+              }
+            ],
+            else: []
+          )
+
       %Types.EndpointDescription{
         endpoint_url: config.endpoint_url,
         server: config.application,
-        security_mode: :none,
-        security_policy_uri: SecureChannel.none(),
+        server_certificate: config.certificate,
+        security_mode: mode,
+        security_policy_uri: SecurityPolicy.uri(policy),
         user_identity_tokens: tokens,
         transport_profile_uri:
           "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary",
-        security_level: 0
+        security_level: SecurityPolicy.level(policy, mode)
       }
-    ]
+    end
   end
 
   defp guid do
