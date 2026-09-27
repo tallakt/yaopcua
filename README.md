@@ -11,9 +11,9 @@ does, written from the OPC UA specification (free to read at
 Foundation's machine-readable definitions, not from another stack's code. It
 speaks the binary protocol over TCP only; the XML and JSON encodings are out.
 
-**Status:** a client and a server that read, write, browse, call methods and
-subscribe to value changes, without security yet. Events and alarms in the
-server come next; see [the roadmap](#roadmap).
+**Status:** a client and a server that read, write, browse, call methods,
+subscribe to value changes and events, and handle alarms, without security
+yet. Security comes next; see [the roadmap](#roadmap).
 
 ## Client
 
@@ -54,7 +54,8 @@ end
 | `browse/3` | lists a node's references, following continuation points |
 | `call/4` | calls a method and returns its outputs |
 | `subscribe/3` | sends the subscriber each change of some values, optionally with a deadband |
-| `subscribe_events/2` | sends the subscriber the events a node reports, with the fields asked for |
+| `subscribe_events/2` | sends the subscriber the events a node reports, with the fields asked for, optionally only of one type |
+| `acknowledge/4`, `refresh/2` | acknowledges an alarm; asks for the standing alarms again (ConditionRefresh) |
 | `unsubscribe/2` | ends a subscription; it also ends when the subscriber exits |
 | `request/3` | sends any service request from `OPCUA.Types` |
 | `endpoints/2` | asks a server which endpoints and logins it offers, without a session |
@@ -91,6 +92,8 @@ it under a supervisor to reconnect.
 | `add_variable/4` | adds a variable with a stored value, or one read from a function each time; `:write` sees and may refuse each client write |
 | `add_method/4` | adds a method; the function gets the inputs as plain values |
 | `set/3`, `get/2` | sets and gets a value from the application; a value that doesn't fit raises |
+| `event/2` | sends an event to the clients that subscribe to events |
+| `add_condition/4`, `condition/3` | adds an alarm on a node, and changes it: active, acknowledged, enabled, severity, message |
 | `space/1` | the address space itself, for `set/3` without going through the server process |
 
 The server starts with all 5,500 standard nodes of namespace 0, and answers
@@ -100,8 +103,32 @@ RegisterNodes, and the subscription services: value changes with deadbands and
 queues, keep-alives, lifetimes and Republish. Each client connection runs in
 its own process.
 
-Not yet: events and alarms, security, history, and sessions that outlive
-their connection.
+### Alarms
+
+An alarm is a condition (Part 9) on the node it's about. Clients see it
+through events, and acknowledge it through the server, which asks the
+application first:
+
+```elixir
+:ok = OPCUA.Server.add_condition(server, "ns=2;s=Pump1.Overload", "Overload",
+        source: "ns=2;s=Pump1", severity: 700, message: "Pump 1 overload",
+        acknowledge: fn comment -> MyPlant.acknowledge(:pump_overload, comment) end)
+
+:ok = OPCUA.Server.condition(server, "ns=2;s=Pump1.Overload", active: true)
+```
+
+| The application | What clients get |
+|---|---|
+| `condition(..., active: true)` | an event with ActiveState true, AckedState false, Retain true |
+| a client calls Acknowledge | the `:acknowledge` function, then an event with AckedState true and the comment |
+| `condition(..., active: false)` | an event with ActiveState false, and Retain false once acknowledged |
+| a client calls ConditionRefresh | the retained alarms again, between RefreshStart and RefreshEnd events |
+
+Event filters take select clauses by browse path (including ConditionId) and
+where clauses with OfType, And, Or, Not, the comparisons, Between, InList and
+IsNull. Enable, Disable and AddComment work too; Confirm and shelving don't.
+
+Not yet: security, history, and sessions that outlive their connection.
 
 ## Encoding
 
@@ -199,7 +226,7 @@ Python only ever runs in tests, never inside yaopcua.
 | ✅ | Client: subscriptions to value changes and events | Part 4 |
 | | Client: custom structures, reconnecting | Part 4 |
 | ✅ | Server: address space with namespace 0, callback variables, methods, subscriptions | Parts 3, 4, 5 |
-| | Events and alarms in the server: event filters, conditions, acknowledge, ConditionRefresh | Part 9 |
+| ✅ | Events and alarms in the server: event filters, conditions, acknowledge, ConditionRefresh | Parts 4, 9 |
 | | Security: Basic256Sha256 and Aes128_Sha256_RsaOaep, username and certificate login, with OTP's `:crypto` and `:public_key` only | Parts 2, 6, 7 |
 | | PubSub: UADP over UDP, for PLC to PLC | Part 14 |
 | | Fuzzing with [StreamData](https://github.com/whatyouhide/stream_data): random and mutated bytes into the decoder, the secure channel and the server | |

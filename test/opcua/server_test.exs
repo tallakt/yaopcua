@@ -564,4 +564,292 @@ defmodule OPCUA.ServerTest do
                {:ok, Server.get(server, "ns=2;s=Pump1.Speed").value.value}
     end
   end
+
+  describe "events and alarms" do
+    @alarm_fields [
+      "EventId",
+      "EventType",
+      "ConditionId",
+      "Message",
+      "Severity",
+      "ActiveState/Id",
+      "AckedState/Id",
+      "EnabledState/Id",
+      "Retain",
+      "Comment"
+    ]
+
+    setup %{server: server} do
+      test = self()
+
+      :ok =
+        Server.add_condition(server, "ns=2;s=Pump1.Overload", "Overload",
+          source: "ns=2;s=Pump1",
+          severity: 700,
+          message: "Pump 1 overload",
+          acknowledge: fn
+            "no" -> {:error, :bad_user_access_denied}
+            comment -> send(test, {:acknowledged, comment}) && :ok
+          end
+        )
+
+      :ok
+    end
+
+    defp event(sub, timeout \\ 2000) do
+      receive do
+        {Client, ^sub, {:event, event}} -> event
+      after
+        timeout -> flunk("no event from subscription #{sub}")
+      end
+    end
+
+    defp no_event(sub, timeout \\ 300) do
+      receive do
+        {Client, ^sub, {:event, event}} -> flunk("unexpected #{inspect(event)}")
+      after
+        timeout -> :ok
+      end
+    end
+
+    test "an event from the application reaches subscribers with the fields they asked for", %{
+      server: server,
+      client: client
+    } do
+      {:ok, sub} =
+        Client.subscribe_events(client,
+          fields: ["Message", "Severity", "SourceNode", "2:Batch", "ConditionId"],
+          interval: 50
+        )
+
+      :ok =
+        Server.event(server,
+          message: "Shift change",
+          severity: 100,
+          fields: [{"2:Batch", %Variant{type: :string, value: "B-17"}}]
+        )
+
+      assert event(sub) == %{
+               "Message" => %OPCUA.LocalizedText{text: "Shift change"},
+               "Severity" => 100,
+               "SourceNode" => %NodeId{id: 2253},
+               "2:Batch" => "B-17",
+               "ConditionId" => nil
+             }
+    end
+
+    test "an alarm goes from active to acknowledged to normal", %{server: server, client: client} do
+      {:ok, sub} = Client.subscribe_events(client, fields: @alarm_fields, interval: 50)
+      :ok = Server.condition(server, "ns=2;s=Pump1.Overload", active: true)
+
+      active = event(sub)
+
+      assert %{
+               "EventType" => %NodeId{id: 10637},
+               "ConditionId" => %NodeId{ns: 2, id: "Pump1.Overload"},
+               "Message" => %OPCUA.LocalizedText{text: "Pump 1 overload"},
+               "Severity" => 700,
+               "ActiveState/Id" => true,
+               "AckedState/Id" => false,
+               "Retain" => true
+             } = active
+
+      assert Client.acknowledge(client, active["ConditionId"], "not the event id") ==
+               {:error, :bad_event_id_unknown}
+
+      assert Client.acknowledge(client, active["ConditionId"], active["EventId"], "on it") == :ok
+      assert_received {:acknowledged, "on it"}
+
+      acked = event(sub)
+
+      assert %{
+               "ActiveState/Id" => true,
+               "AckedState/Id" => true,
+               "Retain" => true,
+               "Comment" => %{text: "on it"}
+             } = acked
+
+      assert Client.acknowledge(client, acked["ConditionId"], acked["EventId"]) ==
+               {:error, :bad_condition_branch_already_acked}
+
+      :ok = Server.condition(server, "ns=2;s=Pump1.Overload", active: false)
+      assert %{"ActiveState/Id" => false, "AckedState/Id" => true, "Retain" => false} = event(sub)
+    end
+
+    test "an alarm that returns to normal unacknowledged stays retained", %{
+      server: server,
+      client: client
+    } do
+      {:ok, sub} = Client.subscribe_events(client, fields: @alarm_fields, interval: 50)
+      :ok = Server.condition(server, "ns=2;s=Pump1.Overload", active: true)
+      assert %{"Retain" => true} = event(sub)
+      :ok = Server.condition(server, "ns=2;s=Pump1.Overload", active: false)
+      assert %{"ActiveState/Id" => false, "AckedState/Id" => false, "Retain" => true} = event(sub)
+    end
+
+    test "the application may refuse an acknowledgement", %{server: server, client: client} do
+      {:ok, sub} = Client.subscribe_events(client, fields: @alarm_fields, interval: 50)
+      :ok = Server.condition(server, "ns=2;s=Pump1.Overload", active: true)
+      active = event(sub)
+
+      assert Client.acknowledge(client, active["ConditionId"], active["EventId"], "no") ==
+               {:error, :bad_user_access_denied}
+
+      no_event(sub)
+      assert Client.read(client, "ns=2;s=Pump1.Overload.AckedState.Id") == {:ok, false}
+    end
+
+    test "the same state again sends no event", %{server: server, client: client} do
+      {:ok, sub} = Client.subscribe_events(client, fields: ["Message"], interval: 50)
+      :ok = Server.condition(server, "ns=2;s=Pump1.Overload", active: true)
+      assert event(sub)
+      :ok = Server.condition(server, "ns=2;s=Pump1.Overload", active: true)
+      no_event(sub)
+    end
+
+    test "ConditionRefresh sends the standing alarms between two markers", %{
+      server: server,
+      client: client
+    } do
+      :ok = Server.add_condition(server, "ns=2;s=Pump1.Dry", "Dry", source: "ns=2;s=Pump1")
+      :ok = Server.condition(server, "ns=2;s=Pump1.Overload", active: true)
+
+      {:ok, sub} =
+        Client.subscribe_events(client, fields: ["EventType", "ConditionId"], interval: 50)
+
+      assert Client.refresh(client, sub) == :ok
+
+      assert event(sub) == %{"EventType" => %NodeId{id: 2787}, "ConditionId" => nil}
+
+      assert event(sub) == %{
+               "EventType" => %NodeId{id: 10637},
+               "ConditionId" => %NodeId{ns: 2, id: "Pump1.Overload"}
+             }
+
+      assert event(sub) == %{"EventType" => %NodeId{id: 2788}, "ConditionId" => nil}
+      no_event(sub)
+
+      assert Client.refresh(client, 999_999) == {:error, :bad_subscription_id_invalid}
+    end
+
+    test "a refresh of a filtered subscription still carries the markers", %{
+      server: server,
+      client: client
+    } do
+      :ok = Server.condition(server, "ns=2;s=Pump1.Overload", active: true)
+
+      {:ok, sub} =
+        Client.subscribe_events(client, fields: ["EventType"], of_type: "i=2915", interval: 50)
+
+      assert Client.refresh(client, sub) == :ok
+      assert Enum.map(1..3, fn _ -> event(sub)["EventType"].id end) == [2787, 10637, 2788]
+    end
+
+    test "filters events by type, or by a where clause", %{server: server, client: client} do
+      {:ok, alarms} =
+        Client.subscribe_events(client, fields: ["Message"], of_type: "i=2915", interval: 50)
+
+      severe = %OPCUA.Types.ContentFilter{
+        elements: [
+          %Types.ContentFilterElement{
+            filter_operator: :greater_than_or_equal,
+            filter_operands: [
+              %Types.SimpleAttributeOperand{
+                type_definition_id: %NodeId{id: 2041},
+                browse_path: [%OPCUA.QualifiedName{name: "Severity"}],
+                attribute_id: 13
+              },
+              %Types.LiteralOperand{value: %Variant{type: :uint16, value: 600}}
+            ]
+          }
+        ]
+      }
+
+      {:ok, high} =
+        Client.subscribe_events(client, fields: ["Message"], where: severe, interval: 50)
+
+      :ok = Server.event(server, message: "low", severity: 100)
+      :ok = Server.event(server, message: "high", severity: 900)
+      :ok = Server.condition(server, "ns=2;s=Pump1.Overload", active: true)
+
+      assert event(alarms) == %{"Message" => %OPCUA.LocalizedText{text: "Pump 1 overload"}}
+      no_event(alarms)
+      assert event(high) == %{"Message" => %OPCUA.LocalizedText{text: "high"}}
+      assert event(high) == %{"Message" => %OPCUA.LocalizedText{text: "Pump 1 overload"}}
+      no_event(high)
+    end
+
+    test "a source reports its own alarms, not the server's other events", %{
+      server: server,
+      client: client
+    } do
+      {:ok, pump} =
+        Client.subscribe_events(client, source: "ns=2;s=Pump1", fields: ["Message"], interval: 50)
+
+      :ok = Server.event(server, message: "elsewhere")
+      :ok = Server.condition(server, "ns=2;s=Pump1.Overload", active: true)
+      assert event(pump) == %{"Message" => %OPCUA.LocalizedText{text: "Pump 1 overload"}}
+      no_event(pump)
+
+      {:ok, not_notifier} =
+        Client.subscribe_events(client, source: "ns=2;s=Pump1.Speed", interval: 50)
+
+      assert_receive {Client, ^not_notifier, {:status, :bad_attribute_id_invalid}}, 2000
+    end
+
+    test "a condition can be disabled, enabled and commented on", %{
+      server: server,
+      client: client
+    } do
+      {:ok, sub} = Client.subscribe_events(client, fields: @alarm_fields, interval: 50)
+      :ok = Server.condition(server, "ns=2;s=Pump1.Overload", active: true)
+      active = event(sub)
+      condition = active["ConditionId"]
+
+      assert Client.call(client, condition, "i=9029", [
+               %Variant{type: :byte_string, value: active["EventId"]},
+               %OPCUA.LocalizedText{text: "checking"}
+             ]) == {:ok, []}
+
+      commented = event(sub)
+      assert commented["Comment"].text == "checking"
+
+      assert Client.call(client, condition, "i=9028", []) == {:ok, []}
+      assert %{"EnabledState/Id" => false, "Retain" => false} = event(sub)
+
+      assert Client.call(client, condition, "i=9028", []) ==
+               {:error, :bad_condition_already_disabled}
+
+      assert Client.acknowledge(client, condition, commented["EventId"]) |> elem(0) == :error
+
+      assert Client.call(client, condition, "i=9027", []) == {:ok, []}
+      assert %{"EnabledState/Id" => true, "Retain" => true} = event(sub)
+    end
+
+    test "conditions are found from their source, and their state can be read", %{
+      server: server,
+      client: client
+    } do
+      assert {:ok, [ref]} = Client.browse(client, "ns=2;s=Pump1", reference_type: "i=9006")
+      assert ref.browse_name.name == "Overload"
+      assert ref.type_definition == %OPCUA.ExpandedNodeId{id: 10637}
+
+      :ok = Server.condition(server, "ns=2;s=Pump1.Overload", active: true, severity: 900)
+      assert Client.read(client, "ns=2;s=Pump1.Overload.ActiveState.Id") == {:ok, true}
+
+      assert Client.read(client, "ns=2;s=Pump1.Overload.ActiveState") ==
+               {:ok, %OPCUA.LocalizedText{locale: "en", text: "Active"}}
+
+      assert Client.read(client, "ns=2;s=Pump1.Overload.Severity") == {:ok, 900}
+      assert Client.read(client, "ns=2;s=Pump1.Overload.Retain") == {:ok, true}
+    end
+
+    test "refuses conditions it doesn't have", %{server: server} do
+      assert Server.condition(server, "ns=2;s=Nope", active: true) ==
+               {:error, :bad_node_id_unknown}
+
+      assert Server.add_condition(server, "ns=2;s=X", "X", source: "ns=2;s=Nope") ==
+               {:error, :bad_parent_node_id_invalid}
+    end
+  end
 end

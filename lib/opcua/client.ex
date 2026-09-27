@@ -341,8 +341,14 @@ defmodule OPCUA.Client do
       `"Message"`, `"ActiveState/Id"`, or `"2:MyField"` for a field in
       namespace 2. `"ConditionId"` is the node id of an alarm's condition.
       The default is #{Enum.map_join(@event_fields, ", ", &"`#{&1}`")}.
+    * `:of_type` - only events of this type and its subtypes, such as
+      `"i=2915"` for alarms (AlarmConditionType)
+    * `:where` - an `OPCUA.Types.ContentFilter` for anything else
     * `:to`, `:interval`, `:keep_alive` - as for `subscribe/3`
     * `:queue` - how many events the server keeps between sends (default 1000)
+
+  For alarms, ask for `"ConditionId"` and `"EventId"` to be able to
+  `acknowledge/4` them, and `refresh/2` to get the ones already standing.
   """
   @spec subscribe_events(client, keyword) :: {:ok, subscription} | error
   def subscribe_events(client, opts \\ []) do
@@ -352,7 +358,10 @@ defmodule OPCUA.Client do
       sampling_interval: 0.0,
       queue_size: Keyword.get(opts, :queue, 1000),
       discard_oldest: true,
-      filter: %Types.EventFilter{select_clauses: Enum.map(fields, &operand/1)}
+      filter: %Types.EventFilter{
+        select_clauses: Enum.map(fields, &operand/1),
+        where_clause: where(opts)
+      }
     }
 
     source = node_id(Keyword.get(opts, :source, @server_object))
@@ -363,6 +372,53 @@ defmodule OPCUA.Client do
     }
 
     create(client, [{{:events, fields}, item, parameters}], opts)
+  end
+
+  defp where(opts) do
+    case {opts[:where], opts[:of_type]} do
+      {nil, nil} ->
+        nil
+
+      {nil, type} ->
+        literal = %Types.LiteralOperand{value: %Variant{type: :node_id, value: node_id(type)}}
+
+        %Types.ContentFilter{
+          elements: [
+            %Types.ContentFilterElement{filter_operator: :of_type, filter_operands: [literal]}
+          ]
+        }
+
+      {%Types.ContentFilter{} = where, _} ->
+        where
+    end
+  end
+
+  @doc """
+  Acknowledges an alarm, given the `"ConditionId"` and `"EventId"` of its
+  latest event, with an optional comment.
+  """
+  @spec acknowledge(client, node_ref, binary, String.t() | nil) :: :ok | error
+  def acknowledge(client, condition, event_id, comment \\ nil) do
+    args = [
+      %Variant{type: :byte_string, value: event_id},
+      %Variant{type: :localized_text, value: comment && %OPCUA.LocalizedText{text: comment}}
+    ]
+
+    # AcknowledgeableConditionType.Acknowledge
+    with {:ok, _} <- call(client, condition, "i=9111", args), do: :ok
+  end
+
+  @doc """
+  Asks the server to send the alarms that are active or unacknowledged again,
+  to an event subscription (ConditionRefresh). They arrive between a
+  RefreshStartEvent and a RefreshEndEvent.
+  """
+  @spec refresh(client, subscription) :: :ok | error
+  def refresh(client, subscription) do
+    # ConditionType.ConditionRefresh
+    with {:ok, _} <-
+           call(client, "i=2782", "i=3875", [%Variant{type: :uint32, value: subscription}]),
+         do: :ok
   end
 
   defp operand("ConditionId") do

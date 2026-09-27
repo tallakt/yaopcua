@@ -51,6 +51,34 @@ async def main(url):
         await subscription.delete()
         out["subscription"] = changes.values
 
+    # An alarm: tripped through a method, then acknowledged by this client.
+    async with Client(url) as client:
+        events = []
+
+        class Events:
+            def event_notification(self, event):
+                events.append(event)
+
+        subscription = await client.create_subscription(50, Events())
+        await subscription.subscribe_events(client.nodes.server, ua.ObjectIds.OffNormalAlarmType)
+        await client.get_node("ns=2;s=Pump1").call_method("2:Trip")
+        await asyncio.sleep(0.3)
+        alarm = events[-1]
+        acknowledge = ua.NodeId(ua.ObjectIds.AcknowledgeableConditionType_Acknowledge)
+        await client.get_node(alarm.NodeId).call_method(acknowledge, ua.Variant(alarm.EventId, ua.VariantType.ByteString), ua.LocalizedText("from asyncua"))
+        await asyncio.sleep(0.3)
+        acked = events[-1]
+        await subscription.delete()
+        out["alarm"] = {
+            "condition": alarm.NodeId.to_string(),
+            "message": alarm.Message.Text,
+            "severity": alarm.Severity,
+            "active": getattr(alarm, "ActiveState/Id"),
+            "acked": getattr(alarm, "AckedState/Id"),
+            "acked_after": getattr(acked, "AckedState/Id"),
+            "comment": acked.Comment.Text,
+        }
+
     user = Client(url)
     user.set_user("operator")
     user.set_password("secret")

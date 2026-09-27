@@ -81,6 +81,16 @@ defmodule OPCUA.Server.Connection do
   def handle_info({:publish_timeout, auth, id}, state),
     do: {:noreply, state |> in_session(auth, &Subscriptions.publish_timeout(&1, id)) |> flush()}
 
+  # An event from the server, for the event items of every session.
+  def handle_info({:event, event}, state) do
+    sessions =
+      Map.new(state.sessions, fn {auth, session} ->
+        {auth, Subscriptions.event(session, event, state.config.space)}
+      end)
+
+    {:noreply, %{state | sessions: sessions}}
+  end
+
   def handle_info({:session_timeout, auth, since}, state) do
     case state.sessions do
       %{^auth => %{last: ^since}} ->

@@ -13,7 +13,7 @@ defmodule OPCUA.Server.Subscriptions do
   # answered by a timer, go to `session.outbox` for the connection to send.
 
   alias OPCUA.{DataValue, StatusCode, Variant}
-  alias OPCUA.Server.{AddressSpace, Services}
+  alias OPCUA.Server.{AddressSpace, Conditions, Events, Node, Services}
   alias OPCUA.Types
 
   @min_interval 10
@@ -139,7 +139,7 @@ defmodule OPCUA.Server.Subscriptions do
     end
   end
 
-  def handle(%Types.ModifyMonitoredItemsRequest{} = request, session, _state) do
+  def handle(%Types.ModifyMonitoredItemsRequest{} = request, session, state) do
     case session.subscriptions[request.subscription_id] do
       nil ->
         {Services.fault(request, :bad_subscription_id_invalid), session}
@@ -154,7 +154,7 @@ defmodule OPCUA.Server.Subscriptions do
                  }, sub}
 
               item ->
-                case parameters(item, modify.requested_parameters, sub) do
+                case modify(item, modify.requested_parameters, sub, state.config.space) do
                   {:ok, item} ->
                     result = %Types.MonitoredItemModifyResult{
                       status_code: 0,
@@ -390,15 +390,14 @@ defmodule OPCUA.Server.Subscriptions do
 
   # Sends what a subscription has, or a keep-alive, in answer to `publish`.
   defp send_cycle(sub, publish) do
-    {items, sub} = take_notifications(sub)
+    {data, sub} = take_notifications(sub)
 
     {message, sub} =
-      if items == [] do
+      if data == [] do
         # A keep-alive carries the next sequence number without using it up.
         {notification(sub.sequence, []), sub}
       else
-        message =
-          notification(sub.sequence, [%Types.DataChangeNotification{monitored_items: items}])
+        message = notification(sub.sequence, data)
 
         retransmit =
           sub.retransmit
@@ -435,21 +434,97 @@ defmodule OPCUA.Server.Subscriptions do
 
   defp take_notifications(%{publishing: false} = sub), do: {[], sub}
 
+  # Value changes go in a DataChangeNotification, events in an
+  # EventNotificationList; the queues are emptied.
   defp take_notifications(sub) do
-    {notes, items} =
-      Enum.map_reduce(sub.items, sub.items, fn
-        {id, %{mode: :reporting, queue: [_ | _]} = item}, items ->
-          notes =
-            for value <- Enum.reverse(item.queue),
-                do: %Types.MonitoredItemNotification{client_handle: item.handle, value: value}
+    reporting = for {id, %{mode: :reporting, queue: [_ | _]} = item} <- sub.items, do: {id, item}
 
-          {notes, Map.put(items, id, %{item | queue: []})}
+    changes =
+      for {_, %{kind: :value} = item} <- reporting,
+          value <- Enum.reverse(item.queue),
+          do: %Types.MonitoredItemNotification{client_handle: item.handle, value: value}
 
-        _, items ->
-          {[], items}
+    events =
+      for {_, %{kind: :events} = item} <- reporting,
+          fields <- Enum.reverse(item.queue),
+          do: fields
+
+    items =
+      Enum.reduce(reporting, sub.items, fn {id, item}, items ->
+        Map.put(items, id, %{item | queue: []})
       end)
 
-    {List.flatten(notes), %{sub | items: items}}
+    data =
+      if(changes == [], do: [], else: [%Types.DataChangeNotification{monitored_items: changes}]) ++
+        if(events == [], do: [], else: [%Types.EventNotificationList{events: events}])
+
+    {data, %{sub | items: items}}
+  end
+
+  ## Events
+
+  @doc false
+  # Queues an event for every event item of the session that reports it.
+  def event(session, event, space) do
+    subscriptions =
+      Map.new(session.subscriptions, fn {id, sub} ->
+        items =
+          Map.new(sub.items, fn
+            {item_id, %{kind: :events, mode: :reporting} = item} ->
+              {item_id,
+               if(Events.reported_by?(event, item.read.node_id, space),
+                 do: queue_event(item, event, space, true),
+                 else: item
+               )}
+
+            other ->
+              other
+          end)
+
+        {id, %{sub | items: items}}
+      end)
+
+    %{session | subscriptions: subscriptions}
+  end
+
+  defp queue_event(item, event, space, where) do
+    fields =
+      if where,
+        do: Events.filter(event, item.filter, space),
+        else: Events.select(event, item.filter, space)
+
+    if fields,
+      do: enqueue(item, %Types.EventFieldList{client_handle: item.handle, event_fields: fields}),
+      else: item
+  end
+
+  @doc false
+  # ConditionRefresh: sends `events` (the refresh markers and the retained
+  # conditions) to the event items of one subscription, or just one item.
+  def refresh(session, sub_id, item_id, events, space) do
+    case session.subscriptions[sub_id] do
+      nil ->
+        {:error, :bad_subscription_id_invalid}
+
+      sub ->
+        targets =
+          for {id, %{kind: :events} = item} <- sub.items, item_id in [nil, id], do: {id, item}
+
+        if targets == [] and item_id != nil do
+          {:error, :bad_monitored_item_id_invalid}
+        else
+          items =
+            Enum.reduce(targets, sub.items, fn {id, item}, items ->
+              # The markers get through whatever the where clause says.
+              item =
+                Enum.reduce(events, item, &queue_event(&2, &1, space, not Conditions.marker?(&1)))
+
+              Map.put(items, id, item)
+            end)
+
+          {:ok, put_sub(session, %{sub | items: items})}
+        end
+    end
   end
 
   # When the last subscription goes, waiting Publish requests have nothing to wait for.
@@ -483,7 +558,7 @@ defmodule OPCUA.Server.Subscriptions do
 
         items =
           Map.new(sub.items, fn {id, item} ->
-            if item.mode != :disabled and now >= item.due,
+            if item.kind == :value and item.mode != :disabled and now >= item.due,
               do: {id, sample_item(%{item | due: now + item.sampling}, space)},
               else: {id, item}
           end)
@@ -543,11 +618,81 @@ defmodule OPCUA.Server.Subscriptions do
   defp create_item(%Types.MonitoredItemCreateRequest{} = create, timestamps, sub, space) do
     read = create.item_to_monitor
 
+    if OPCUA.AttributeId.name(read.attribute_id) == :event_notifier,
+      do: create_event_item(create, sub, space),
+      else: create_value_item(create, timestamps, sub, space)
+  end
+
+  defp create_event_item(create, sub, space) do
+    read = create.item_to_monitor
+
+    with %Node{} = node <-
+           AddressSpace.get(space, read.node_id) || {:error, :bad_node_id_unknown},
+         true <-
+           Bitwise.band(node.attributes[:event_notifier] || 0, 1) == 1 ||
+             {:error, :bad_attribute_id_invalid},
+         {:ok, filter_result, item} <-
+           event_parameters(
+             %{
+               id: sub.next_item + 1,
+               kind: :events,
+               read: read,
+               mode: create.monitoring_mode,
+               queue: []
+             },
+             create.requested_parameters,
+             space
+           ) do
+      result = %Types.MonitoredItemCreateResult{
+        status_code: 0,
+        monitored_item_id: item.id,
+        revised_sampling_interval: 0.0,
+        revised_queue_size: item.queue_size,
+        filter_result: filter_result
+      }
+
+      {result, %{sub | next_item: item.id, items: Map.put(sub.items, item.id, item)}}
+    else
+      {:error, status} ->
+        {%Types.MonitoredItemCreateResult{status_code: code(status)}, sub}
+
+      {:error, status, result} ->
+        {%Types.MonitoredItemCreateResult{status_code: code(status), filter_result: result}, sub}
+    end
+  end
+
+  defp modify(%{kind: :events} = item, parameters, _sub, space) do
+    case event_parameters(item, parameters, space) do
+      {:ok, _, item} -> {:ok, Map.put(item, :sampling, 0)}
+      {:error, status, _} -> {:error, status}
+    end
+  end
+
+  defp modify(item, parameters, sub, _space), do: parameters(item, parameters, sub)
+
+  defp event_parameters(item, %Types.MonitoringParameters{} = p, space) do
+    with {:ok, result} <- Events.check(p.filter, space) do
+      queue = if p.queue_size in [0, 1], do: @max_queue, else: min(p.queue_size, @max_queue * 10)
+
+      {:ok, result,
+       Map.merge(item, %{
+         handle: p.client_handle,
+         queue_size: queue,
+         discard_oldest: p.discard_oldest,
+         filter: p.filter
+       })}
+    end
+  end
+
+  defp create_value_item(create, timestamps, sub, space) do
+    read = create.item_to_monitor
+
     with :ok <- monitorable(space, read),
          {:ok, item} <-
            parameters(
              %{
                id: sub.next_item + 1,
+               kind: :value,
                read: read,
                timestamps: timestamps,
                mode: create.monitoring_mode,
@@ -580,9 +725,7 @@ defmodule OPCUA.Server.Subscriptions do
   defp monitorable(space, read) do
     case AddressSpace.read(space, %{read | index_range: nil}, :neither) do
       %DataValue{status: 0} ->
-        if OPCUA.AttributeId.name(read.attribute_id) == :event_notifier,
-          do: {:error, :bad_filter_not_allowed},
-          else: :ok
+        :ok
 
       %DataValue{status: status} ->
         {:error, StatusCode.name(status)}
@@ -637,8 +780,9 @@ defmodule OPCUA.Server.Subscriptions do
     do: Process.send_after(self(), {:publish_cycle, auth, sub.id}, sub.interval)
 
   defp schedule(auth, sub, :sample) do
+    # Event items aren't sampled.
     fastest =
-      sub.items |> Map.values() |> Enum.map(& &1.sampling) |> Enum.min(fn -> sub.interval end)
+      Enum.min(for({_, %{kind: :value, sampling: s}} <- sub.items, do: s), fn -> sub.interval end)
 
     Process.send_after(self(), {:sample, auth, sub.id}, min(fastest, sub.interval))
   end

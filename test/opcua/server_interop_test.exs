@@ -6,7 +6,7 @@ defmodule OPCUA.ServerInteropTest do
 
   alias OPCUA.Server
 
-  test "asyncua's client reads, writes, browses, calls, subscribes and logs in" do
+  test "asyncua's client reads, writes, browses, calls, subscribes, acknowledges alarms and logs in" do
     server = start_supervised!({Server, port: 0, users: %{"operator" => "secret"}})
     2 = Server.namespace(server, "urn:plant")
     :ok = Server.add_object(server, "ns=2;s=Pump1", "Pump1")
@@ -38,6 +38,24 @@ defmodule OPCUA.ServerInteropTest do
         inputs: [{"a", :int32}, {"b", :int32}],
         outputs: [{"product", :int32}],
         call: fn [a, b] -> {:ok, [a * b]} end
+      )
+
+    test = self()
+
+    :ok =
+      Server.add_condition(server, "ns=2;s=Pump1.Overload", "Overload",
+        source: "ns=2;s=Pump1",
+        severity: 700,
+        message: "Pump 1 overload",
+        acknowledge: fn comment -> send(test, {:acknowledged, comment}) && :ok end
+      )
+
+    :ok =
+      Server.add_method(server, "ns=2;s=Pump1.Trip", "Trip",
+        parent: "ns=2;s=Pump1",
+        call: fn [] ->
+          Server.condition(server, "ns=2;s=Pump1.Overload", active: true) && {:ok, []}
+        end
       )
 
     # More children than one browse returns, so asyncua must use BrowseNext.
@@ -75,9 +93,19 @@ defmodule OPCUA.ServerInteropTest do
              "state" => "Running",
              "many" => 1500,
              "subscription" => [1234, 777],
+             "alarm" => %{
+               "condition" => "ns=2;s=Pump1.Overload",
+               "message" => "Pump 1 overload",
+               "severity" => 700,
+               "active" => true,
+               "acked" => false,
+               "acked_after" => true,
+               "comment" => "from asyncua"
+             },
              "user_read" => 21.5
            }
 
     assert Server.get(server, "ns=2;s=Pump1.Speed").value.value == 777
+    assert_received {:acknowledged, "from asyncua"}
   end
 end

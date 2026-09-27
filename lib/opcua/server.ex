@@ -37,7 +37,7 @@ defmodule OPCUA.Server do
   use GenServer
 
   alias OPCUA.{DataValue, LocalizedText, NodeId, QualifiedName, Variant}
-  alias OPCUA.Server.{AddressSpace, Connection, Node}
+  alias OPCUA.Server.{AddressSpace, Conditions, Connection, Events, Node}
   alias OPCUA.Types
 
   @objects %NodeId{id: 85}
@@ -258,6 +258,52 @@ defmodule OPCUA.Server do
   end
 
   @doc """
+  Sends an event to the clients that subscribe to events.
+
+  ## Options
+
+    * `:source` - the node it's about (default the Server object)
+    * `:message`, `:severity` (1 to 1000, default 500)
+    * `:type` - the event type (default BaseEventType, `i=2041`)
+    * `:fields` - more fields, as `{"Path", %OPCUA.Variant{}}`
+  """
+  @spec event(GenServer.server(), keyword) :: :ok
+  def event(server, opts \\ []), do: GenServer.call(server, {:event, opts})
+
+  @doc """
+  Adds an alarm: a condition (Part 9) on `:source`, off and acknowledged to
+  begin with. Clients see it through events, and can acknowledge it.
+
+  ## Options
+
+    * `:source` - the node the alarm is about (required); it becomes an
+      event notifier, so clients can subscribe to its events
+    * `:message` - the alarm text (default the name)
+    * `:severity` - 1 to 1000 (default 500)
+    * `:type` - `:off_normal` (the default), `:alarm`, `:discrete`, or the
+      node id of another condition type
+    * `:acknowledge` - a function called with the comment when a client
+      acknowledges; it returns `:ok`, or `{:error, status}` to refuse. It runs
+      in the process of the client's connection.
+  """
+  @spec add_condition(GenServer.server(), node_ref, String.t(), keyword) :: :ok | {:error, atom}
+  def add_condition(server, node, name, opts) do
+    opts = Keyword.update!(opts, :source, &node_id/1)
+    GenServer.call(server, {:add_condition, node_id(node), name, opts})
+  end
+
+  @doc """
+  Changes an alarm: `active:`, `acked:`, `enabled:`, `severity:` or
+  `message:`. Clients get an event when anything changed. An alarm that
+  becomes active also becomes unacknowledged, unless `acked:` says otherwise.
+
+      :ok = OPCUA.Server.condition(server, "ns=2;s=Pump1.Overload", active: true)
+  """
+  @spec condition(GenServer.server(), node_ref, keyword) :: :ok | {:error, atom}
+  def condition(server, node, changes),
+    do: GenServer.call(server, {:condition, node_id(node), changes})
+
+  @doc """
   Sets the value of a variable, with the current time as its source
   timestamp. A `OPCUA.DataValue` is stored as given.
 
@@ -366,7 +412,8 @@ defmodule OPCUA.Server do
         anonymous: Keyword.get(opts, :anonymous, true),
         users: Keyword.get(opts, :users),
         # channel, token and subscription ids, unique across the server's connections
-        ids: :atomics.new(3, signed: false)
+        ids: :atomics.new(3, signed: false),
+        server: self()
       }
 
       namespaces = ["http://opcfoundation.org/UA/", application_uri]
@@ -490,6 +537,43 @@ defmodule OPCUA.Server do
     end
   end
 
+  def handle_call({:event, opts}, _, state) do
+    space = state.config.space
+    source = node_id(Keyword.get(opts, :source, %NodeId{id: 2253}))
+    type = node_id(Keyword.get(opts, :type, %NodeId{id: 2041}))
+
+    event =
+      Events.new(
+        space,
+        type,
+        source,
+        opts[:message],
+        Keyword.get(opts, :severity, 500),
+        Keyword.get(opts, :fields, [])
+      )
+
+    broadcast(state, event)
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:add_condition, node, name, opts}, _, state) do
+    {:reply, Conditions.add(state.config.space, node, name, opts), state}
+  end
+
+  def handle_call({:condition, node, changes}, _, state) do
+    case Conditions.update(state.config.space, node, changes) do
+      {:ok, event} ->
+        broadcast(state, event)
+        {:reply, :ok, state}
+
+      :unchanged ->
+        {:reply, :ok, state}
+
+      error ->
+        {:reply, error, state}
+    end
+  end
+
   def handle_call({:add, node, value, parent, reference, type_definition}, _, state) do
     {:reply,
      AddressSpace.add(state.config.space, node, value, parent, reference, type_definition), state}
@@ -497,6 +581,13 @@ defmodule OPCUA.Server do
 
   @impl true
   def handle_info({:EXIT, _, reason}, state), do: {:stop, reason, state}
+
+  # Every connection gets the event; each checks its own event items.
+  defp broadcast(state, event) do
+    for {_, pid, _, _} <- DynamicSupervisor.which_children(state.connections),
+        is_pid(pid),
+        do: send(pid, {:event, event})
+  end
 
   @impl true
   def terminate(_, state) do

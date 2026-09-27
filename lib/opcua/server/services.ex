@@ -7,7 +7,7 @@ defmodule OPCUA.Server.Services do
   require Logger
 
   alias OPCUA.{NodeId, SecureChannel, StatusCode, Variant}
-  alias OPCUA.Server.{AddressSpace, Node, Subscriptions}
+  alias OPCUA.Server.{AddressSpace, Conditions, Node, Subscriptions}
   alias OPCUA.Types
 
   # How many operations one request may ask for, and references one browse
@@ -311,7 +311,9 @@ defmodule OPCUA.Server.Services do
   end
 
   defp call(%Types.CallRequest{} = request, session, state) do
-    results = for call <- request.methods_to_call, do: method(state.config.space, call)
+    {results, session} =
+      Enum.map_reduce(request.methods_to_call, session, &call_method(&1, &2, state))
+
     {%Types.CallResponse{response_header: header(request, 0), results: results}, session}
   end
 
@@ -344,6 +346,136 @@ defmodule OPCUA.Server.Services do
       {result, %{session | continuation: Map.put(session.continuation, point, {later, max})}}
     end
   end
+
+  @condition_type %NodeId{id: 2782}
+  @refresh %NodeId{id: 3875}
+  @refresh2 %NodeId{id: 12912}
+  @acknowledge %NodeId{id: 9111}
+  @add_comment %NodeId{id: 9029}
+  @enable %NodeId{id: 9027}
+  @disable %NodeId{id: 9028}
+
+  # The methods of ConditionType and AcknowledgeableConditionType, called on
+  # the type (ConditionRefresh) or on a condition (the rest).
+  defp call_method(%{object_id: @condition_type, method_id: method} = call, session, state)
+       when method in [@refresh, @refresh2] do
+    space = state.config.space
+
+    case {method, call.input_arguments || []} do
+      {@refresh, [%Variant{type: :uint32, value: sub}]} ->
+        refresh(session, sub, nil, space)
+
+      {@refresh2, [%Variant{type: :uint32, value: sub}, %Variant{type: :uint32, value: item}]} ->
+        refresh(session, sub, item, space)
+
+      {_, args} ->
+        {arguments_status(args, if(method == @refresh, do: 1, else: 2)), session}
+    end
+  end
+
+  defp call_method(%{method_id: method} = call, session, state)
+       when method in [@acknowledge, @add_comment, @enable, @disable] do
+    space = state.config.space
+
+    case Conditions.state(space, call.object_id) do
+      nil ->
+        {method(space, call), session}
+
+      condition ->
+        {condition_method(method, condition, call.input_arguments || [], session, state), session}
+    end
+  end
+
+  defp call_method(call, session, state), do: {method(state.config.space, call), session}
+
+  defp refresh(session, sub, item, space) do
+    case Subscriptions.refresh(session, sub, item, Conditions.refresh(space), space) do
+      {:ok, session} -> {%Types.CallMethodResult{status_code: 0}, session}
+      {:error, status} -> {%Types.CallMethodResult{status_code: StatusCode.code(status)}, session}
+    end
+  end
+
+  defp arguments_status(args, wanted) do
+    status =
+      cond do
+        length(args) < wanted -> :bad_arguments_missing
+        length(args) > wanted -> :bad_too_many_arguments
+        true -> :bad_invalid_argument
+      end
+
+    %Types.CallMethodResult{status_code: StatusCode.code(status)}
+  end
+
+  defp condition_method(method, condition, args, session, state)
+       when method in [@acknowledge, @add_comment] do
+    with [
+           %Variant{type: :byte_string, value: event_id},
+           %Variant{type: :localized_text, value: comment}
+         ] <- args,
+         comment = comment && comment.text,
+         {:ok, condition} <- check_event(method, condition, event_id, state.config.space),
+         :ok <- if(method == @acknowledge, do: acknowledged(condition, comment), else: :ok) do
+      changes =
+        if method == @acknowledge, do: [acked: true, comment: comment], else: [comment: comment]
+
+      update(condition, changes ++ [user: user(session)], state)
+    else
+      {:error, status} -> %Types.CallMethodResult{status_code: StatusCode.code(status)}
+      args when is_list(args) -> arguments_status(args, 2)
+    end
+  end
+
+  defp condition_method(method, condition, [], _session, state) do
+    enable = method == @enable
+
+    if condition.enabled == enable,
+      do: %Types.CallMethodResult{
+        status_code:
+          StatusCode.code(
+            if(enable, do: :bad_condition_already_enabled, else: :bad_condition_already_disabled)
+          )
+      },
+      else: update(condition, [enabled: enable], state)
+  end
+
+  defp condition_method(_, _, args, _, _), do: arguments_status(args, 0)
+
+  defp check_event(@acknowledge, condition, event_id, space),
+    do: Conditions.acknowledgeable(space, condition.id, event_id)
+
+  defp check_event(@add_comment, %{event_id: event_id} = condition, event_id, _),
+    do: {:ok, condition}
+
+  defp check_event(@add_comment, _, _, _), do: {:error, :bad_event_id_unknown}
+
+  # The application hears of an acknowledgement first, and may refuse it.
+  defp acknowledged(%{acknowledge: nil}, _), do: :ok
+
+  defp acknowledged(%{acknowledge: fun} = condition, comment) do
+    case fun.(comment) do
+      :ok -> :ok
+      {:error, status} when is_atom(status) -> {:error, status}
+    end
+  rescue
+    exception ->
+      Logger.error(
+        "OPC UA acknowledge of #{condition.id} failed: " <>
+          Exception.format(:error, exception, __STACKTRACE__)
+      )
+
+      {:error, :bad_internal_error}
+  end
+
+  # The server process makes the change, so every client hears of it.
+  defp update(condition, changes, state) do
+    case GenServer.call(state.config.server, {:condition, condition.id, changes}) do
+      :ok -> %Types.CallMethodResult{status_code: 0}
+      {:error, status} -> %Types.CallMethodResult{status_code: StatusCode.code(status)}
+    end
+  end
+
+  defp user(%{user: user}) when is_binary(user), do: user
+  defp user(_), do: nil
 
   defp method(space, %Types.CallMethodRequest{} = call) do
     with %Node{} = object <-
