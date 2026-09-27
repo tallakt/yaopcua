@@ -1,0 +1,61 @@
+defmodule OPCUA.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :yaopcua,
+      version: "0.1.0",
+      elixir: "~> 1.18",
+      start_permanent: Mix.env() == :prod,
+      deps: deps(),
+      aliases: ["opcua.schema": &schema/1]
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger]
+    ]
+  end
+
+  defp deps do
+    []
+  end
+
+  # mix opcua.schema UA-1.05.07-2026-07-30
+  #
+  # Replaces schema/ with unmodified copies of the OPC Foundation's definition
+  # files from one release tag of https://github.com/OPCFoundation/UA-Nodeset,
+  # and writes the tag to schema/VERSION. This is an alias rather than a task in
+  # lib/ so it runs without compiling, and so it doesn't ship to projects that
+  # depend on yaopcua.
+  @schema ~w(Opc.Ua.Types.bsd NodeIds.csv StatusCode.csv AttributeIds.csv)
+
+  defp schema([tag]) do
+    {:ok, _} = Application.ensure_all_started([:inets, :ssl])
+
+    ssl = [
+      verify: :verify_peer,
+      cacerts: :public_key.cacerts_get(),
+      customize_hostname_check: [match_fun: :public_key.pkix_verify_hostname_match_fun(:https)]
+    ]
+
+    files =
+      for file <- @schema do
+        url = ~c"https://raw.githubusercontent.com/OPCFoundation/UA-Nodeset/#{tag}/Schema/#{file}"
+
+        case :httpc.request(:get, {url, []}, [ssl: ssl], body_format: :binary) do
+          {:ok, {{_, 200, _}, _, body}} -> {file, body}
+          {:ok, {{_, status, _}, _, _}} -> Mix.raise("#{file} of #{tag}: HTTP #{status}")
+          {:error, reason} -> Mix.raise("#{file} of #{tag}: #{inspect(reason)}")
+        end
+      end
+
+    File.mkdir_p!("schema")
+    for {file, body} <- files, do: File.write!(Path.join("schema", file), body)
+    File.write!("schema/VERSION", tag <> "\n")
+    Mix.shell().info("schema/ now holds #{tag}")
+  end
+
+  defp schema(_), do: Mix.raise("usage: mix opcua.schema UA-1.05.07-2026-07-30")
+end
