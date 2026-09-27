@@ -9,6 +9,10 @@ defmodule OPCUA.Client do
       {:ok, refs} = OPCUA.Client.browse(client, "ns=2;s=Plant")
       {:ok, [42]} = OPCUA.Client.call(client, "ns=2;s=Plant", "ns=2;s=Multiply", [6, 7])
 
+      {:ok, sub} = OPCUA.Client.subscribe(client, ["ns=2;s=Pump1.Speed"])
+      # the caller then gets
+      {OPCUA.Client, ^sub, {:value, "ns=2;s=Pump1.Speed", %OPCUA.DataValue{}}}
+
   Node ids are `OPCUA.NodeId` structs or their text form. Errors are the
   status code's name, such as `{:error, :bad_node_id_unknown}`.
 
@@ -36,26 +40,24 @@ defmodule OPCUA.Client do
 
   require Logger
 
-  alias OPCUA.{DataValue, NodeId, SecureChannel, StatusCode, Transport, Variant}
+  import OPCUA.Client.Connection, only: [with_header: 3, result: 1, status_name: 1]
+
+  alias OPCUA.{DataValue, NodeId, QualifiedName, SecureChannel, StatusCode, Transport, Variant}
+  alias OPCUA.Client.Connection
   alias OPCUA.Types
-
-  @receive_buffer 65_535
-  @max_message 16_777_216
-
-  @limits %{
-    protocol_version: 0,
-    receive_buffer_size: @receive_buffer,
-    send_buffer_size: @receive_buffer,
-    max_message_size: @max_message,
-    max_chunk_count: 0
-  }
 
   # ServerStatus.State, read to keep the session alive
   @keep_alive 2259
   @session_lost [:bad_session_id_invalid, :bad_session_closed, :bad_session_not_activated]
 
+  @base_event_type %NodeId{id: 2041}
+  @condition_type %NodeId{id: 2782}
+  @server_object "i=2253"
+  @event_fields ~w(EventId EventType SourceNode SourceName Time Message Severity)
+
   @type client :: GenServer.server()
   @type node_ref :: NodeId.t() | String.t()
+  @type subscription :: non_neg_integer
   @type error :: {:error, atom | non_neg_integer}
 
   @doc "Connects and activates a session. See the module doc for the options."
@@ -124,12 +126,13 @@ defmodule OPCUA.Client do
       value = OPCUA.AttributeId.id(:value)
 
       items =
-        for {{node, _}, variant} <- Enum.zip(writes, variants),
-            do: %Types.WriteValue{
-              node_id: node_id(node),
-              attribute_id: value,
-              value: %DataValue{value: variant}
-            }
+        for {{node, _}, variant} <- Enum.zip(writes, variants) do
+          %Types.WriteValue{
+            node_id: node_id(node),
+            attribute_id: value,
+            value: %DataValue{value: variant}
+          }
+        end
 
       with {:ok, %{results: results}} <-
              request(client, %Types.WriteRequest{nodes_to_write: items}) do
@@ -139,16 +142,17 @@ defmodule OPCUA.Client do
   end
 
   defp variants(client, writes) do
-    Enum.reduce_while(writes, {:ok, []}, fn {node, value}, {:ok, acc} ->
+    writes
+    |> Enum.reduce_while({:ok, []}, fn {node, value}, {:ok, acc} ->
       case variant(client, node_id(node), value) do
         {:ok, variant} -> {:cont, {:ok, [variant | acc]}}
         error -> {:halt, error}
       end
     end)
-    |> then(fn
+    |> case do
       {:ok, acc} -> {:ok, Enum.reverse(acc)}
       error -> error
-    end)
+    end
   end
 
   defp variant(_, _, %Variant{} = variant), do: {:ok, variant}
@@ -156,13 +160,19 @@ defmodule OPCUA.Client do
   defp variant(client, node, value) do
     case GenServer.call(client, {:type, node}) do
       nil ->
-        with {:ok, [%DataValue{value: %Variant{type: type}}]} <- read_many(client, [node]) do
-          GenServer.cast(client, {:type, node, type})
-          {:ok, %Variant{type: type, value: value}}
-        else
-          {:ok, [%DataValue{status: status}]} when status != 0 -> {:error, status_name(status)}
-          {:ok, _} -> {:error, :bad_type_mismatch}
-          error -> error
+        case read_many(client, [node]) do
+          {:ok, [%DataValue{value: %Variant{type: type}}]} ->
+            GenServer.cast(client, {:type, node, type})
+            {:ok, %Variant{type: type, value: value}}
+
+          {:ok, [%DataValue{status: status}]} when status != 0 ->
+            {:error, status_name(status)}
+
+          {:ok, _} ->
+            {:error, :bad_type_mismatch}
+
+          error ->
+            error
         end
 
       type ->
@@ -212,18 +222,14 @@ defmodule OPCUA.Client do
         {:ok, Enum.concat(Enum.reverse([result.references || [] | acc]))}
 
       true ->
-        browse_next(client, result, acc)
-    end
-  end
+        request = %Types.BrowseNextRequest{
+          release_continuation_points: false,
+          continuation_points: [result.continuation_point]
+        }
 
-  defp browse_next(client, %Types.BrowseResult{continuation_point: point, references: refs}, acc) do
-    request = %Types.BrowseNextRequest{
-      release_continuation_points: false,
-      continuation_points: [point]
-    }
-
-    with {:ok, %{results: [result]}} <- request(client, request) do
-      browse_rest(client, result, [refs || [] | acc])
+        with {:ok, %{results: [next]}} <- request(client, request) do
+          browse_rest(client, next, [result.references || [] | acc])
+        end
     end
   end
 
@@ -261,6 +267,185 @@ defmodule OPCUA.Client do
   defp infer(v) when is_binary(v), do: %Variant{type: :string, value: v}
   defp infer(%DateTime{} = v), do: %Variant{type: :date_time, value: v}
   defp infer(%NodeId{} = v), do: %Variant{type: :node_id, value: v}
+  defp infer(%OPCUA.LocalizedText{} = v), do: %Variant{type: :localized_text, value: v}
+
+  @doc """
+  Subscribes to changes in the values of `nodes`. The subscriber gets
+
+      {OPCUA.Client, subscription, {:value, node, %OPCUA.DataValue{}}}
+
+  for each change, with `node` as given here. The first message for each node
+  comes right away, with its current value. A node the server can't monitor,
+  such as one that doesn't exist, gets a single message with its Bad status.
+
+  If the server drops the subscription, the subscriber gets
+  `{OPCUA.Client, subscription, {:status, status}}`.
+
+  ## Options
+
+    * `:to` - the subscriber, the caller by default. The subscription is
+      deleted when it exits.
+    * `:interval` - how often the server sends changes, in ms (default 1000)
+    * `:sampling` - how often the server samples the values, in ms (default
+      the interval)
+    * `:deadband` - `{:absolute, 0.5}` or `{:percent, 2.0}` to leave out small
+      changes of analog values
+    * `:queue` - how many changes the server keeps per node between sends
+      (default 1: only the latest)
+  """
+  @spec subscribe(client, [node_ref], keyword) :: {:ok, subscription} | error
+  def subscribe(client, nodes, opts \\ []) do
+    parameters = %Types.MonitoringParameters{
+      sampling_interval: Keyword.get(opts, :sampling, -1) * 1.0,
+      queue_size: Keyword.get(opts, :queue, 1),
+      discard_oldest: true,
+      filter: deadband(Keyword.get(opts, :deadband))
+    }
+
+    value = OPCUA.AttributeId.id(:value)
+
+    items =
+      for node <- nodes do
+        {{:value, node}, %Types.ReadValueId{node_id: node_id(node), attribute_id: value},
+         parameters}
+      end
+
+    create(client, items, opts)
+  end
+
+  defp deadband(nil), do: nil
+
+  defp deadband({type, value}) when type in [:absolute, :percent] do
+    %Types.DataChangeFilter{
+      trigger: :status_value,
+      deadband_type: if(type == :absolute, do: 1, else: 2),
+      deadband_value: value * 1.0
+    }
+  end
+
+  @doc """
+  Subscribes to the events a node reports, such as alarms. The subscriber gets
+
+      {OPCUA.Client, subscription, {:event, %{"Message" => ..., "Severity" => ...}}}
+
+  with the fields asked for, by name.
+
+  ## Options
+
+    * `:source` - the node whose events to get (default `i=2253`, the Server
+      object, which reports all events)
+    * `:fields` - the event fields to get, as browse paths from the event:
+      `"Message"`, `"ActiveState/Id"`, or `"2:MyField"` for a field in
+      namespace 2. `"ConditionId"` is the node id of an alarm's condition.
+      The default is #{Enum.map_join(@event_fields, ", ", &"`#{&1}`")}.
+    * `:to`, `:interval` - as for `subscribe/3`
+    * `:queue` - how many events the server keeps between sends (default 1000)
+  """
+  @spec subscribe_events(client, keyword) :: {:ok, subscription} | error
+  def subscribe_events(client, opts \\ []) do
+    fields = Keyword.get(opts, :fields, @event_fields)
+
+    parameters = %Types.MonitoringParameters{
+      sampling_interval: 0.0,
+      queue_size: Keyword.get(opts, :queue, 1000),
+      discard_oldest: true,
+      filter: %Types.EventFilter{select_clauses: Enum.map(fields, &operand/1)}
+    }
+
+    source = node_id(Keyword.get(opts, :source, @server_object))
+
+    item = %Types.ReadValueId{
+      node_id: source,
+      attribute_id: OPCUA.AttributeId.id(:event_notifier)
+    }
+
+    create(client, [{{:events, fields}, item, parameters}], opts)
+  end
+
+  defp operand("ConditionId") do
+    %Types.SimpleAttributeOperand{
+      type_definition_id: @condition_type,
+      attribute_id: OPCUA.AttributeId.id(:node_id)
+    }
+  end
+
+  # With BaseEventType as the type, the server resolves the path on whatever
+  # event it has (Part 4, SimpleAttributeOperand).
+  defp operand(path) do
+    %Types.SimpleAttributeOperand{
+      type_definition_id: @base_event_type,
+      browse_path: path |> String.split("/") |> Enum.map(&qualified_name/1),
+      attribute_id: OPCUA.AttributeId.id(:value)
+    }
+  end
+
+  defp qualified_name(name) do
+    case Integer.parse(name) do
+      {ns, ":" <> name} -> %QualifiedName{ns: ns, name: name}
+      _ -> %QualifiedName{ns: 0, name: name}
+    end
+  end
+
+  defp create(client, items, opts) do
+    pid = Keyword.get(opts, :to, self())
+    interval = Keyword.get(opts, :interval, 1000)
+    # Keep-alives about every 10 s, and a lifetime six times that.
+    keep_alive = max(1, ceil(10_000 / interval))
+
+    request = %Types.CreateSubscriptionRequest{
+      requested_publishing_interval: interval * 1.0,
+      requested_lifetime_count: keep_alive * 6,
+      requested_max_keep_alive_count: keep_alive,
+      publishing_enabled: true
+    }
+
+    with {:ok, created} <- request(client, request) do
+      sub = created.subscription_id
+      # Registered before the items exist, so their first values aren't missed.
+      handles = GenServer.call(client, {:register, created, pid, Enum.map(items, &elem(&1, 0))})
+
+      creates =
+        for {{_, item, parameters}, handle} <- Enum.zip(items, handles) do
+          %Types.MonitoredItemCreateRequest{
+            item_to_monitor: item,
+            monitoring_mode: :reporting,
+            requested_parameters: %{parameters | client_handle: handle}
+          }
+        end
+
+      monitored = %Types.CreateMonitoredItemsRequest{
+        subscription_id: sub,
+        timestamps_to_return: :both,
+        items_to_create: creates
+      }
+
+      case request(client, monitored) do
+        {:ok, %{results: results}} ->
+          failed =
+            for {handle, %{status_code: status}} <- Enum.zip(handles, results),
+                StatusCode.bad?(status),
+                do: {handle, status}
+
+          if failed != [], do: GenServer.cast(client, {:failed, sub, failed})
+          {:ok, sub}
+
+        error ->
+          unsubscribe(client, sub)
+          error
+      end
+    end
+  end
+
+  @doc "Deletes a subscription. The subscriber gets no more messages from it."
+  @spec unsubscribe(client, subscription) :: :ok | error
+  def unsubscribe(client, subscription) do
+    :ok = GenServer.call(client, {:unregister, subscription})
+    request = %Types.DeleteSubscriptionsRequest{subscription_ids: [subscription]}
+
+    with {:ok, %{results: [status]}} <- request(client, request) do
+      if StatusCode.bad?(status), do: {:error, status_name(status)}, else: :ok
+    end
+  end
 
   @doc """
   Sends any service request from `OPCUA.Types` and returns its response. The
@@ -290,10 +475,10 @@ defmodule OPCUA.Client do
   def endpoints(url, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 5000)
 
-    with {:ok, state} <- connect(url, timeout, 60_000) do
-      case exchange(state, %Types.GetEndpointsRequest{endpoint_url: url}) do
+    with {:ok, state} <- Connection.connect(url, timeout, 60_000) do
+      case Connection.exchange(state, %Types.GetEndpointsRequest{endpoint_url: url}) do
         {:ok, %{endpoints: endpoints}, state} ->
-          disconnect(state)
+          Connection.disconnect(state)
           {:ok, endpoints}
 
         error ->
@@ -306,306 +491,107 @@ defmodule OPCUA.Client do
   defp node_id(%NodeId{} = node), do: node
   defp node_id(text) when is_binary(text), do: NodeId.parse!(text)
 
-  defp status_name(status), do: StatusCode.name(status) || status
-
-  ## Server
+  ## The process
 
   @impl true
   def init(opts) do
     Process.flag(:trap_exit, true)
     url = Keyword.fetch!(opts, :url)
     timeout = Keyword.get(opts, :timeout, 5000)
+    lifetime = Keyword.get(opts, :channel_lifetime, 3_600_000)
 
-    with {:ok, state} <- connect(url, timeout, Keyword.get(opts, :channel_lifetime, 3_600_000)),
-         {:ok, state} <- session(state, opts),
-         # Chunks that arrived with the last handshake reply still go through the channel.
-         {:noreply, state} <-
-           Enum.reduce_while(state.chunks, {:noreply, %{state | chunks: []}}, &chunk/2) do
+    with {:ok, state} <- Connection.connect(url, timeout, lifetime),
+         {:ok, state} <- Connection.session(state, opts),
+         # Chunks that came with the last handshake reply still go through the channel.
+         {:noreply, state} <- chunks(state.chunks, %{state | chunks: []}) do
       :ok = :inet.setopts(state.socket, active: true)
-      {:ok, schedule(state)}
+      {:ok, state |> schedule_renew() |> schedule_keep_alive()}
     else
       {:error, reason} -> {:stop, reason}
       {:stop, reason, _} -> {:stop, reason}
     end
   end
 
-  # A connection that is set up with blocking receives, before the process
-  # switches the socket to active mode.
-  defp connect(url, timeout, lifetime) do
-    with {:ok, {host, port}} <- Transport.endpoint(url),
-         {:ok, socket} <-
-           :gen_tcp.connect(host, port, [:binary, active: false, nodelay: true], timeout),
-         state = %{
-           socket: socket,
-           url: url,
-           timeout: timeout,
-           lifetime: lifetime,
-           buffer: <<>>,
-           chunks: [],
-           channel: nil,
-           token: nil,
-           pending: %{},
-           types: %{},
-           handle: 0
-         },
-         :ok <-
-           :gen_tcp.send(socket, Transport.frame(:hello, :final, Transport.hello(@limits, url))),
-         {:ok, limits, state} <- acknowledge(state),
-         state = %{state | channel: SecureChannel.new(limits, receive_max_message: @max_message)},
-         {:ok, state} <- open(state, :issue) do
-      {:ok, state}
-    else
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp acknowledge(state) do
-    case receive_chunk(state) do
-      {:ok, {:acknowledge, :final, body}, state} ->
-        with {:ok, limits} <- Transport.decode(:acknowledge, body), do: {:ok, limits, state}
-
-      {:ok, {:error, _, body}, _} ->
-        remote_error(body)
-
-      {:ok, _, _} ->
-        {:error, :bad_tcp_message_type_invalid}
-
-      error ->
-        error
-    end
-  end
-
-  defp open(state, type) do
-    request = %Types.OpenSecureChannelRequest{
-      request_header: header(state, 0),
-      client_protocol_version: 0,
-      request_type: type,
-      security_mode: :none,
-      client_nonce: "",
-      requested_lifetime: state.lifetime
-    }
-
-    {id, channel} = SecureChannel.next_request_id(state.channel)
-
-    with {:ok, frames, channel} <- SecureChannel.encode(channel, :open, id, request),
-         :ok <- :gen_tcp.send(state.socket, frames),
-         {:ok, %Types.OpenSecureChannelResponse{} = response, state} <-
-           await(%{state | channel: channel}, id) do
-      {:ok,
-       %{
-         state
-         | channel: SecureChannel.token(state.channel, response.security_token),
-           token: response.security_token
-       }}
-    end
-  end
-
-  defp session(state, opts) do
-    create = %Types.CreateSessionRequest{
-      client_description: %Types.ApplicationDescription{
-        application_uri: Keyword.get(opts, :application_uri, "urn:yaopcua:client"),
-        product_uri: "urn:yaopcua",
-        application_name: %OPCUA.LocalizedText{text: "yaopcua"},
-        application_type: :client
-      },
-      endpoint_url: state.url,
-      session_name: Keyword.get(opts, :session_name, "yaopcua"),
-      client_nonce: :crypto.strong_rand_bytes(32),
-      requested_session_timeout: Keyword.get(opts, :session_timeout, 60_000) * 1.0,
-      max_response_message_size: @max_message
-    }
-
-    with {:ok, created, state} <- exchange(state, create),
-         state =
-           Map.merge(state, %{
-             auth: created.authentication_token,
-             session_timeout: created.revised_session_timeout
-           }),
-         {:ok, token} <- identity(created.server_endpoints, Keyword.get(opts, :user, :anonymous)),
-         {:ok, _, state} <-
-           exchange(state, %Types.ActivateSessionRequest{
-             user_identity_token: token,
-             locale_ids: ["en"]
-           }) do
-      {:ok, state}
-    end
-  end
-
-  defp identity(endpoints, user) do
-    none = SecureChannel.none()
-
-    policies =
-      for %{security_policy_uri: ^none, user_identity_tokens: tokens} <- endpoints || [],
-          token <- tokens || [],
-          do: token
-
-    case {user, policies} do
-      {:anonymous, _} ->
-        policy = Enum.find(policies, &(&1.token_type == :anonymous))
-
-        {:ok,
-         %Types.AnonymousIdentityToken{
-           policy_id: if(policy, do: policy.policy_id, else: "anonymous")
-         }}
-
-      {{name, password}, _} ->
-        case Enum.find(policies, &(&1.token_type == :user_name)) do
-          nil ->
-            {:error, :bad_identity_token_rejected}
-
-          %{security_policy_uri: uri} = policy when uri in [nil, "", none] ->
-            {:ok,
-             %Types.UserNameIdentityToken{
-               policy_id: policy.policy_id,
-               user_name: name,
-               password: password
-             }}
-
-          _ ->
-            # The server wants the password encrypted; that comes with security.
-            {:error, :bad_security_policy_rejected}
-        end
-    end
-  end
-
-  # Sends a request and waits for its response, before the socket goes active.
-  defp exchange(state, request) do
-    {id, channel} = SecureChannel.next_request_id(state.channel)
-    {request, state} = with_header(%{state | channel: channel}, request, state.timeout)
-
-    with {:ok, frames, channel} <- SecureChannel.encode(state.channel, :message, id, request),
-         :ok <- :gen_tcp.send(state.socket, frames),
-         {:ok, response, state} <- await(%{state | channel: channel}, id) do
-      case result(response) do
-        {:ok, response} -> {:ok, response, state}
-        error -> error
-      end
-    end
-  end
-
-  defp await(state, id) do
-    with {:ok, chunk, state} <- receive_chunk(state) do
-      case chunk do
-        {:error, _, body} ->
-          remote_error(body)
-
-        {kind, _, _} = chunk when kind in [:open, :message] ->
-          case SecureChannel.receive(state.channel, chunk) do
-            {:ok, channel} -> await(%{state | channel: channel}, id)
-            {:ok, {_, ^id, response}, channel} -> {:ok, response, %{state | channel: channel}}
-            {:ok, _other, channel} -> await(%{state | channel: channel}, id)
-            {:abort, ^id, status, _, _} -> {:error, status_name(status)}
-            {:abort, _, _, _, channel} -> await(%{state | channel: channel}, id)
-            {:error, _} = error -> error
-          end
-
-        _ ->
-          {:error, :bad_tcp_message_type_invalid}
-      end
-    end
-  end
-
-  defp receive_chunk(%{chunks: [chunk | more]} = state), do: {:ok, chunk, %{state | chunks: more}}
-
-  defp receive_chunk(state) do
-    case Transport.split(state.buffer, @receive_buffer) do
-      {:ok, [], rest} ->
-        case :gen_tcp.recv(state.socket, 0, state.timeout) do
-          {:ok, data} -> receive_chunk(%{state | buffer: rest <> data})
-          {:error, :timeout} -> {:error, :bad_timeout}
-          {:error, _} -> {:error, :bad_connection_closed}
-        end
-
-      {:ok, chunks, rest} ->
-        receive_chunk(%{state | chunks: chunks, buffer: rest})
-
-      error ->
-        error
-    end
-  end
-
-  defp remote_error(body) do
-    case Transport.decode(:error, body) do
-      {:ok, {status, _reason}} -> {:error, status_name(status)}
-      error -> error
-    end
-  end
-
-  defp disconnect(state) do
-    {id, channel} = SecureChannel.next_request_id(state.channel)
-
-    with {:ok, frames, _} <-
-           SecureChannel.encode(channel, :close, id, %Types.CloseSecureChannelRequest{
-             request_header: header(state, 0)
-           }) do
-      :gen_tcp.send(state.socket, frames)
-    end
-
-    :gen_tcp.close(state.socket)
-  end
-
-  defp header(state, handle) do
-    %Types.RequestHeader{
-      authentication_token: Map.get(state, :auth),
-      timestamp: DateTime.utc_now(),
-      request_handle: handle,
-      timeout_hint: state.timeout
-    }
-  end
-
-  defp with_header(state, request, timeout) do
-    handle = if state.handle >= 0xFFFF_FFFF, do: 1, else: state.handle + 1
-    header = %{header(state, handle) | timeout_hint: timeout}
-    {%{request | request_header: header}, %{state | handle: handle}}
-  end
-
-  defp result(%Types.ServiceFault{response_header: %{service_result: status}}),
-    do: {:error, status_name(status)}
-
-  defp result(%{response_header: %{service_result: status}} = response) do
-    if StatusCode.bad?(status), do: {:error, status_name(status)}, else: {:ok, response}
-  end
-
-  ## Running
-
   @impl true
   def handle_call({:request, request, timeout}, from, state) do
     timeout = timeout || state.timeout
-    {id, channel} = SecureChannel.next_request_id(state.channel)
-    {request, state} = with_header(%{state | channel: channel}, request, timeout)
 
     try do
-      send_message(state, :message, id, request)
+      send_request(state, request, timeout, from, timeout)
     rescue
       exception in ArgumentError -> {:raise, exception}
     end
     |> case do
-      {:ok, state} ->
-        timer = Process.send_after(self(), {:timeout, id}, timeout)
-        {:noreply, %{state | pending: Map.put(state.pending, id, {from, timer})}}
-
-      {:raise, exception} ->
-        {:reply, {:raise, exception}, state}
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
+      {:ok, state} -> {:noreply, state}
+      {:raise, exception} -> {:reply, {:raise, exception}, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
 
   def handle_call({:type, node}, _from, state), do: {:reply, Map.get(state.types, node), state}
 
+  def handle_call({:register, created, pid, keys}, _from, state) do
+    sub = created.subscription_id
+    first = state.next_handle + 1
+    handles = Enum.to_list(first..(first + length(keys) - 1)//1)
+
+    items =
+      for {handle, key} <- Enum.zip(handles, keys), into: state.items, do: {handle, {sub, key}}
+
+    subscription = %{
+      pid: pid,
+      monitor: Process.monitor(pid),
+      handles: handles,
+      keep_alive: created.revised_publishing_interval * created.revised_max_keep_alive_count
+    }
+
+    state = %{
+      state
+      | subscriptions: Map.put(state.subscriptions, sub, subscription),
+        items: items,
+        next_handle: first + length(keys) - 1
+    }
+
+    {:reply, handles, publish(state)}
+  end
+
+  def handle_call({:unregister, sub}, _from, state), do: {:reply, :ok, drop(state, sub)}
+
   @impl true
   def handle_cast({:type, node, type}, state),
     do: {:noreply, %{state | types: Map.put(state.types, node, type)}}
 
+  def handle_cast({:failed, sub, failed}, state) do
+    case state.subscriptions do
+      %{^sub => %{pid: pid}} ->
+        items =
+          Enum.reduce(failed, state.items, fn {handle, status}, items ->
+            case Map.pop(items, handle) do
+              {{^sub, {:value, node}}, items} ->
+                send(pid, {__MODULE__, sub, {:value, node, %DataValue{status: status}}})
+                items
+
+              {{^sub, {:events, _}}, items} ->
+                send(pid, {__MODULE__, sub, {:status, status_name(status)}})
+                items
+
+              {_, items} ->
+                items
+            end
+          end)
+
+        {:noreply, %{state | items: items}}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   @impl true
   def handle_info({:tcp, _, data}, state) do
-    case Transport.split(state.buffer <> data, @receive_buffer) do
-      {:ok, chunks, rest} ->
-        chunks |> Enum.reduce_while({:noreply, %{state | buffer: rest}}, &chunk/2)
-
-      {:error, reason} ->
-        {:stop, {:shutdown, reason}, state}
+    case Transport.split(state.buffer <> data, Connection.receive_buffer()) do
+      {:ok, chunks, rest} -> chunks(chunks, %{state | buffer: rest})
+      {:error, reason} -> {:stop, {:shutdown, reason}, state}
     end
   end
 
@@ -614,64 +600,56 @@ defmodule OPCUA.Client do
 
   def handle_info({:tcp_error, _, reason}, state), do: {:stop, {:shutdown, reason}, state}
 
-  def handle_info({:timeout, id}, state) do
-    case Map.pop(state.pending, id) do
-      {{from, _}, pending} when is_tuple(from) ->
-        GenServer.reply(from, {:error, :bad_timeout})
-        {:noreply, %{state | pending: pending}}
-
-      {_, pending} ->
-        {:noreply, %{state | pending: pending}}
-    end
-  end
+  def handle_info({:timeout, id}, state),
+    do: {:noreply, respond(state, id, {:error, :bad_timeout})}
 
   def handle_info(:keep_alive, state) do
-    {id, channel} = SecureChannel.next_request_id(state.channel)
-
     read = %Types.ReadValueId{
       node_id: %NodeId{id: @keep_alive},
       attribute_id: OPCUA.AttributeId.id(:value)
     }
 
-    {request, state} =
-      with_header(
-        %{state | channel: channel},
-        %Types.ReadRequest{nodes_to_read: [read]},
-        state.timeout
-      )
+    request = %Types.ReadRequest{nodes_to_read: [read]}
 
-    case send_message(state, :message, id, request) do
-      {:ok, state} ->
-        {:noreply,
-         schedule_keep_alive(%{state | pending: Map.put(state.pending, id, {:keep_alive, nil})})}
-
-      {:error, reason} ->
-        {:stop, {:shutdown, reason}, state}
+    case send_request(state, request, state.timeout, :keep_alive, state.timeout) do
+      {:ok, state} -> {:noreply, schedule_keep_alive(state)}
+      {:error, reason} -> {:stop, {:shutdown, reason}, state}
     end
   end
 
   def handle_info(:renew, state) do
     {id, channel} = SecureChannel.next_request_id(state.channel)
-
-    request = %Types.OpenSecureChannelRequest{
-      request_header: header(state, 0),
-      request_type: :renew,
-      security_mode: :none,
-      client_nonce: "",
-      requested_lifetime: state.lifetime
-    }
+    request = Connection.open_request(state, :renew)
 
     case send_message(%{state | channel: channel}, :open, id, request) do
-      {:ok, state} -> {:noreply, %{state | pending: Map.put(state.pending, id, {:renew, nil})}}
+      {:ok, state} -> {:noreply, put_pending(state, id, :renew, nil)}
       {:error, reason} -> {:stop, {:shutdown, reason}, state}
+    end
+  end
+
+  def handle_info({:DOWN, ref, :process, _, _}, state) do
+    case Enum.find(state.subscriptions, fn {_, s} -> s.monitor == ref end) do
+      {sub, _} ->
+        state = drop(state, sub)
+        request = %Types.DeleteSubscriptionsRequest{subscription_ids: [sub]}
+
+        case send_request(state, request, state.timeout, :ignore, state.timeout) do
+          {:ok, state} -> {:noreply, state}
+          {:error, reason} -> {:stop, {:shutdown, reason}, state}
+        end
+
+      nil ->
+        {:noreply, state}
     end
   end
 
   def handle_info({:session_lost, status}, state), do: {:stop, {:shutdown, status}, state}
   def handle_info({:EXIT, _, reason}, state), do: {:stop, reason, state}
 
+  defp chunks(chunks, state), do: Enum.reduce_while(chunks, {:noreply, state}, &chunk/2)
+
   defp chunk({:error, _, body}, {:noreply, state}) do
-    {:halt, {:stop, {:shutdown, remote_error(body)}, state}}
+    {:halt, {:stop, {:shutdown, Connection.remote_error(body)}, state}}
   end
 
   defp chunk(chunk, {:noreply, state}) do
@@ -691,40 +669,159 @@ defmodule OPCUA.Client do
     end
   end
 
+  # A response, or a timeout, for a request we sent.
   defp respond(state, id, reply) do
     case Map.pop(state.pending, id) do
       {nil, _} ->
         state
 
-      {{:renew, _}, pending} ->
-        case reply do
-          {:ok, %Types.OpenSecureChannelResponse{security_token: token}} ->
-            schedule_renew(%{
-              state
-              | pending: pending,
-                channel: SecureChannel.token(state.channel, token),
-                token: token
-            })
-
-          _ ->
-            Logger.warning("OPC UA secure channel renewal failed: #{inspect(reply)}")
-            %{state | pending: pending}
-        end
-
-      {{:keep_alive, _}, pending} ->
-        with {:error, status} when status in @session_lost <-
-               with({:ok, response} <- reply, do: result(response)) do
-          send(self(), {:session_lost, status})
-        end
-
-        %{state | pending: pending}
-
-      {{from, timer}, pending} ->
-        Process.cancel_timer(timer)
-        GenServer.reply(from, with({:ok, response} <- reply, do: result(response)))
-        %{state | pending: pending}
+      {{tag, timer}, pending} ->
+        if timer, do: Process.cancel_timer(timer)
+        reply = with {:ok, response} <- reply, do: result(response)
+        handle_reply(%{state | pending: pending}, tag, reply)
     end
   end
+
+  defp handle_reply(state, :renew, {:ok, %Types.OpenSecureChannelResponse{security_token: token}}) do
+    schedule_renew(%{state | channel: SecureChannel.token(state.channel, token), token: token})
+  end
+
+  defp handle_reply(state, :renew, reply) do
+    Logger.warning("OPC UA secure channel renewal failed: #{inspect(reply)}")
+    state
+  end
+
+  defp handle_reply(state, :keep_alive, {:error, status}) when status in @session_lost do
+    send(self(), {:session_lost, status})
+    state
+  end
+
+  defp handle_reply(state, :publish, reply) do
+    state = %{state | publishing: state.publishing - 1}
+
+    case reply do
+      {:ok, response} ->
+        state |> published(response) |> publish()
+
+      {:error, :bad_no_subscription} ->
+        state
+
+      {:error, :bad_too_many_publish_requests} ->
+        %{state | publish_target: max(1, state.publishing)}
+
+      {:error, status} when status in @session_lost ->
+        send(self(), {:session_lost, status})
+        state
+
+      {:error, _} ->
+        publish(state)
+    end
+  end
+
+  defp handle_reply(state, tag, _) when tag in [:keep_alive, :ignore], do: state
+
+  defp handle_reply(state, from, reply) do
+    GenServer.reply(from, reply)
+    state
+  end
+
+  # Keeps a few publish requests at the server while there are subscriptions,
+  # so it always has one to answer with notifications.
+  defp publish(%{subscriptions: subs} = state) when map_size(subs) == 0, do: state
+  defp publish(%{publishing: n, publish_target: target} = state) when n >= target, do: state
+
+  defp publish(state) do
+    # The server answers at least every keep-alive period, with nothing if it must.
+    keep_alive = state.subscriptions |> Map.values() |> Enum.map(& &1.keep_alive) |> Enum.max()
+    hint = trunc(keep_alive * 2)
+    request = %Types.PublishRequest{subscription_acknowledgements: Enum.reverse(state.acks)}
+
+    case send_request(%{state | acks: []}, request, hint, :publish, hint + state.timeout) do
+      {:ok, state} -> publish(%{state | publishing: state.publishing + 1})
+      {:error, _} -> state
+    end
+  end
+
+  defp published(state, %Types.PublishResponse{
+         subscription_id: sub,
+         notification_message: message
+       }) do
+    notifications = message.notification_data || []
+
+    state =
+      if notifications == [],
+        do: state,
+        else: %{
+          state
+          | acks: [
+              %Types.SubscriptionAcknowledgement{
+                subscription_id: sub,
+                sequence_number: message.sequence_number
+              }
+              | state.acks
+            ]
+        }
+
+    case state.subscriptions do
+      %{^sub => %{pid: pid}} -> Enum.reduce(notifications, state, &notify(&2, pid, sub, &1))
+      _ -> state
+    end
+  end
+
+  defp notify(state, pid, sub, %Types.DataChangeNotification{monitored_items: items}) do
+    for %{client_handle: handle, value: value} <- items || [],
+        {^sub, {:value, node}} <- [state.items[handle]],
+        do: send(pid, {__MODULE__, sub, {:value, node, value}})
+
+    state
+  end
+
+  defp notify(state, pid, sub, %Types.EventNotificationList{events: events}) do
+    for %{client_handle: handle, event_fields: fields} <- events || [],
+        {^sub, {:events, names}} <- [state.items[handle]] do
+      event = names |> Enum.zip(Enum.map(fields || [], &unwrap/1)) |> Map.new()
+      send(pid, {__MODULE__, sub, {:event, event}})
+    end
+
+    state
+  end
+
+  defp notify(state, pid, sub, %Types.StatusChangeNotification{status: status}) do
+    send(pid, {__MODULE__, sub, {:status, status_name(status)}})
+    if StatusCode.bad?(status), do: drop(state, sub), else: state
+  end
+
+  defp notify(state, _, _, _), do: state
+
+  defp drop(state, sub) do
+    case Map.pop(state.subscriptions, sub) do
+      {nil, _} ->
+        state
+
+      {subscription, subscriptions} ->
+        Process.demonitor(subscription.monitor, [:flush])
+
+        %{
+          state
+          | subscriptions: subscriptions,
+            items: Map.drop(state.items, subscription.handles)
+        }
+    end
+  end
+
+  # Sends a request and remembers what to do with its response: reply to a
+  # caller (`tag` is its `from`), or handle it here.
+  defp send_request(state, request, hint, tag, timeout) do
+    {id, channel} = SecureChannel.next_request_id(state.channel)
+    {request, state} = with_header(%{state | channel: channel}, request, hint)
+
+    with {:ok, state} <- send_message(state, :message, id, request) do
+      {:ok, put_pending(state, id, tag, Process.send_after(self(), {:timeout, id}, timeout))}
+    end
+  end
+
+  defp put_pending(state, id, tag, timer),
+    do: %{state | pending: Map.put(state.pending, id, {tag, timer})}
 
   defp send_message(state, kind, id, message) do
     with {:ok, frames, channel} <- SecureChannel.encode(state.channel, kind, id, message),
@@ -735,8 +832,6 @@ defmodule OPCUA.Client do
       error -> error
     end
   end
-
-  defp schedule(state), do: state |> schedule_renew() |> schedule_keep_alive()
 
   # Renew at 75% of the token's lifetime, as the spec recommends.
   defp schedule_renew(state) do
@@ -779,7 +874,7 @@ defmodule OPCUA.Client do
         1000 -> :ok
       end
 
-      disconnect(state)
+      Connection.disconnect(state)
     end
   end
 end

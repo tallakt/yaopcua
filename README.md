@@ -11,8 +11,8 @@ does, written from the OPC UA specification (free to read at
 Foundation's machine-readable definitions, not from another stack's code. It
 speaks the binary protocol over TCP only; the XML and JSON encodings are out.
 
-**Status:** a client that reads, writes, browses and calls methods, without
-security yet. Subscriptions and the server come next; see
+**Status:** a client that reads, writes, browses, calls methods and subscribes
+to value changes and events, without security yet. The server comes next; see
 [the roadmap](#roadmap).
 
 ## Client
@@ -29,6 +29,23 @@ security yet. Subscriptions and the server come next; see
 {:error, :bad_node_id_unknown} = OPCUA.Client.read(client, "ns=2;s=Nope")
 ```
 
+Subscriptions send messages to the subscriber, the caller by default:
+
+```elixir
+{:ok, sub} = OPCUA.Client.subscribe(client, ["ns=2;s=Pump1.Speed", "ns=2;s=Tank.Level"], interval: 100)
+
+# first the current values, then each change
+receive do
+  {OPCUA.Client, ^sub, {:value, "ns=2;s=Pump1.Speed", %OPCUA.DataValue{value: %{value: speed}}}} -> speed
+end
+
+{:ok, alarms} = OPCUA.Client.subscribe_events(client, fields: ["Message", "Severity", "ActiveState/Id"])
+
+receive do
+  {OPCUA.Client, ^alarms, {:event, %{"Message" => message, "Severity" => severity}}} -> {message, severity}
+end
+```
+
 | Function | Does |
 |---|---|
 | `read/3` | reads one attribute of one node, the value by default, as a plain Elixir value |
@@ -36,6 +53,9 @@ security yet. Subscriptions and the server come next; see
 | `write/3`, `write_many/2` | writes plain values in the node's own type (the client reads the node once to learn it), or `OPCUA.Variant`s as given |
 | `browse/3` | lists a node's references, following continuation points |
 | `call/4` | calls a method and returns its outputs |
+| `subscribe/3` | sends the subscriber each change of some values, optionally with a deadband |
+| `subscribe_events/2` | sends the subscriber the events a node reports, with the fields asked for |
+| `unsubscribe/2` | ends a subscription; it also ends when the subscriber exits |
 | `request/3` | sends any service request from `OPCUA.Types` |
 | `endpoints/2` | asks a server which endpoints and logins it offers, without a session |
 
@@ -137,7 +157,8 @@ Python only ever runs in tests, never inside yaopcua.
 | ✅ | Binary encoding of the built-in types and all generated structures | Part 6 |
 | ✅ | UA-TCP transport, secure channel (policy None), sessions | Parts 4, 6 |
 | ✅ | Client: read, write, browse, method calls, anonymous and username login | Part 4 |
-| | Client: subscriptions, custom structures, reconnecting | Part 4 |
+| ✅ | Client: subscriptions to value changes and events | Part 4 |
+| | Client: custom structures, reconnecting | Part 4 |
 | | Server: address space, callback variables, subscriptions, a reduced namespace 0 | Parts 3, 4, 5 |
 | | Events and alarms: event filters, conditions, acknowledge, ConditionRefresh | Part 9 |
 | | Security: Basic256Sha256 and Aes128_Sha256_RsaOaep, username and certificate login, with OTP's `:crypto` and `:public_key` only | Parts 2, 6, 7 |

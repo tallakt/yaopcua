@@ -59,6 +59,17 @@ async def main(port):
     await plant.add_method(ua.NodeId("Multiply", ns), ua.QualifiedName("Multiply", ns), multiply,
                            [ua.VariantType.Int32, ua.VariantType.Int32], [ua.VariantType.Int32])
 
+    events = await server.get_event_generator()
+
+    @uamethod
+    async def fire(parent, message, severity):
+        events.event.Message = ua.LocalizedText(message)
+        events.event.Severity = severity
+        await events.trigger()
+
+    await plant.add_method(ua.NodeId("Fire", ns), ua.QualifiedName("Fire", ns), fire,
+                           [ua.VariantType.String, ua.VariantType.UInt16], [])
+
     async with server:
         print("ready", flush=True)
         await asyncio.get_running_loop().run_in_executor(None, sys.stdin.read)

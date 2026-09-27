@@ -159,4 +159,133 @@ defmodule OPCUA.ClientInteropTest do
     assert {:ok, _} = Client.read(client, "ns=2;s=Pump1.Speed")
     assert :sys.get_state(client).token.token_id != first.token_id
   end
+
+  describe "subscriptions" do
+    # Waits for the next message from a subscription, skipping others.
+    defp next(sub, timeout \\ 3000) do
+      receive do
+        {Client, ^sub, message} -> message
+      after
+        timeout -> flunk("no message from subscription #{sub}")
+      end
+    end
+
+    defp none(sub, timeout \\ 500) do
+      receive do
+        {Client, ^sub, message} -> flunk("unexpected #{inspect(message)}")
+      after
+        timeout -> :ok
+      end
+    end
+
+    test "sends the current values, then each change", %{client: client} do
+      :ok = Client.write(client, "ns=2;s=Scratch.UInt32", 5)
+      {:ok, sub} = Client.subscribe(client, ["ns=2;s=Scratch.UInt32"], interval: 50)
+
+      assert {:value, "ns=2;s=Scratch.UInt32", %DataValue{value: %Variant{value: 5}, status: 0}} =
+               next(sub)
+
+      :ok = Client.write(client, "ns=2;s=Scratch.UInt32", 6)
+      assert {:value, "ns=2;s=Scratch.UInt32", %DataValue{value: %Variant{value: 6}}} = next(sub)
+      none(sub)
+    end
+
+    test "a deadband leaves out small changes", %{client: client} do
+      :ok = Client.write(client, "ns=2;s=Scratch.Double", 0.0)
+
+      {:ok, sub} =
+        Client.subscribe(client, ["ns=2;s=Scratch.Double"],
+          interval: 50,
+          deadband: {:absolute, 1.0}
+        )
+
+      assert {:value, _, %DataValue{value: %Variant{value: +0.0}}} = next(sub)
+
+      # One write at a time: with a queue of 1, changes within an interval merge.
+      :ok = Client.write(client, "ns=2;s=Scratch.Double", 10.0)
+      assert {:value, _, %DataValue{value: %Variant{value: 10.0}}} = next(sub)
+      :ok = Client.write(client, "ns=2;s=Scratch.Double", 10.5)
+      none(sub, 300)
+      :ok = Client.write(client, "ns=2;s=Scratch.Double", 12.0)
+      assert {:value, _, %DataValue{value: %Variant{value: 12.0}}} = next(sub)
+    end
+
+    test "a node that can't be monitored gets one message with its status", %{client: client} do
+      {:ok, sub} = Client.subscribe(client, ["ns=2;s=Nope", "ns=2;s=Pump1.Speed"], interval: 50)
+      messages = [next(sub), next(sub)]
+
+      assert {:value, "ns=2;s=Nope", %DataValue{status: status, value: nil}} =
+               List.keyfind(messages, "ns=2;s=Nope", 1)
+
+      assert OPCUA.StatusCode.name(status) == :bad_node_id_unknown
+
+      assert {:value, "ns=2;s=Pump1.Speed", %DataValue{value: %Variant{value: 1500}}} =
+               List.keyfind(messages, "ns=2;s=Pump1.Speed", 1)
+    end
+
+    test "sends to another process, and stops when it exits", %{client: client} do
+      test = self()
+
+      subscriber =
+        spawn(fn ->
+          receive do
+            {Client, sub, message} -> send(test, {:got, sub, message})
+          end
+        end)
+
+      {:ok, sub} = Client.subscribe(client, ["ns=2;s=Pump1.Speed"], to: subscriber, interval: 50)
+      assert_receive {:got, ^sub, {:value, "ns=2;s=Pump1.Speed", _}}, 3000
+      refute Process.alive?(subscriber)
+
+      Process.sleep(100)
+      refute Map.has_key?(:sys.get_state(client).subscriptions, sub)
+    end
+
+    test "unsubscribing stops the messages", %{client: client} do
+      {:ok, sub} = Client.subscribe(client, ["ns=2;s=Scratch.Int16"], interval: 50)
+      assert {:value, _, _} = next(sub)
+      assert :ok = Client.unsubscribe(client, sub)
+      :ok = Client.write(client, "ns=2;s=Scratch.Int16", 99)
+      none(sub)
+      assert Client.unsubscribe(client, sub) == {:error, :bad_subscription_id_invalid}
+    end
+
+    test "several subscriptions share the publish requests", %{client: client} do
+      {:ok, one} = Client.subscribe(client, ["ns=2;s=Pump1.Speed"], interval: 50)
+      {:ok, two} = Client.subscribe(client, ["ns=2;s=Tank.Level"], interval: 200)
+      assert {:value, "ns=2;s=Pump1.Speed", _} = next(one)
+      assert {:value, "ns=2;s=Tank.Level", _} = next(two)
+      assert :sys.get_state(client).publishing == 2
+    end
+
+    test "events arrive with the fields asked for", %{client: client} do
+      {:ok, sub} =
+        Client.subscribe_events(client,
+          fields: ["Message", "Severity", "SourceNode"],
+          interval: 50
+        )
+
+      {:ok, []} = Client.call(client, "ns=2;s=Plant", "ns=2;s=Fire", ["Pump tripped", 700])
+
+      assert {:event,
+              %{
+                "Message" => %OPCUA.LocalizedText{text: "Pump tripped"},
+                "Severity" => 700,
+                "SourceNode" => %OPCUA.NodeId{id: 2253}
+              }} =
+               next(sub)
+    end
+
+    test "events have the common fields by default", %{client: client} do
+      {:ok, sub} = Client.subscribe_events(client, interval: 50)
+      {:ok, []} = Client.call(client, "ns=2;s=Plant", "ns=2;s=Fire", ["Level high", 400])
+      assert {:event, event} = next(sub)
+
+      assert Map.keys(event) |> Enum.sort() ==
+               ~w(EventId EventType Message Severity SourceName SourceNode Time)
+
+      assert %DateTime{} = event["Time"]
+      assert is_binary(event["EventId"])
+    end
+  end
 end
