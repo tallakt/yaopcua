@@ -130,7 +130,7 @@ Event filters take select clauses by browse path (including ConditionId) and
 where clauses with OfType, And, Or, Not, the comparisons, Between, InList and
 IsNull. Enable, Disable and AddComment work too; Confirm and shelving don't.
 
-Not yet: history, and sessions that outlive their connection.
+What the server doesn't do yet is listed under [What's missing](#whats-missing).
 
 ## Security
 
@@ -171,8 +171,9 @@ OPCUA.Certificate.write_key("server.pem", key)
 | User certificates | signs with the user's key | accepts those in `:user_certificates` |
 
 A secure client or server won't start without being told what to trust
-(`:trust`, a list of certificates or `:any`). The deprecated Basic128Rsa15 and
-Basic256 aren't supported.
+(`:trust`, a list of certificates or `:any`). See
+[What's missing](#whats-missing) for the policies and certificate handling
+that aren't there.
 
 ## PubSub
 
@@ -205,8 +206,8 @@ fields = [{"Speed", :int16}, {"Level", :double}, {"Running", :boolean}]
 | `key_frames:` | every value each N-th cycle, and only the changed ones in between |
 | `read:` or `Publisher.set/3` | where the publisher's values come from |
 
-Messages are UADP (Part 14), checked against asyncua in both directions. Not
-yet: message security, chunked messages, Ethernet (TSN) and MQTT transports.
+Messages are UADP (Part 14), checked against asyncua in both directions. See
+[What's missing](#whats-missing) for what PubSub lacks.
 
 ## Encoding
 
@@ -275,6 +276,92 @@ mix test
 The diff then shows the Foundation's own changes. The `.bsd` and the NodeSet
 are XML, read with OTP's xmerl while compiling; nothing reads XML at runtime.
 
+## What's missing
+
+yaopcua is a subset of OPC UA. Beyond the XML and JSON encodings, which are
+out on purpose, this is what it doesn't do, by area.
+
+**Encoding**
+- Custom structures from a server's own namespaces stay undecoded
+  `OPCUA.ExtensionObject`s; decoding them from their DataTypeDefinition is on
+  the roadmap. Structures with optional fields or unions (spec 1.04+) aren't
+  supported either.
+- DateTime keeps microseconds, dropping the last 100 ns digit.
+- A Variant with a built-in type id above 25 is a decoding error.
+- XML bodies of ExtensionObjects are kept as text, never parsed.
+- Option sets are integers; `flags/1` on their module names the bits.
+
+**Connections**
+- UA-TCP over IPv4 only: no IPv6, HTTPS, WebSockets or reverse connect.
+- Messages are capped at 16 MB and 4096 chunks.
+
+**Security**
+- The ECC policies, and the deprecated Basic128Rsa15 and Basic256.
+- Certificate chains in the handshake: each side sends and expects a single
+  certificate.
+- Revocation lists, a rejected-certificate folder, and certificate management
+  from a Global Discovery Server.
+- The client trusts the server's certificate by the trust list alone; it
+  doesn't compare the certificate's host names or URI with the endpoint.
+- RSA-OAEP goes through functions OTP 27 deprecates (see `OPCUA.SecurityPolicy`).
+
+**Client**
+- No reconnecting: when the connection drops the client stops, and a
+  supervisor must start a new one, with new sessions and subscriptions.
+- Notifications lost on the way aren't asked for again (Republish), and
+  subscriptions can't move to another session (TransferSubscriptions).
+- History, Query, node management (AddNodes and so on), SetTriggering and
+  discovery beyond GetEndpoints; the other services are there through
+  `request/3`, without helpers.
+- `call/4` sends plain integers as Int32 and floats as Double; other types
+  need an `OPCUA.Variant`.
+
+**Server**
+- Sessions end with their connection, so a client can't reactivate one, or
+  its subscriptions, on a new connection.
+- No history, Query, node management from clients, SetTriggering or
+  TransferSubscriptions: they're answered with BadServiceUnsupported.
+- No views, no DataTypeDefinition or RolePermissions attributes, and only the
+  Value attribute can be written, without index ranges.
+- Variables are of the 25 built-in types, scalar or one-dimensional arrays;
+  no custom data types or enumerations.
+- Most of namespace 0 has no values: ServerCapabilities, diagnostics and the
+  like read as empty. Its methods, such as GetMonitoredItems, answer
+  BadNotImplemented.
+- No limits on connections, sessions, subscriptions or monitored items per
+  client, and fixed ones elsewhere (10,000 operations per request, 1,000
+  references per browse, 16 continuation points per session).
+- Subscriptions ignore `max_notifications_per_publish` and priority, and
+  don't set the queue overflow bit. Items are sampled on a timer that ticks
+  at the subscription's fastest sampling interval, so a slower item may be up
+  to one tick late. Percent deadbands need an EURange, which isn't there.
+- A renewed secure channel token is used for sending at once, rather than
+  after the client first uses it.
+- Events: the where-clause operators Like, Cast, InView, RelatedTo and the
+  bitwise ones; AttributeOperand; index ranges in select clauses; overflow
+  events for full queues. Events reach the Server object, their source and
+  what's above the source by HasEventSource and HasNotifier.
+- Alarms: no Confirm, shelving, suppression, silencing, latching or branches;
+  no fields of specific alarm types (such as limits); and no Acknowledge
+  method node on each condition, so clients call the one on the type.
+- The address space isn't saved; the application builds it on each start.
+- The server's certificate, if not given, is made anew on each start.
+- No registration with discovery servers, and no mDNS.
+
+**PubSub**
+- Message security and the Security Key Service.
+- Network messages chunked over several datagrams, discovery messages, and
+  dataset metadata; promoted fields are skipped.
+- Transports other than UDP: Ethernet (TSN), MQTT, AMQP; and the JSON
+  message mapping.
+- Configuration as nodes in the server, or from a configuration file.
+- Event datasets: decoded, but not published or passed on.
+
+**Quality**
+- Tested against asyncua only, not against open62541, the OPC Foundation's
+  .NET stack, real PLCs, or the Compliance Test Tool.
+- Performance hasn't been measured.
+
 ## Tests
 
 yaopcua is tested against [asyncua](https://github.com/FreeOpcUa/opcua-asyncio),
@@ -310,5 +397,5 @@ Python only ever runs in tests, never inside yaopcua.
 | ✅ | PubSub: UADP over UDP, unicast and multicast, key and delta frames | Part 14 |
 | | Fuzzing with [StreamData](https://github.com/whatyouhide/stream_data): random and mutated bytes into the decoder, the secure channel and the server | |
 
-Out of scope: the XML and JSON encodings, HTTPS and WebSocket transports,
-history, node management from clients, discovery servers and mDNS.
+Out of scope on purpose: the XML and JSON encodings. Everything else not
+done is under [What's missing](#whats-missing).
