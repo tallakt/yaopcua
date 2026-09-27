@@ -29,7 +29,7 @@ defmodule OPCUA.MixProject do
   # and writes the tag to schema/VERSION. This is an alias rather than a task in
   # lib/ so it runs without compiling, and so it doesn't ship to projects that
   # depend on yaopcua.
-  @schema ~w(Opc.Ua.Types.bsd NodeIds.csv StatusCode.csv AttributeIds.csv)
+  @schema ~w(Opc.Ua.Types.bsd Opc.Ua.NodeSet2.xml NodeIds.csv StatusCode.csv AttributeIds.csv)
 
   defp schema([tag]) do
     {:ok, _} = Application.ensure_all_started([:inets, :ssl])

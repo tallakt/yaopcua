@@ -11,9 +11,9 @@ does, written from the OPC UA specification (free to read at
 Foundation's machine-readable definitions, not from another stack's code. It
 speaks the binary protocol over TCP only; the XML and JSON encodings are out.
 
-**Status:** a client that reads, writes, browses, calls methods and subscribes
-to value changes and events, without security yet. The server comes next; see
-[the roadmap](#roadmap).
+**Status:** a client and a server that read, write, browse, call methods and
+subscribe to value changes, without security yet. Events and alarms in the
+server come next; see [the roadmap](#roadmap).
 
 ## Client
 
@@ -65,6 +65,44 @@ The client keeps the session alive and renews the secure channel before it
 expires. When the connection drops it stops with `{:shutdown, reason}`, so run
 it under a supervisor to reconnect.
 
+## Server
+
+```elixir
+{:ok, server} = OPCUA.Server.start_link(port: 4840)
+2 = OPCUA.Server.namespace(server, "urn:plant")
+
+:ok = OPCUA.Server.add_object(server, "ns=2;s=Pump1", "Pump1")
+:ok = OPCUA.Server.add_variable(server, "ns=2;s=Pump1.Speed", "Speed",
+        parent: "ns=2;s=Pump1", type: :int16, value: 1500, writable: true)
+:ok = OPCUA.Server.add_variable(server, "ns=2;s=Pump1.Temp", "Temp",
+        parent: "ns=2;s=Pump1", type: :double, read: fn -> read_sensor() end)
+:ok = OPCUA.Server.add_method(server, "ns=2;s=Pump1.Start", "Start",
+        parent: "ns=2;s=Pump1", inputs: [{"speed", :int16}], outputs: [],
+        call: fn [speed] -> start_pump(speed) && {:ok, []} end)
+
+# from the application, whenever the value changes
+:ok = OPCUA.Server.set(server, "ns=2;s=Pump1.Speed", 1510)
+```
+
+| Function | Does |
+|---|---|
+| `namespace/2` | the index of a namespace URI, adding it if new |
+| `add_folder/4`, `add_object/4` | adds a folder or an object, under the Objects folder by default |
+| `add_variable/4` | adds a variable with a stored value, or one read from a function each time; `:write` sees and may refuse each client write |
+| `add_method/4` | adds a method; the function gets the inputs as plain values |
+| `set/3`, `get/2` | sets and gets a value from the application; a value that doesn't fit raises |
+| `space/1` | the address space itself, for `set/3` without going through the server process |
+
+The server starts with all 5,500 standard nodes of namespace 0, and answers
+GetEndpoints, FindServers, sessions (anonymous and username logins), Read,
+Write, Browse and BrowseNext, TranslateBrowsePathsToNodeIds, Call,
+RegisterNodes, and the subscription services: value changes with deadbands and
+queues, keep-alives, lifetimes and Republish. Each client connection runs in
+its own process.
+
+Not yet: events and alarms, security, history, and sessions that outlive
+their connection.
+
 ## Encoding
 
 Every structure and enumeration of the spec is a module under `OPCUA.Types`,
@@ -115,6 +153,7 @@ copied unmodified into `schema/` from one release of their
 | File | Gives |
 |---|---|
 | `Opc.Ua.Types.bsd` | the layout of every structure and enumeration |
+| `Opc.Ua.NodeSet2.xml` | the standard nodes the server starts with |
 | `NodeIds.csv` | the ids of the standard nodes, including each structure's wire id |
 | `StatusCode.csv` | status code names and descriptions |
 | `AttributeIds.csv` | attribute ids |
@@ -128,8 +167,8 @@ mix opcua.schema UA-1.05.07-2026-07-30
 mix test
 ```
 
-The diff then shows the Foundation's own changes. The `.bsd` is XML, read with
-OTP's xmerl while compiling; nothing reads XML at runtime.
+The diff then shows the Foundation's own changes. The `.bsd` and the NodeSet
+are XML, read with OTP's xmerl while compiling; nothing reads XML at runtime.
 
 ## Tests
 
@@ -139,9 +178,9 @@ a Python OPC UA stack written independently of this one, in two ways:
 * `test/vectors/asyncua.txt` holds about 1,200 structures encoded by asyncua.
   yaopcua must decode each one and encode it back to the same bytes. These run
   with every `mix test`; `test/vectors/generate_asyncua.py` regenerates them.
-* The interop tests run the client against an asyncua server, started as a
-  separate process from `test/support/asyncua_server.py`. They need a Python
-  with asyncua, and are skipped without one:
+* The interop tests run the client against an asyncua server, and asyncua's
+  client against the server, as separate processes from `test/support/`. They
+  need a Python with asyncua, and are skipped without one:
 
   ```
   python3 -m venv ~/.venvs/asyncua && ~/.venvs/asyncua/bin/pip install asyncua
@@ -159,10 +198,11 @@ Python only ever runs in tests, never inside yaopcua.
 | ✅ | Client: read, write, browse, method calls, anonymous and username login | Part 4 |
 | ✅ | Client: subscriptions to value changes and events | Part 4 |
 | | Client: custom structures, reconnecting | Part 4 |
-| | Server: address space, callback variables, subscriptions, a reduced namespace 0 | Parts 3, 4, 5 |
-| | Events and alarms: event filters, conditions, acknowledge, ConditionRefresh | Part 9 |
+| ✅ | Server: address space with namespace 0, callback variables, methods, subscriptions | Parts 3, 4, 5 |
+| | Events and alarms in the server: event filters, conditions, acknowledge, ConditionRefresh | Part 9 |
 | | Security: Basic256Sha256 and Aes128_Sha256_RsaOaep, username and certificate login, with OTP's `:crypto` and `:public_key` only | Parts 2, 6, 7 |
 | | PubSub: UADP over UDP, for PLC to PLC | Part 14 |
+| | Fuzzing with [StreamData](https://github.com/whatyouhide/stream_data): random and mutated bytes into the decoder, the secure channel and the server | |
 
 Out of scope: the XML and JSON encodings, HTTPS and WebSocket transports,
 history, node management from clients, discovery servers and mDNS.

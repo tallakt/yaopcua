@@ -9,10 +9,6 @@ defmodule OPCUA.Schema do
   them.
   """
 
-  # The bsd is XML. xmerl is only needed while compiling, so it is put on the
-  # code path here rather than listed as a runtime dependency.
-  Mix.ensure_application!(:xmerl)
-
   @dir Path.expand("../../schema", __DIR__)
   @external_resource Path.join(@dir, "VERSION")
   @version @dir |> Path.join("VERSION") |> File.read!() |> String.trim()
@@ -60,6 +56,9 @@ defmodule OPCUA.Schema do
   # where a field type is a built-in type atom, a module of OPCUA.Types, or
   # `{:array, type}` with the `NoOfX` count folded in.
   def types do
+    # The bsd is XML. xmerl is only needed while compiling, so it's put on the
+    # code path here rather than listed as a runtime dependency.
+    Mix.ensure_application!(:xmerl)
     path = path("Opc.Ua.Types.bsd") |> String.to_charlist()
 
     {:ok, {raw, nil, false}, _} =

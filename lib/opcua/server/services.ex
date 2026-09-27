@@ -1,0 +1,414 @@
+defmodule OPCUA.Server.Services do
+  @moduledoc false
+  # Answers service requests for a connection: `handle(request, state)`
+  # returns the response and the connection's new state. Sessions are kept in
+  # `state.sessions`, by authentication token.
+
+  require Logger
+
+  alias OPCUA.{NodeId, SecureChannel, StatusCode, Variant}
+  alias OPCUA.Server.{AddressSpace, Node, Subscriptions}
+  alias OPCUA.Types
+
+  # How many operations one request may ask for, and references one browse
+  # may return before it needs a continuation point.
+  @max_operations 10_000
+  @max_references 1000
+  @max_continuation_points 16
+
+  @subscriptions [
+    Types.CreateSubscriptionRequest,
+    Types.ModifySubscriptionRequest,
+    Types.SetPublishingModeRequest,
+    Types.DeleteSubscriptionsRequest,
+    Types.CreateMonitoredItemsRequest,
+    Types.ModifyMonitoredItemsRequest,
+    Types.SetMonitoringModeRequest,
+    Types.DeleteMonitoredItemsRequest,
+    Types.PublishRequest,
+    Types.RepublishRequest
+  ]
+
+  @no_session [
+    Types.GetEndpointsRequest,
+    Types.FindServersRequest,
+    Types.CreateSessionRequest,
+    Types.ActivateSessionRequest
+  ]
+
+  @doc false
+  def header(request, status) do
+    %Types.ResponseHeader{
+      timestamp: DateTime.utc_now(),
+      request_handle: request.request_header.request_handle,
+      service_result: StatusCode.code(status_atom(status))
+    }
+  end
+
+  defp status_atom(0), do: :good
+  defp status_atom(status), do: status
+
+  @doc false
+  def fault(request, status), do: %Types.ServiceFault{response_header: header(request, status)}
+
+  @doc false
+  def handle(%module{} = request, state) when module in @no_session, do: service(request, state)
+
+  def handle(request, state) do
+    auth = request.request_header.authentication_token
+
+    case state.sessions do
+      # CloseSession is allowed before activation, too.
+      %{^auth => _} when is_struct(request, Types.CloseSessionRequest) ->
+        close(request, state)
+
+      %{^auth => %{activated: true} = session} ->
+        {response, session} = session(request, touch(session), state)
+        {response, %{state | sessions: Map.put(state.sessions, auth, session)}}
+
+      %{^auth => _} ->
+        {fault(request, :bad_session_not_activated), state}
+
+      _ ->
+        {fault(request, :bad_session_id_invalid), state}
+    end
+  end
+
+  ## Without a session
+
+  defp service(%Types.GetEndpointsRequest{} = request, state) do
+    {%Types.GetEndpointsResponse{
+       response_header: header(request, 0),
+       endpoints: endpoints(state.config)
+     }, state}
+  end
+
+  defp service(%Types.FindServersRequest{} = request, state) do
+    {%Types.FindServersResponse{
+       response_header: header(request, 0),
+       servers: [state.config.application]
+     }, state}
+  end
+
+  defp service(%Types.CreateSessionRequest{} = request, state) do
+    timeout = request.requested_session_timeout |> max(1000.0) |> min(3_600_000.0)
+    auth = %NodeId{ns: 0, id: {:opaque, :crypto.strong_rand_bytes(32)}}
+
+    session =
+      Subscriptions.new_session(%{
+        id: %NodeId{ns: 1, id: {:guid, guid()}},
+        auth: auth,
+        name: request.session_name,
+        timeout: timeout,
+        activated: false,
+        user: nil,
+        continuation: %{},
+        last: nil
+      })
+
+    response = %Types.CreateSessionResponse{
+      response_header: header(request, 0),
+      session_id: session.id,
+      authentication_token: auth,
+      revised_session_timeout: timeout,
+      server_nonce: :crypto.strong_rand_bytes(32),
+      server_endpoints: endpoints(state.config),
+      max_request_message_size: 0
+    }
+
+    {response, %{state | sessions: Map.put(state.sessions, auth, touch(session))}}
+  end
+
+  defp service(%Types.ActivateSessionRequest{} = request, state) do
+    auth = request.request_header.authentication_token
+
+    with %{} = session <- state.sessions[auth] || {:error, :bad_session_id_invalid},
+         {:ok, user} <- login(request.user_identity_token, state.config) do
+      session = touch(%{session | activated: true, user: user})
+
+      response = %Types.ActivateSessionResponse{
+        response_header: header(request, 0),
+        server_nonce: :crypto.strong_rand_bytes(32)
+      }
+
+      {response, %{state | sessions: Map.put(state.sessions, auth, session)}}
+    else
+      {:error, status} -> {fault(request, status), state}
+    end
+  end
+
+  defp login(nil, config), do: login(%Types.AnonymousIdentityToken{}, config)
+  defp login(%Types.AnonymousIdentityToken{}, %{anonymous: true}), do: {:ok, :anonymous}
+  defp login(%Types.AnonymousIdentityToken{}, _), do: {:error, :bad_identity_token_rejected}
+
+  defp login(%Types.UserNameIdentityToken{encryption_algorithm: algorithm} = token, config)
+       when algorithm in [nil, ""] do
+    valid =
+      case config.users do
+        nil -> false
+        users when is_map(users) -> Map.fetch(users, token.user_name) == {:ok, token.password}
+        fun when is_function(fun, 2) -> fun.(token.user_name, token.password) == true
+      end
+
+    if valid, do: {:ok, token.user_name}, else: {:error, :bad_user_access_denied}
+  end
+
+  defp login(%Types.UserNameIdentityToken{}, _), do: {:error, :bad_identity_token_invalid}
+  defp login(_, _), do: {:error, :bad_identity_token_invalid}
+
+  defp endpoints(config) do
+    tokens =
+      if(config.anonymous,
+        do: [%Types.UserTokenPolicy{policy_id: "anonymous", token_type: :anonymous}],
+        else: []
+      ) ++
+        if(config.users,
+          do: [%Types.UserTokenPolicy{policy_id: "username", token_type: :user_name}],
+          else: []
+        )
+
+    [
+      %Types.EndpointDescription{
+        endpoint_url: config.endpoint_url,
+        server: config.application,
+        security_mode: :none,
+        security_policy_uri: SecureChannel.none(),
+        user_identity_tokens: tokens,
+        transport_profile_uri:
+          "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary",
+        security_level: 0
+      }
+    ]
+  end
+
+  defp guid do
+    <<a::32, b::16, c::16, d::16, e::48>> = :crypto.strong_rand_bytes(16)
+
+    [{a, 8}, {b, 4}, {c, 4}, {d, 4}, {e, 12}]
+    |> Enum.map_join("-", fn {n, w} ->
+      n |> Integer.to_string(16) |> String.pad_leading(w, "0")
+    end)
+  end
+
+  # Each request restarts the session's timeout.
+  defp touch(session) do
+    last = System.monotonic_time()
+    Process.send_after(self(), {:session_timeout, session.auth, last}, trunc(session.timeout))
+    %{session | last: last}
+  end
+
+  # Publish requests still waiting are answered before the session goes.
+  defp close(request, state) do
+    auth = request.request_header.authentication_token
+    session = state.sessions[auth]
+
+    waiting =
+      for publish <- session.publishes,
+          do: {publish.id, fault(publish.request, :bad_session_closed)}
+
+    outbox = state.outbox ++ Enum.reverse(session.outbox) ++ waiting
+    state = %{state | sessions: Map.delete(state.sessions, auth), outbox: outbox}
+    {%Types.CloseSessionResponse{response_header: header(request, 0)}, state}
+  end
+
+  ## With a session
+
+  defp session(request, session, state) do
+    case operations(request) do
+      0 -> {fault(request, :bad_nothing_to_do), session}
+      n when n > @max_operations -> {fault(request, :bad_too_many_operations), session}
+      _ -> call(request, session, state)
+    end
+  end
+
+  defp operations(%Types.ReadRequest{nodes_to_read: list}), do: length(list || [])
+  defp operations(%Types.WriteRequest{nodes_to_write: list}), do: length(list || [])
+  defp operations(%Types.BrowseRequest{nodes_to_browse: list}), do: length(list || [])
+  defp operations(%Types.BrowseNextRequest{continuation_points: list}), do: length(list || [])
+
+  defp operations(%Types.TranslateBrowsePathsToNodeIdsRequest{browse_paths: list}),
+    do: length(list || [])
+
+  defp operations(%Types.CallRequest{methods_to_call: list}), do: length(list || [])
+  defp operations(%Types.RegisterNodesRequest{nodes_to_register: list}), do: length(list || [])
+
+  defp operations(%Types.UnregisterNodesRequest{nodes_to_unregister: list}),
+    do: length(list || [])
+
+  defp operations(_), do: 1
+
+  defp call(%module{} = request, session, state) when module in @subscriptions,
+    do: Subscriptions.handle(request, session, state)
+
+  defp call(%Types.ReadRequest{} = request, session, state) do
+    if request.timestamps_to_return in [:source, :server, :both, :neither] do
+      results =
+        for read <- request.nodes_to_read,
+            do: AddressSpace.read(state.config.space, read, request.timestamps_to_return)
+
+      {%Types.ReadResponse{response_header: header(request, 0), results: results}, session}
+    else
+      {fault(request, :bad_timestamps_to_return_invalid), session}
+    end
+  end
+
+  defp call(%Types.WriteRequest{} = request, session, state) do
+    results =
+      for write <- request.nodes_to_write, do: AddressSpace.write(state.config.space, write)
+
+    {%Types.WriteResponse{response_header: header(request, 0), results: results}, session}
+  end
+
+  defp call(%Types.BrowseRequest{} = request, session, state) do
+    if request.view && request.view.view_id do
+      {fault(request, :bad_view_id_unknown), session}
+    else
+      max = request.requested_max_references_per_node
+      max = if max in [0, nil], do: @max_references, else: min(max, @max_references)
+
+      {results, session} =
+        Enum.map_reduce(request.nodes_to_browse, session, fn description, session ->
+          case AddressSpace.browse(state.config.space, description) do
+            {:ok, refs} ->
+              page(session, refs, max)
+
+            {:error, status} ->
+              {%Types.BrowseResult{status_code: StatusCode.code(status)}, session}
+          end
+        end)
+
+      {%Types.BrowseResponse{response_header: header(request, 0), results: results}, session}
+    end
+  end
+
+  defp call(%Types.BrowseNextRequest{} = request, session, _state) do
+    {results, session} =
+      Enum.map_reduce(request.continuation_points, session, fn point, session ->
+        case Map.pop(session.continuation, point) do
+          {nil, _} ->
+            {%Types.BrowseResult{status_code: StatusCode.code(:bad_continuation_point_invalid)},
+             session}
+
+          {_, continuation} when request.release_continuation_points ->
+            {%Types.BrowseResult{status_code: 0}, %{session | continuation: continuation}}
+
+          {{refs, max}, continuation} ->
+            page(%{session | continuation: continuation}, refs, max)
+        end
+      end)
+
+    {%Types.BrowseNextResponse{response_header: header(request, 0), results: results}, session}
+  end
+
+  defp call(%Types.TranslateBrowsePathsToNodeIdsRequest{} = request, session, state) do
+    results =
+      for path <- request.browse_paths, do: AddressSpace.translate(state.config.space, path)
+
+    {%Types.TranslateBrowsePathsToNodeIdsResponse{
+       response_header: header(request, 0),
+       results: results
+     }, session}
+  end
+
+  defp call(%Types.CallRequest{} = request, session, state) do
+    results = for call <- request.methods_to_call, do: method(state.config.space, call)
+    {%Types.CallResponse{response_header: header(request, 0), results: results}, session}
+  end
+
+  # Nodes need no registering here; the ids are handed back as they are.
+  defp call(%Types.RegisterNodesRequest{} = request, session, _state) do
+    {%Types.RegisterNodesResponse{
+       response_header: header(request, 0),
+       registered_node_ids: request.nodes_to_register
+     }, session}
+  end
+
+  defp call(%Types.UnregisterNodesRequest{} = request, session, _state) do
+    {%Types.UnregisterNodesResponse{response_header: header(request, 0)}, session}
+  end
+
+  defp call(request, session, _state), do: {fault(request, :bad_service_unsupported), session}
+
+  # The first `max` references, and a continuation point for the rest.
+  defp page(session, refs, max) when length(refs) <= max do
+    {%Types.BrowseResult{status_code: 0, references: refs}, session}
+  end
+
+  defp page(session, refs, max) do
+    if map_size(session.continuation) >= @max_continuation_points do
+      {%Types.BrowseResult{status_code: StatusCode.code(:bad_no_continuation_points)}, session}
+    else
+      {now, later} = Enum.split(refs, max)
+      point = :crypto.strong_rand_bytes(16)
+      result = %Types.BrowseResult{status_code: 0, continuation_point: point, references: now}
+      {result, %{session | continuation: Map.put(session.continuation, point, {later, max})}}
+    end
+  end
+
+  defp method(space, %Types.CallMethodRequest{} = call) do
+    with %Node{} = object <-
+           AddressSpace.get(space, call.object_id) || {:error, :bad_node_id_unknown},
+         %Node{class: :method} = method <-
+           AddressSpace.get(space, call.method_id) || {:error, :bad_method_invalid},
+         true <-
+           Enum.member?(object.references, {%NodeId{id: 47}, method.node_id, true}) ||
+             {:error, :bad_method_invalid},
+         %{call: fun, inputs: types, outputs: outputs} <- method.attributes,
+         {:ok, args} <- arguments(call.input_arguments || [], types) do
+      invoke(fun, args, outputs, method)
+    else
+      {:error, status} ->
+        %Types.CallMethodResult{status_code: StatusCode.code(status)}
+
+      {:error, status, results} ->
+        %Types.CallMethodResult{
+          status_code: StatusCode.code(status),
+          input_argument_results: results
+        }
+
+      %Node{} ->
+        %Types.CallMethodResult{status_code: StatusCode.code(:bad_method_invalid)}
+
+      # a method from namespace 0 that this server doesn't implement
+      %{} ->
+        %Types.CallMethodResult{status_code: StatusCode.code(:bad_not_implemented)}
+    end
+  end
+
+  defp arguments(args, types) when length(args) < length(types),
+    do: {:error, :bad_arguments_missing}
+
+  defp arguments(args, types) when length(args) > length(types),
+    do: {:error, :bad_too_many_arguments}
+
+  defp arguments(args, types) do
+    results =
+      for {%Variant{type: type}, wanted} <- Enum.zip(args, types),
+          do: if(type == wanted, do: 0, else: StatusCode.code(:bad_type_mismatch))
+
+    if Enum.all?(results, &(&1 == 0)),
+      do: {:ok, Enum.map(args, & &1.value)},
+      else: {:error, :bad_invalid_argument, results}
+  end
+
+  defp invoke(fun, args, outputs, method) do
+    case fun.(args) do
+      {:ok, values} when length(values) == length(outputs) ->
+        variants =
+          for {value, type} <- Enum.zip(values, outputs), do: %Variant{type: type, value: value}
+
+        %Types.CallMethodResult{status_code: 0, output_arguments: variants}
+
+      {:error, status} when is_atom(status) ->
+        %Types.CallMethodResult{status_code: StatusCode.code(status)}
+    end
+  rescue
+    exception ->
+      Logger.error(
+        "OPC UA method #{method.node_id} failed: " <>
+          Exception.format(:error, exception, __STACKTRACE__)
+      )
+
+      %Types.CallMethodResult{status_code: StatusCode.code(:bad_internal_error)}
+  end
+end

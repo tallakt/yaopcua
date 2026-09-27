@@ -292,6 +292,9 @@ defmodule OPCUA.Client do
       changes of analog values
     * `:queue` - how many changes the server keeps per node between sends
       (default 1: only the latest)
+    * `:keep_alive` - how long the server may go without sending anything,
+      in ms (default 10000). If the client doesn't ask for notifications for
+      six times this, the server deletes the subscription.
   """
   @spec subscribe(client, [node_ref], keyword) :: {:ok, subscription} | error
   def subscribe(client, nodes, opts \\ []) do
@@ -338,7 +341,7 @@ defmodule OPCUA.Client do
       `"Message"`, `"ActiveState/Id"`, or `"2:MyField"` for a field in
       namespace 2. `"ConditionId"` is the node id of an alarm's condition.
       The default is #{Enum.map_join(@event_fields, ", ", &"`#{&1}`")}.
-    * `:to`, `:interval` - as for `subscribe/3`
+    * `:to`, `:interval`, `:keep_alive` - as for `subscribe/3`
     * `:queue` - how many events the server keeps between sends (default 1000)
   """
   @spec subscribe_events(client, keyword) :: {:ok, subscription} | error
@@ -389,8 +392,8 @@ defmodule OPCUA.Client do
   defp create(client, items, opts) do
     pid = Keyword.get(opts, :to, self())
     interval = Keyword.get(opts, :interval, 1000)
-    # Keep-alives about every 10 s, and a lifetime six times that.
-    keep_alive = max(1, ceil(10_000 / interval))
+    # A keep-alive at least every :keep_alive ms, and a lifetime six times that.
+    keep_alive = max(1, ceil(Keyword.get(opts, :keep_alive, 10_000) / interval))
 
     request = %Types.CreateSubscriptionRequest{
       requested_publishing_interval: interval * 1.0,
