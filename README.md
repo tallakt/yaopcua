@@ -11,8 +11,39 @@ does, written from the OPC UA specification (free to read at
 Foundation's machine-readable definitions, not from another stack's code. It
 speaks the binary protocol over TCP only; the XML and JSON encodings are out.
 
-**Status:** the binary encoding is done. Connections, the client and the server
-come next; see [the roadmap](#roadmap).
+**Status:** a client that reads, writes, browses and calls methods, without
+security yet. Subscriptions and the server come next; see
+[the roadmap](#roadmap).
+
+## Client
+
+```elixir
+{:ok, client} = OPCUA.Client.start_link(url: "opc.tcp://10.0.0.5:4840")
+
+{:ok, 1500} = OPCUA.Client.read(client, "ns=2;s=Pump1.Speed")
+{:ok, [1.0, 2.0, 3.0]} = OPCUA.Client.read(client, "ns=2;s=Tank.Setpoints")
+:ok = OPCUA.Client.write(client, "ns=2;s=Pump1.Speed", 1600)
+{:ok, refs} = OPCUA.Client.browse(client, "ns=2;s=Plant")
+{:ok, [42]} = OPCUA.Client.call(client, "ns=2;s=Plant", "ns=2;s=Multiply", [6, 7])
+
+{:error, :bad_node_id_unknown} = OPCUA.Client.read(client, "ns=2;s=Nope")
+```
+
+| Function | Does |
+|---|---|
+| `read/3` | reads one attribute of one node, the value by default, as a plain Elixir value |
+| `read_many/3` | reads several nodes, with status and timestamps (`OPCUA.DataValue`) |
+| `write/3`, `write_many/2` | writes plain values in the node's own type (the client reads the node once to learn it), or `OPCUA.Variant`s as given |
+| `browse/3` | lists a node's references, following continuation points |
+| `call/4` | calls a method and returns its outputs |
+| `request/3` | sends any service request from `OPCUA.Types` |
+| `endpoints/2` | asks a server which endpoints and logins it offers, without a session |
+
+Log in with `user: {"operator", "secret"}`; anonymous is the default.
+
+The client keeps the session alive and renews the secure channel before it
+expires. When the connection drops it stops with `{:shutdown, reason}`, so run
+it under a supervisor to reconnect.
 
 ## Encoding
 
@@ -82,20 +113,31 @@ OTP's xmerl while compiling; nothing reads XML at runtime.
 
 ## Tests
 
-Besides unit tests built from the spec's rules, `test/vectors/asyncua.txt`
-holds about 1,200 structures encoded by
-[asyncua](https://github.com/FreeOpcUa/opcua-asyncio), a Python stack written
-independently of this one. yaopcua must decode each one and encode it back to
-the same bytes. `test/vectors/generate_asyncua.py` regenerates them; asyncua
-itself is only needed for that, not to run the tests.
+yaopcua is tested against [asyncua](https://github.com/FreeOpcUa/opcua-asyncio),
+a Python OPC UA stack written independently of this one, in two ways:
+
+* `test/vectors/asyncua.txt` holds about 1,200 structures encoded by asyncua.
+  yaopcua must decode each one and encode it back to the same bytes. These run
+  with every `mix test`; `test/vectors/generate_asyncua.py` regenerates them.
+* The interop tests run the client against an asyncua server, started as a
+  separate process from `test/support/asyncua_server.py`. They need a Python
+  with asyncua, and are skipped without one:
+
+  ```
+  python3 -m venv ~/.venvs/asyncua && ~/.venvs/asyncua/bin/pip install asyncua
+  ASYNCUA_PYTHON=~/.venvs/asyncua/bin/python mix test
+  ```
+
+Python only ever runs in tests, never inside yaopcua.
 
 ## Roadmap
 
 | | Feature | Spec |
 |---|---|---|
 | ✅ | Binary encoding of the built-in types and all generated structures | Part 6 |
-| | UA-TCP transport, secure channel (policy None), sessions | Parts 4, 6 |
-| | Client: read, write, browse, subscriptions, method calls, custom structures | Part 4 |
+| ✅ | UA-TCP transport, secure channel (policy None), sessions | Parts 4, 6 |
+| ✅ | Client: read, write, browse, method calls, anonymous and username login | Part 4 |
+| | Client: subscriptions, custom structures, reconnecting | Part 4 |
 | | Server: address space, callback variables, subscriptions, a reduced namespace 0 | Parts 3, 4, 5 |
 | | Events and alarms: event filters, conditions, acknowledge, ConditionRefresh | Part 9 |
 | | Security: Basic256Sha256 and Aes128_Sha256_RsaOaep, username and certificate login, with OTP's `:crypto` and `:public_key` only | Parts 2, 6, 7 |
