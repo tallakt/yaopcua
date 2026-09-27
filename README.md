@@ -13,7 +13,8 @@ speaks the binary protocol over TCP only; the XML and JSON encodings are out.
 
 **Status:** a client and a server that read, write, browse, call methods,
 subscribe to value changes and events, and handle alarms, over signed and
-encrypted channels. PubSub comes next; see [the roadmap](#roadmap).
+encrypted channels; and PubSub over UDP for PLC to PLC. Fuzzing comes next;
+see [the roadmap](#roadmap).
 
 ## Client
 
@@ -173,6 +174,40 @@ A secure client or server won't start without being told what to trust
 (`:trust`, a list of certificates or `:any`). The deprecated Basic128Rsa15 and
 Basic256 aren't supported.
 
+## PubSub
+
+For controller-to-controller data: a publisher sends datasets over UDP every
+interval, to a multicast group or one host, and any number of subscribers
+pick out the ones they want. There are no sessions, and nothing to answer.
+
+```elixir
+fields = [{"Speed", :int16}, {"Level", :double}, {"Running", :boolean}]
+
+# on one PLC
+{:ok, _} = OPCUA.PubSub.Publisher.start_link(
+  url: "opc.udp://239.0.0.1:4840", publisher_id: 42, interval: 50,
+  writers: [[id: 1, fields: fields, read: fn -> Pump.values() end]])
+
+# on another
+{:ok, _} = OPCUA.PubSub.Subscriber.start_link(
+  url: "opc.udp://239.0.0.1:4840",
+  readers: [[publisher_id: 42, writer_id: 1, fields: fields, timeout: 200]])
+
+# which then gets, every 50 ms
+{OPCUA.PubSub, {42, 1}, {:data, %{"Speed" => 1500, "Level" => 2.5, "Running" => true}}}
+# and if the publisher goes quiet for 200 ms
+{OPCUA.PubSub, {42, 1}, :timeout}
+```
+
+| Option | |
+|---|---|
+| `encoding:` | `:variant` (typed, the default), `:raw` (smallest; both ends must agree on the types) or `:data_value` (with status and timestamps) |
+| `key_frames:` | every value each N-th cycle, and only the changed ones in between |
+| `read:` or `Publisher.set/3` | where the publisher's values come from |
+
+Messages are UADP (Part 14), checked against asyncua in both directions. Not
+yet: message security, chunked messages, Ethernet (TSN) and MQTT transports.
+
 ## Encoding
 
 Every structure and enumeration of the spec is a module under `OPCUA.Types`,
@@ -272,7 +307,7 @@ Python only ever runs in tests, never inside yaopcua.
 | ✅ | Server: address space with namespace 0, callback variables, methods, subscriptions | Parts 3, 4, 5 |
 | ✅ | Events and alarms in the server: event filters, conditions, acknowledge, ConditionRefresh | Parts 4, 9 |
 | ✅ | Security: Basic256Sha256, Aes128_Sha256_RsaOaep and Aes256_Sha256_RsaPss, encrypted passwords and certificate logins, with OTP's `:crypto` and `:public_key` only | Parts 2, 4, 6, 7 |
-| | PubSub: UADP over UDP, for PLC to PLC | Part 14 |
+| ✅ | PubSub: UADP over UDP, unicast and multicast, key and delta frames | Part 14 |
 | | Fuzzing with [StreamData](https://github.com/whatyouhide/stream_data): random and mutated bytes into the decoder, the secure channel and the server | |
 
 Out of scope: the XML and JSON encodings, HTTPS and WebSocket transports,
