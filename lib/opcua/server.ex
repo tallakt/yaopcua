@@ -22,9 +22,27 @@ defmodule OPCUA.Server do
   Sessions live as long as the connection that made them, so they can't be
   reactivated, nor their subscriptions transferred, on a new connection.
   There's no history, Query, node management from clients, SetTriggering or
-  views; only built-in data types for variables; no limits on connections,
-  sessions or subscriptions per client; and most of namespace 0 has no
-  values. See "What's missing" in the README.
+  views; only built-in data types for variables; no access rights per
+  user; and most of namespace 0 has no values. See "What's missing" in the
+  README.
+
+  ## Limits
+
+  A client, or someone posing as one, can't take more than `:limits`
+  allows, so that clients can't exhaust the machine the server runs on:
+
+    * `:connections` - open connections (default 32); more are refused
+    * `:message_size` - bytes in one request (default 4 MB); a message
+      decodes to up to 16 times its size in memory
+    * `:connection_memory` - bytes the process of one connection may take
+      (default 256 MB); a connection that needs more is closed
+    * `:sessions` - per connection (default 10)
+    * `:subscriptions` - per session (default 50)
+    * `:monitored_items` - per session (default 50,000)
+    * `:open_timeout` - ms a connection has to open its secure channel
+      (default 10 seconds)
+    * `:session_wait` - ms a connection may go without an activated session
+      (default a minute)
 
   ## Security
 
@@ -59,12 +77,15 @@ defmodule OPCUA.Server do
       made if not given, which clients must trust anew on each start
     * `:user_certificates` - the user certificates to accept for certificate
       logins, or `:any`
+    * `:limits` - see Limits above
     * `:name` - to register the process
   """
 
   use GenServer
 
-  alias OPCUA.{DataValue, LocalizedText, NodeId, NodeIds, QualifiedName, Variant}
+  require Logger
+
+  alias OPCUA.{DataValue, LocalizedText, NodeId, NodeIds, QualifiedName, Transport, Variant}
   alias OPCUA.Server.{AddressSpace, Conditions, Connection, Events, Node}
   alias OPCUA.Types
 
@@ -87,6 +108,17 @@ defmodule OPCUA.Server do
   # Ids unique across the server's connections, each counted in its own
   # slot of an :atomics array.
   @ids %{channel: 1, token: 2, subscription: 3}
+
+  @limits [
+    connections: 32,
+    message_size: 4 * 1024 * 1024,
+    connection_memory: 256 * 1024 * 1024,
+    sessions: 10,
+    subscriptions: 50,
+    monitored_items: 50_000,
+    open_timeout: 10_000,
+    session_wait: 60_000
+  ]
 
   @typedoc "A server's address space, from `space/1`."
   @opaque space :: AddressSpace.t()
@@ -476,7 +508,9 @@ defmodule OPCUA.Server do
              backlog: 128
            ]),
          {:ok, {_, port}} <- :inet.sockname(listen),
-         {:ok, connections} <- DynamicSupervisor.start_link(strategy: :one_for_one) do
+         limits = Map.new(Keyword.merge(@limits, Keyword.get(opts, :limits, []))),
+         {:ok, connections} <-
+           DynamicSupervisor.start_link(strategy: :one_for_one, max_children: limits.connections) do
       {:ok, host} = :inet.gethostname()
       url = Keyword.get(opts, :endpoint_url, "opc.tcp://#{host}:#{port}")
       application_uri = Keyword.get(opts, :application_uri, "urn:yaopcua:server")
@@ -516,6 +550,7 @@ defmodule OPCUA.Server do
         trust: Keyword.get(opts, :trust, []),
         user_certificates: opts[:user_certificates],
         ids: :atomics.new(map_size(@ids), signed: false),
+        limits: limits,
         server: self()
       }
 
@@ -611,6 +646,11 @@ defmodule OPCUA.Server do
             :ok = :gen_tcp.controlling_process(socket, pid)
             send(pid, :go)
 
+          {:error, :max_children} ->
+            error = Transport.error(:bad_max_connections_reached, "too many connections")
+            :gen_tcp.send(socket, Transport.frame(:error, :final, error))
+            :gen_tcp.close(socket)
+
           _ ->
             :gen_tcp.close(socket)
         end
@@ -620,8 +660,12 @@ defmodule OPCUA.Server do
       {:error, :closed} ->
         :ok
 
+      # Out of file descriptors, say: the server goes on, and accepts again
+      # when connections have closed.
       {:error, reason} ->
-        exit(reason)
+        Logger.warning("OPC UA server can't accept a connection: #{inspect(reason)}")
+        Process.sleep(100)
+        accept(listen, connections, config)
     end
   end
 

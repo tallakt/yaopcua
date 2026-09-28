@@ -159,6 +159,15 @@ defmodule OPCUA.Certificate do
     key_info(info, :subjectPublicKey)
   end
 
+  @doc "The size of the certificate's RSA key in bits, or nil for one that can't be read."
+  @spec key_bits(t) :: pos_integer | nil
+  def key_bits(der) do
+    {:RSAPublicKey, n, _} = public_key(der)
+    bit_size(:binary.encode_unsigned(n))
+  rescue
+    _ -> nil
+  end
+
   @doc "The application URI in the certificate's subject alternative name, or nil."
   @spec application_uri(t) :: String.t() | nil
   def application_uri(der) do

@@ -180,6 +180,38 @@ A secure client or server won't start without being told what to trust
 [What's missing](#whats-missing) for the policies and certificate handling
 that aren't there.
 
+### Hostile clients and networks
+
+A server on a plant network should expect anything on its port, and the
+machine it shares with the PLC must not run out of memory because of it.
+Each connection has its own process, and none can take more than `:limits`
+allows (see `OPCUA.Server`):
+
+| Attack | What stops it |
+|---|---|
+| Many connections, or ones that stall in the handshake | 32 connections at most; 10 seconds to open a secure channel, then a minute to log in to a session |
+| Huge or deeply nested messages | 4 MB per request; values, and structures in ExtensionObjects, nested at most 100 deep |
+| Requests that make a connection take a lot of memory | a connection whose process passes 256 MB is closed |
+| Many sessions, subscriptions or monitored items | 10 sessions per connection; 50 subscriptions and 50,000 monitored items per session |
+| Event filters that loop, or grow exponentially | elements may only refer forward, and each is evaluated once |
+| Strangers making the server do RSA | a certificate is checked against `:trust`, and for a key of 2048 to 4096 bits, before any decryption or signature check; user certificates need such a key too |
+| Guessing passwords from response times | passwords are compared in constant time |
+| A flood of UDP datagrams at a subscriber | at most 100 wait in its mailbox; the network drops the rest |
+
+A client can meet a hostile server too. It caps messages at 16 MB, reads its
+socket one packet at a time so a server can't flood it, and refuses a server
+key outside 2048 to 4096 bits. It takes only the response a request asks for
+(or a ServiceFault), keeps the timeouts and intervals a server gives within
+bounds, and a plain value that doesn't fit the type the server gives for a
+node is an error rather than an exception in the caller.
+
+What's left to the application: `:anonymous` is true by default; every user
+who logs in can read every node and write every writable variable; `trust:
+:any` lets any certificate open a channel; and PubSub has no message
+security, so anyone on the network can publish a dataset. And the limits
+protect the machine, not the service: someone who takes all the connections
+keeps other clients out, though the PLC runs on.
+
 ## PubSub
 
 For controller-to-controller data: a publisher sends datasets over UDP every
@@ -298,7 +330,8 @@ out on purpose, this is what it doesn't do, by area.
 
 **Connections**
 - UA-TCP over IPv4 only: no IPv6, HTTPS, WebSockets or reverse connect.
-- Messages are capped at 16 MB and 4096 chunks.
+- Messages are capped at 4096 chunks, and 16 MB for the client; the
+  server's cap is one of its limits (4 MB by default).
 
 **Security**
 - The ECC policies, and the deprecated Basic128Rsa15 and Basic256.
@@ -333,9 +366,10 @@ out on purpose, this is what it doesn't do, by area.
 - Most of namespace 0 has no values: ServerCapabilities, diagnostics and the
   like read as empty. Its methods, such as GetMonitoredItems, answer
   BadNotImplemented.
-- No limits on connections, sessions, subscriptions or monitored items per
-  client, and fixed ones elsewhere (10,000 operations per request, 1,000
-  references per browse, 16 continuation points per session).
+- No access rights per user: anyone who can log in can read every node and
+  write every writable variable.
+- Besides `:limits`, fixed limits: 10,000 operations per request, 1,000
+  references per browse, 16 continuation points per session.
 - Subscriptions ignore `max_notifications_per_publish` and priority, and
   don't set the queue overflow bit. Items are sampled on a timer that ticks
   at the subscription's fastest sampling interval, so a slower item may be up
@@ -397,17 +431,25 @@ open62541's fuzzers. Random and mutated bytes go into:
 * the transport framing;
 * the secure channel, with each policy and mode;
 * UADP, and a running subscriber;
-* a running server, on new connections and on open sessions.
+* a running server, on new connections and on open sessions;
+* the client, from a hostile server that answers anything, the session
+  included.
 
 Random requests go to the server too, for every service except Publish and
-those that manage the channel and session, and random arguments to its
-methods and alarm methods. Nothing may crash. The server must
-answer or refuse, and whatever decodes must encode and decode back to itself. Each property runs 100 cases with `mix test`. For more:
+those that manage the channel and session; random arguments to its methods
+and alarm methods; and random event filters, with events put through them.
+Values nested up to and past the depth limits must decode or be refused
+within a second. Nothing may crash. The server must answer or refuse, and
+whatever decodes must encode and decode back to itself. Each property runs
+100 cases with `mix test`. For more:
 
 ```
 FUZZ_RUNS=10000 mix test test/opcua/fuzz_test.exs   # cases per property
 FUZZ_SECONDS=600 mix test test/opcua/fuzz_test.exs  # or seconds per property
 ```
+
+`test/opcua/hardening_test.exs` has a test for each attack under
+[Hostile clients and networks](#hostile-clients-and-networks).
 
 StreamData generates values from the types, where libFuzzer follows code
 coverage. It knows every structure's shape, but it won't work its way into a

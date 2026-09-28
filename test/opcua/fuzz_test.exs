@@ -146,6 +146,55 @@ defmodule OPCUA.FuzzTest do
         end
       end
     end
+
+    property "values nested up to and past the depth limits decode, or are refused, quickly" do
+      check all(
+              bytes <-
+                bind(tuple({member_of(Map.keys(deep_types())), integer(1..130)}), fn {kind, n} ->
+                  one_of([constant(deep(kind, n)), mutations(deep(kind, n))])
+                  |> map(&{Map.fetch!(deep_types(), kind), &1})
+                end),
+              max_runs: runs(),
+              max_run_time: run_time()
+            ) do
+        {type, bytes} = bytes
+        {time, _} = :timer.tc(fn -> stable(bytes, type) end)
+        assert time < 1_000_000
+      end
+    end
+
+    defp deep_types,
+      do: %{
+        variant: :variant,
+        structure: :variant,
+        data_value: :data_value,
+        diagnostic: :diagnostic_info
+      }
+
+    # A value `n` deep, the way each kind nests.
+    defp deep(kind, n) do
+      Enum.reduce(1..n, nil, fn _, inner -> deeper(kind, inner) end)
+      |> Binary.encode(Map.fetch!(deep_types(), kind))
+      |> IO.iodata_to_binary()
+    end
+
+    defp deeper(:variant, inner), do: %Variant{type: :variant, value: [inner]}
+
+    defp deeper(:structure, inner) do
+      %Variant{
+        type: :extension_object,
+        value: %Types.ContentFilterElement{
+          filter_operator: :not,
+          filter_operands: [%Types.LiteralOperand{value: inner}]
+        }
+      }
+    end
+
+    defp deeper(:data_value, inner),
+      do: %OPCUA.DataValue{value: inner && %Variant{type: :data_value, value: inner}}
+
+    defp deeper(:diagnostic, inner),
+      do: %OPCUA.DiagnosticInfo{symbolic_id: 1, inner_diagnostic_info: inner}
   end
 
   describe "the transport and secure channel" do
@@ -390,6 +439,119 @@ defmodule OPCUA.FuzzTest do
     defp field(encoding), do: value(encoding)
   end
 
+  describe "a client" do
+    # Every client call there is, against a server that answers anything.
+    @calls [
+      :read,
+      :read_many,
+      :write,
+      :write_plain,
+      :browse,
+      :call,
+      :subscribe,
+      :subscribe_events,
+      :request
+    ]
+
+    property "a client survives whatever a hostile server answers" do
+      hostile = OPCUA.HostileServer.start()
+      responses = for m <- structs(), String.ends_with?(inspect(m), "Response"), do: m
+
+      check all(
+              call <- member_of(@calls),
+              seed <- integer(),
+              max_runs: runs(),
+              max_run_time: run_time()
+            ) do
+        OPCUA.HostileServer.answer(hostile, fn request, n ->
+          [answer] = Enum.take(StreamData.seeded(answer(request, responses), seed + n), 1)
+          answer
+        end)
+
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            # The session may fail, if the server spoils it, but not crash.
+            case Client.start(url: hostile.url, timeout: 200) do
+              {:ok, client} -> use_client(client, call)
+              {:error, reason} -> assert is_atom(reason) or is_integer(reason), inspect(reason)
+            end
+          end)
+
+        refute log =~ "terminating", log
+        refute log =~ "** (", log
+      end
+    end
+
+    defp use_client(client, call) do
+      ref = Process.monitor(client)
+
+      # It answers, or stops: any exception here is a failure.
+      try do
+        client_call(call, client)
+      catch
+        :exit, _ -> :ok
+      end
+
+      try do
+        Client.close(client)
+      catch
+        :exit, _ -> :ok
+      end
+
+      assert_receive {:DOWN, ^ref, :process, _, reason}, 5000
+      assert reason in [:normal, :noproc] or match?({:shutdown, _}, reason), inspect(reason)
+    end
+
+    defp client_call(:read, client), do: Client.read(client, "ns=2;s=X")
+    defp client_call(:read_many, client), do: Client.read_many(client, ["ns=2;s=X", "i=2258"])
+
+    defp client_call(:write, client),
+      do: Client.write(client, "ns=2;s=X", %Variant{type: :int16, value: 1})
+
+    defp client_call(:write_plain, client), do: Client.write(client, "ns=2;s=X", 5)
+    defp client_call(:browse, client), do: Client.browse(client, "i=85")
+    defp client_call(:call, client), do: Client.call(client, "i=85", "ns=2;s=M", [1, 2.5])
+
+    defp client_call(:subscribe, client) do
+      with {:ok, sub} <- Client.subscribe(client, ["ns=2;s=X", "ns=2;s=Y"], interval: 10) do
+        Process.sleep(30)
+        Client.unsubscribe(client, sub)
+      end
+    end
+
+    defp client_call(:subscribe_events, client) do
+      with {:ok, sub} <- Client.subscribe_events(client, interval: 10) do
+        Client.refresh(client, sub)
+        Process.sleep(30)
+        Client.acknowledge(client, "ns=2;s=Alarm", "id", "ok")
+        Client.unsubscribe(client, sub)
+      end
+    end
+
+    defp client_call(:request, client),
+      do: Client.request(client, %Types.TranslateBrowsePathsToNodeIdsRequest{})
+
+    # The right response with random contents, most often; or any response,
+    # a fault, a mangled one, or nothing. The session is set up properly
+    # most of the time, so that the calls get a turn.
+    defp answer(request, responses) do
+      type = OPCUA.Client.Connection.response_type(request)
+      session = request.__struct__ in [Types.CreateSessionRequest, Types.ActivateSessionRequest]
+      default = if session, do: [{60, constant(:default)}], else: []
+
+      frequency(
+        default ++
+          [
+            {6, map(value(type), &{:response, &1})},
+            {2, map(bind(member_of(responses), &value/1), &{:response, &1})},
+            {1, map(value(Types.ServiceFault), &{:response, &1})},
+            {2, map(tuple({value(type), integer()}), fn {r, seed} -> {:mangled, r, seed} end)},
+            {1, constant(:nothing)}
+          ]
+      )
+    end
+  end
+
   describe "a running server" do
     # The server must still answer a well-behaved client.
     defp healthy(url) do
@@ -543,6 +705,115 @@ defmodule OPCUA.FuzzTest do
 
       with {client, _} <- Process.get(:fuzz_client), do: Client.close(client)
       healthy(url)
+    end
+
+    property "random event filters are checked, and events go through them", %{
+      url: url,
+      server: server
+    } do
+      paths = ["Message", "Severity", "EventType", "SourceNode", "ActiveState/Id", "2:Nope"]
+      operators = Keyword.keys(Types.FilterOperator.values())
+
+      # Mostly what the server evaluates, and elements referring forward, as
+      # a valid filter does; now and then anything.
+      supported =
+        [:equals, :is_null, :greater_than, :less_than, :greater_than_or_equal] ++
+          [:less_than_or_equal, :not, :between, :in_list, :and, :or, :of_type]
+
+      literal =
+        one_of([
+          value(:variant),
+          map(integer(0..1000), &%Variant{type: :uint16, value: &1}),
+          map(boolean(), &%Variant{type: :boolean, value: &1}),
+          map(
+            member_of([2041, 2782, 2915, 10637]),
+            &%Variant{type: :node_id, value: %NodeId{id: &1}}
+          )
+        ])
+
+      operand = fn index, count ->
+        reference =
+          if index + 1 < count,
+            do: [{6, map(integer((index + 1)..(count - 1)), &%Types.ElementOperand{index: &1})}],
+            else: []
+
+        frequency(
+          reference ++
+            [
+              {1, map(integer(0..(count + 1)), &%Types.ElementOperand{index: &1})},
+              {3, map(literal, &%Types.LiteralOperand{value: &1})},
+              {3,
+               map(member_of(paths), fn path ->
+                 %Types.SimpleAttributeOperand{
+                   browse_path:
+                     path |> String.split("/") |> Enum.map(&OPCUA.QualifiedName.parse/1),
+                   attribute_id: 13
+                 }
+               end)},
+              {1, constant(nil)}
+            ]
+        )
+      end
+
+      element = fn index, count ->
+        map(
+          tuple({
+            frequency([{9, member_of(supported)}, {1, member_of(operators)}]),
+            list_of(operand.(index, count), max_length: 3)
+          }),
+          fn {operator, operands} ->
+            %Types.ContentFilterElement{filter_operator: operator, filter_operands: operands}
+          end
+        )
+      end
+
+      filter =
+        bind(integer(1..8), fn count ->
+          fixed_list(for index <- 0..(count - 1), do: element.(index, count))
+        end)
+
+      check all(
+              elements <- filter,
+              active <- boolean(),
+              max_runs: runs(),
+              max_run_time: run_time()
+            ) do
+        client = client(url)
+        where = %Types.ContentFilter{elements: elements}
+
+        {_, log} =
+          ExUnit.CaptureLog.with_log(fn ->
+            with {:ok, sub} <-
+                   Client.subscribe_events(client,
+                     where: where,
+                     fields: ["Message", "Severity"],
+                     interval: 20
+                   ) do
+              :ok = Server.event(server, message: "fuzz", severity: 300)
+              Server.condition(server, "ns=2;s=Pump.Fault", active: active)
+              # Answered after the connection has taken the events.
+              {:ok, _} = Client.read(client, "ns=2;s=Pump.Speed")
+              Client.unsubscribe(client, sub)
+            end
+          end)
+
+        drain_mailbox()
+        refute log =~ "failed", log
+        refute log =~ "terminating", log
+        assert Process.alive?(client)
+        assert Process.alive?(server)
+      end
+
+      with {client, _} <- Process.get(:fuzz_client), do: Client.close(client)
+      healthy(url)
+    end
+
+    defp drain_mailbox do
+      receive do
+        {Client, _, _} -> drain_mailbox()
+      after
+        0 -> :ok
+      end
     end
 
     # A client for a run of 50 cases, so that what the requests create, such

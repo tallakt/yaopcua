@@ -278,6 +278,10 @@ defmodule OPCUA.Server.AddressSpace do
 
   defp range(_, _), do: {:error, :bad_index_range_invalid}
 
+  # Longer than any index, and a number of a million digits takes a while
+  # to parse.
+  defp numeric_range(text) when byte_size(text) > 40, do: {:error, :bad_index_range_invalid}
+
   defp numeric_range(text) do
     case String.split(text, ":") do
       [n] ->

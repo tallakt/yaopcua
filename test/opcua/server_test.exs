@@ -874,6 +874,28 @@ defmodule OPCUA.ServerTest do
                Client.browse(client, "ns=2;s=Pump1.Hot", reference_type: "i=40")
     end
 
+    test "alarm methods refuse arrays and nulls where they take one value", %{client: client} do
+      comments = [
+        %Variant{type: :localized_text, value: []},
+        %Variant{type: :localized_text, value: [%OPCUA.LocalizedText{text: "a"}]}
+      ]
+
+      for event_id <- [nil, ["id"]], comment <- comments do
+        args = [%Variant{type: :byte_string, value: event_id}, List.first(comments)]
+
+        assert Client.call(client, "ns=2;s=Pump1.Overload", "i=9111", args) ==
+                 {:error, :bad_invalid_argument}
+
+        args = [%Variant{type: :byte_string, value: "id"}, comment]
+
+        assert Client.call(client, "ns=2;s=Pump1.Overload", "i=9029", args) ==
+                 {:error, :bad_invalid_argument}
+      end
+
+      refresh = [%Variant{type: :uint32, value: [1]}]
+      assert Client.call(client, "i=2782", "i=3875", refresh) == {:error, :bad_invalid_argument}
+    end
+
     test "refuses conditions it doesn't have", %{server: server} do
       assert Server.condition(server, "ns=2;s=Nope", active: true) ==
                {:error, :bad_node_id_unknown}

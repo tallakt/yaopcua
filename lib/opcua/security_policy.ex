@@ -51,8 +51,10 @@ defmodule OPCUA.SecurityPolicy do
     }
   }
 
-  # Every secure policy here: HMAC-SHA256 keys and signatures of 32 bytes,
-  # AES blocks and IVs of 16, and nonces of 32.
+  # Every secure policy here: RSA keys of 2048 to 4096 bits, HMAC-SHA256
+  # keys and signatures of 32 bytes, AES blocks and IVs of 16, and nonces of
+  # 32. A smaller key is weak, and a bigger one slow.
+  @key_bits 2048..4096
   @signature_key 32
   @signature 32
   @block 16
@@ -76,6 +78,12 @@ defmodule OPCUA.SecurityPolicy do
         {name, %{uri: ^uri}} -> name
         _ -> nil
       end)
+
+  @doc false
+  # Whether a certificate's key size (see OPCUA.Certificate.key_bits/1) is
+  # one the policy allows.
+  def key_bits?(:none, _), do: true
+  def key_bits?(_, bits), do: is_integer(bits) and bits in @key_bits
 
   @doc false
   def nonce_length(:none), do: 0

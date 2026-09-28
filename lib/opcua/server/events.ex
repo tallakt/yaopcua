@@ -109,7 +109,8 @@ defmodule OPCUA.Server.Events do
   @doc false
   # Checks an EventFilter when a monitored item is made: every select clause
   # must name a field from an event type, and the where clause may only use
-  # the operators implemented here.
+  # the operators implemented here, and refer only to elements after the one
+  # referring (Part 4, 7.7.1), so that it can't loop.
   def check(%Types.EventFilter{} = filter, space) do
     selects =
       for clause <- filter.select_clauses || [] do
@@ -121,11 +122,20 @@ defmodule OPCUA.Server.Events do
     elements = (filter.where_clause && filter.where_clause.elements) || []
 
     wheres =
-      for element <- elements do
+      for {element, index} <- Enum.with_index(elements) do
+        operands = element.filter_operands || []
+
         code =
-          if element.filter_operator in @operators,
-            do: 0,
-            else: StatusCode.code(:bad_filter_operator_unsupported)
+          cond do
+            element.filter_operator not in @operators ->
+              StatusCode.code(:bad_filter_operator_unsupported)
+
+            not Enum.all?(operands, &operand?(&1, index, length(elements))) ->
+              StatusCode.code(:bad_filter_operand_invalid)
+
+            true ->
+              0
+          end
 
         %Types.ContentFilterElementResult{status_code: code}
       end
@@ -139,6 +149,9 @@ defmodule OPCUA.Server.Events do
       selects == [] ->
         {:error, :bad_event_filter_invalid, result}
 
+      Enum.any?(wheres, &(&1.status_code == StatusCode.code(:bad_filter_operand_invalid))) ->
+        {:error, :bad_monitored_item_filter_invalid, result}
+
       Enum.any?(wheres, &(&1.status_code != 0)) ->
         {:error, :bad_monitored_item_filter_unsupported, result}
 
@@ -148,6 +161,11 @@ defmodule OPCUA.Server.Events do
   end
 
   def check(_, _), do: {:error, :bad_event_filter_invalid, nil}
+
+  defp operand?(%Types.ElementOperand{index: target}, index, count),
+    do: target > index and target < count
+
+  defp operand?(_, _, _), do: true
 
   defp event_type?(_, nil), do: true
   defp event_type?(space, type), do: AddressSpace.subtype?(space, type, @base_event_type)
@@ -186,15 +204,24 @@ defmodule OPCUA.Server.Events do
   defp where?(_, nil, _), do: true
   defp where?(_, %Types.ContentFilter{elements: elements}, _) when elements in [nil, []], do: true
 
-  defp where?(event, %Types.ContentFilter{elements: elements}, space),
-    do: evaluate(elements, 0, event, space) == true
+  # Each element is evaluated once, from the last, as elements only refer to
+  # later ones: an element used by many others costs no more.
+  defp where?(event, %Types.ContentFilter{elements: elements}, space) do
+    results =
+      elements
+      |> Enum.with_index()
+      |> Enum.reverse()
+      |> Enum.reduce(%{}, fn {element, index}, results ->
+        Map.put(results, index, evaluate(element, results, event, space))
+      end)
 
-  defp evaluate(elements, index, event, space) do
-    %Types.ContentFilterElement{filter_operator: operator, filter_operands: operands} =
-      Enum.at(elements, index)
+    results[0] == true
+  end
 
-    value = &operand(&1, elements, event, space)
-    operands = operands || []
+  defp evaluate(%Types.ContentFilterElement{} = element, results, event, space) do
+    value = &operand(&1, results, event, space)
+    operator = element.filter_operator
+    operands = element.filter_operands || []
 
     case {operator, operands} do
       {:of_type, [%Types.LiteralOperand{value: %Variant{value: type}}]} ->
@@ -244,8 +271,7 @@ defmodule OPCUA.Server.Events do
   defp operand(%Types.SimpleAttributeOperand{} = operand, _, event, space),
     do: event |> select(operand, space) |> unwrap()
 
-  defp operand(%Types.ElementOperand{index: index}, elements, event, space),
-    do: evaluate(elements, index, event, space)
+  defp operand(%Types.ElementOperand{index: index}, results, _, _), do: results[index]
 
   defp operand(_, _, _, _), do: nil
 

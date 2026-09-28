@@ -44,6 +44,8 @@ defmodule OPCUA.SecureChannel do
             certificate: nil,
             private_key: nil,
             remote_certificate: nil,
+            # The certificates a server trusts, checked before any RSA.
+            trust: nil,
             channel_id: 0,
             token_id: 0,
             previous_token_id: nil,
@@ -83,6 +85,9 @@ defmodule OPCUA.SecureChannel do
     * `:certificate`, `:private_key` - our own
     * `:remote_certificate` - the other side's, which a client knows before
       it opens the channel
+    * `:trust` - the certificates a server trusts (see
+      `OPCUA.Certificate.trusted?/2`). An OpenSecureChannel with another is
+      refused before any costly decryption or signature check.
     * `:receive_max_message`, `:receive_max_chunks` - what we accept
   """
   @spec new(Transport.limits(), keyword) :: t
@@ -96,6 +101,7 @@ defmodule OPCUA.SecureChannel do
       certificate: opts[:certificate],
       private_key: opts[:private_key],
       remote_certificate: opts[:remote_certificate],
+      trust: opts[:trust],
       send_chunk_size: limits.receive_buffer_size,
       send_max_message: limits.max_message_size,
       send_max_chunks: limits.max_chunk_count,
@@ -429,6 +435,12 @@ defmodule OPCUA.SecureChannel do
 
       channel.remote_certificate not in [nil, certificate] ->
         {:error, :bad_certificate_invalid}
+
+      not SecurityPolicy.key_bits?(policy, Certificate.key_bits(certificate)) ->
+        {:error, :bad_certificate_policy_check_failed}
+
+      channel.trust != nil and not Certificate.trusted?(certificate, channel.trust) ->
+        {:error, :bad_certificate_untrusted}
 
       true ->
         {:ok, %{channel | policy: policy, remote_certificate: certificate}}

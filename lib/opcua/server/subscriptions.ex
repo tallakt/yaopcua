@@ -31,6 +31,10 @@ defmodule OPCUA.Server.Subscriptions do
   ## Subscriptions
 
   @doc false
+  def handle(%Types.CreateSubscriptionRequest{} = request, session, state)
+      when map_size(session.subscriptions) >= state.config.limits.subscriptions,
+      do: {Services.fault(request, :bad_too_many_subscriptions), session}
+
   def handle(%Types.CreateSubscriptionRequest{} = request, session, state) do
     id = OPCUA.Server.next_id(state.config, :subscription)
     sub = %{revise(%Subscription{id: id}, request) | publishing: request.publishing_enabled}
@@ -109,9 +113,18 @@ defmodule OPCUA.Server.Subscriptions do
     with %{} = sub <- session.subscriptions[request.subscription_id] || :unknown,
          true <-
            request.timestamps_to_return in [:source, :server, :both, :neither] || :timestamps do
+      room = state.config.limits.monitored_items - monitored_items(session)
+
       {results, sub} =
-        Enum.map_reduce(request.items_to_create || [], sub, fn create, sub ->
-          create_item(create, request.timestamps_to_return, sub, state.config.space)
+        (request.items_to_create || [])
+        |> Enum.with_index()
+        |> Enum.map_reduce(sub, fn
+          {_, index}, sub when index >= room ->
+            {%Types.MonitoredItemCreateResult{status_code: code(:bad_too_many_monitored_items)},
+             sub}
+
+          {create, _}, sub ->
+            create_item(create, request.timestamps_to_return, sub, state.config.space)
         end)
 
       response = %Types.CreateMonitoredItemsResponse{
@@ -643,6 +656,9 @@ defmodule OPCUA.Server.Subscriptions do
         {%Types.MonitoredItemCreateResult{status_code: code(status), filter_result: result}, sub}
     end
   end
+
+  defp monitored_items(session),
+    do: session.subscriptions |> Map.values() |> Enum.map(&map_size(&1.items)) |> Enum.sum()
 
   defp modify(%{kind: :events} = item, parameters, _sub, space) do
     case event_parameters(item, parameters, space) do

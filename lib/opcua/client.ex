@@ -65,7 +65,7 @@ defmodule OPCUA.Client do
 
   require Logger
 
-  import OPCUA.Client.Connection, only: [with_header: 3, result: 1, status_name: 1]
+  import OPCUA.Client.Connection, only: [with_header: 3, result: 2, status_name: 1, ms: 3]
 
   alias OPCUA.{DataValue, NodeId, NodeIds, QualifiedName, SecureChannel, StatusCode}
   alias OPCUA.{Transport, Variant}
@@ -160,7 +160,8 @@ defmodule OPCUA.Client do
 
   `value` is either an `OPCUA.Variant`, sent as is, or a plain value. For a
   plain value the client reads the node once to learn its type, and remembers
-  it for later writes.
+  it for later writes; a value that doesn't fit that type is
+  `{:error, :bad_type_mismatch}`.
   """
   @spec write(client, node_ref, term) :: :ok | error
   def write(client, node, value) do
@@ -213,7 +214,7 @@ defmodule OPCUA.Client do
         case read_many(client, [node]) do
           {:ok, [%DataValue{value: %Variant{type: type}}]} ->
             GenServer.cast(client, {:type, node, type})
-            {:ok, %Variant{type: type, value: value}}
+            typed(type, value)
 
           {:ok, [%DataValue{status: status}]} when status != 0 ->
             {:error, status_name(status)}
@@ -226,8 +227,18 @@ defmodule OPCUA.Client do
         end
 
       type ->
-        {:ok, %Variant{type: type, value: value}}
+        typed(type, value)
     end
+  end
+
+  # The type comes from the server, so a value that doesn't fit it is a
+  # mismatch rather than the caller's mistake to raise for.
+  defp typed(type, value) do
+    variant = %Variant{type: type, value: value}
+    OPCUA.Binary.encode(variant, :variant)
+    {:ok, variant}
+  rescue
+    ArgumentError -> {:error, :bad_type_mismatch}
   end
 
   @doc """
@@ -521,7 +532,7 @@ defmodule OPCUA.Client do
       case request(client, monitored) do
         {:ok, %{results: results}} ->
           failed =
-            for {handle, %{status_code: status}} <- Enum.zip(handles, results),
+            for {handle, %{status_code: status}} <- Enum.zip(handles, results || []),
                 StatusCode.bad?(status),
                 do: {handle, status}
 
@@ -578,7 +589,7 @@ defmodule OPCUA.Client do
       case Connection.exchange(state, %Types.GetEndpointsRequest{endpoint_url: url}) do
         {:ok, %{endpoints: endpoints}, state} ->
           Connection.disconnect(state)
-          {:ok, endpoints}
+          {:ok, endpoints || []}
 
         error ->
           :gen_tcp.close(state.socket)
@@ -617,7 +628,10 @@ defmodule OPCUA.Client do
             pair
         end
 
-      with {:ok, server} <- server_certificate(url, timeout, policy, mode, opts) do
+      with {:ok, server} <- server_certificate(url, timeout, policy, mode, opts),
+           true <-
+             OPCUA.SecurityPolicy.key_bits?(policy, OPCUA.Certificate.key_bits(server)) ||
+               {:error, :bad_certificate_policy_check_failed} do
         {:ok,
          %{
            policy: policy,
@@ -661,7 +675,7 @@ defmodule OPCUA.Client do
          {:ok, state} <- Connection.session(state, opts),
          # Chunks that came with the last handshake reply still go through the channel.
          {:noreply, state} <- chunks(state.chunks, %{state | chunks: []}) do
-      :ok = :inet.setopts(state.socket, active: true)
+      :ok = :inet.setopts(state.socket, active: :once)
       {:ok, state |> schedule_renew() |> schedule_keep_alive()}
     else
       {:error, reason} -> {:stop, reason}
@@ -696,7 +710,12 @@ defmodule OPCUA.Client do
       pid: pid,
       monitor: Process.monitor(pid),
       handles: handles,
-      keep_alive: created.revised_publishing_interval * created.revised_max_keep_alive_count
+      keep_alive:
+        min(
+          ms(created.revised_publishing_interval, 1, 3_600_000) *
+            max(created.revised_max_keep_alive_count, 1),
+          3_600_000
+        )
     }
 
     state = %{
@@ -742,10 +761,18 @@ defmodule OPCUA.Client do
   end
 
   @impl true
-  def handle_info({:tcp, _, data}, state) do
+  # One read at a time, so a server sending faster than the client keeps up
+  # is held back by TCP rather than filling the mailbox.
+  def handle_info({:tcp, socket, data}, state) do
     case Transport.split(state.buffer <> data, Connection.receive_buffer()) do
-      {:ok, chunks, rest} -> chunks(chunks, %{state | buffer: rest})
-      {:error, reason} -> {:stop, {:shutdown, reason}, state}
+      {:ok, chunks, rest} ->
+        with {:noreply, state} <- chunks(chunks, %{state | buffer: rest}) do
+          _ = :inet.setopts(socket, active: :once)
+          {:noreply, state}
+        end
+
+      {:error, reason} ->
+        {:stop, {:shutdown, reason}, state}
     end
   end
 
@@ -773,8 +800,11 @@ defmodule OPCUA.Client do
     {request, state} = Connection.open_request(state, :renew)
 
     case send_message(%{state | channel: channel}, :open, id, request) do
-      {:ok, state} -> {:noreply, put_pending(state, id, :renew, nil)}
-      {:error, reason} -> {:stop, {:shutdown, reason}, state}
+      {:ok, state} ->
+        {:noreply, put_pending(state, id, {:renew, Types.OpenSecureChannelResponse}, nil)}
+
+      {:error, reason} ->
+        {:stop, {:shutdown, reason}, state}
     end
   end
 
@@ -826,9 +856,10 @@ defmodule OPCUA.Client do
       {nil, _} ->
         state
 
-      {{tag, timer}, pending} ->
+      {{{tag, type}, timer}, pending} ->
         if timer, do: Process.cancel_timer(timer)
-        reply = with {:ok, response} <- reply, do: result(response)
+        reply = with {:ok, response} <- reply, do: result(response, type)
+
         handle_reply(%{state | pending: pending}, tag, reply)
     end
   end
@@ -963,14 +994,16 @@ defmodule OPCUA.Client do
     end
   end
 
-  # Sends a request and remembers what to do with its response: reply to a
-  # caller (`tag` is `{:call, from}`), or handle it here.
+  # Sends a request and remembers what to do with its response, and what
+  # type it must be: reply to a caller (`tag` is `{:call, from}`), or handle
+  # it here.
   defp send_request(state, request, hint, tag, timeout) do
     {id, channel} = SecureChannel.next_request_id(state.channel)
     {request, state} = with_header(%{state | channel: channel}, request, hint)
 
     with {:ok, state} <- send_message(state, :message, id, request) do
-      {:ok, put_pending(state, id, tag, Process.send_after(self(), {:timeout, id}, timeout))}
+      timer = Process.send_after(self(), {:timeout, id}, timeout)
+      {:ok, put_pending(state, id, {tag, Connection.response_type(request)}, timer)}
     end
   end
 
@@ -989,7 +1022,7 @@ defmodule OPCUA.Client do
 
   # Renew at 75% of the token's lifetime, as the spec recommends.
   defp schedule_renew(state) do
-    Process.send_after(self(), :renew, trunc(state.token.revised_lifetime * 0.75))
+    Process.send_after(self(), :renew, ms(state.token.revised_lifetime * 0.75, 1000, 0xFFFF_FFFF))
     state
   end
 
@@ -1000,7 +1033,7 @@ defmodule OPCUA.Client do
 
   @impl true
   def terminate(reason, state) do
-    for {_, {{:call, from}, _}} <- state.pending,
+    for {_, {{{:call, from}, _}, _}} <- state.pending,
         do: GenServer.reply(from, {:error, :bad_connection_closed})
 
     # {:shutdown, reason} means the connection is already broken.

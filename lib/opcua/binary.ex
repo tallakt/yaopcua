@@ -102,8 +102,12 @@ defmodule OPCUA.Binary do
   @end_ticks DateTime.to_unix(~U[9999-12-31 23:59:59Z]) * 10_000_000 + @epoch
   @end_of_time ~U[9999-12-31 23:59:59.999999Z]
 
-  # How deep variants, data values and diagnostic infos may nest in each other.
+  # How deep variants, data values and diagnostic infos may nest in each
+  # other, and structures in ExtensionObjects. The generated decoders take
+  # no depth to count with, so the depth of structures is kept in the
+  # process dictionary under this key while decoding.
   @max_depth 100
+  @structure_depth {__MODULE__, :structure_depth}
 
   @doc false
   def builtins, do: @builtins
@@ -447,7 +451,7 @@ defmodule OPCUA.Binary do
         {type_id && %ExtensionObject{type_id: type_id}, rest}
 
       <<1, rest::binary>> ->
-        {body, rest} = take(rest, :byte_string)
+        {body, rest} = body(rest)
         {structure(type_id, body), rest}
 
       <<2, rest::binary>> ->
@@ -510,20 +514,44 @@ defmodule OPCUA.Binary do
   defp optional(binary, 1, type, _), do: take(binary, type)
   defp optional(binary, 0, _, default), do: {default, binary}
 
+  # An ExtensionObject's body, not copied (unlike other byte strings): it's
+  # decoded right away, or copied in structure/2 if kept. Copying each body
+  # of nested ones would take time quadratic in their depth.
+  defp body(<<n::little-signed-32, rest::binary>>) when n < 0, do: {nil, rest}
+  defp body(<<n::little-signed-32, body::binary-size(n), rest::binary>>), do: {body, rest}
+  defp body(_), do: raise(DecodeError, "too short or malformed for extension_object")
+
   defp structure(%NodeId{ns: 0, id: id} = type_id, body) when is_binary(body) do
     case OPCUA.Types.by_encoding(id) do
       nil ->
-        %ExtensionObject{type_id: type_id, encoding: :binary, body: body}
+        %ExtensionObject{type_id: type_id, encoding: :binary, body: :binary.copy(body)}
 
       module ->
         # A newer server may append fields this release doesn't know; they're ignored.
-        {value, _} = take(body, module)
+        {value, _} = nested(fn -> take(body, module) end)
         value
     end
   end
 
   defp structure(type_id, body),
-    do: %ExtensionObject{type_id: type_id, encoding: :binary, body: body}
+    do: %ExtensionObject{type_id: type_id, encoding: :binary, body: body && :binary.copy(body)}
+
+  defp nested(decode) do
+    depth = Process.get(@structure_depth, 0)
+
+    if depth >= @max_depth,
+      do: raise(DecodeError, "structures nested more than #{@max_depth} deep")
+
+    Process.put(@structure_depth, depth + 1)
+
+    try do
+      decode.()
+    after
+      if depth == 0,
+        do: Process.delete(@structure_depth),
+        else: Process.put(@structure_depth, depth)
+    end
+  end
 
   defp too_deep(depth) when depth > @max_depth,
     do: raise(DecodeError, "values nested more than #{@max_depth} deep")

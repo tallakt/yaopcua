@@ -120,8 +120,8 @@ defmodule OPCUA.Client.Connection do
 
     with {:ok, frames, channel} <- SecureChannel.encode(channel, :open, id, request),
          :ok <- :gen_tcp.send(state.socket, frames),
-         {:ok, %Types.OpenSecureChannelResponse{} = response, state} <-
-           await(%{state | channel: channel}, id) do
+         {:ok, response, state} <- await(%{state | channel: channel}, id),
+         {:ok, response} <- result(response, Types.OpenSecureChannelResponse) do
       {:ok, opened(state, response)}
     end
   end
@@ -179,8 +179,8 @@ defmodule OPCUA.Client.Connection do
          state = %{
            state
            | auth: created.authentication_token,
-             session_timeout: created.revised_session_timeout,
-             server_nonce: created.server_nonce
+             session_timeout: ms(created.revised_session_timeout, 1000, 86_400_000),
+             server_nonce: created.server_nonce || ""
          },
          {:ok, token, token_signature} <-
            identity(state, created, Keyword.get(opts, :user, :anonymous)),
@@ -234,7 +234,10 @@ defmodule OPCUA.Client.Connection do
       )
 
     tokens = (endpoint && endpoint.user_identity_tokens) || []
-    server_certificate = created.server_certificate || (endpoint && endpoint.server_certificate)
+
+    server_certificate =
+      created.server_certificate || state.security[:server_certificate] ||
+        (endpoint && endpoint.server_certificate)
 
     case {user, Enum.find(tokens, &(&1.token_type == token_type(user)))} do
       {:anonymous, policy} ->
@@ -247,9 +250,20 @@ defmodule OPCUA.Client.Connection do
         {:error, :bad_identity_token_rejected}
 
       {user, policy} ->
-        case token_policy(state, policy) do
-          nil -> {:error, :bad_security_policy_rejected}
-          security -> user_token(user, policy, security, server_certificate, state.server_nonce)
+        security = token_policy(state, policy)
+
+        cond do
+          security == nil ->
+            {:error, :bad_security_policy_rejected}
+
+          # A secret to encrypt, or a signature to make, for a server that
+          # hasn't said what its certificate is.
+          (security != :none or match?({:certificate, _, _}, user)) and
+              not is_binary(server_certificate) ->
+            {:error, :bad_certificate_invalid}
+
+          true ->
+            user_token(user, policy, security, server_certificate, state.server_nonce)
         end
     end
   end
@@ -310,8 +324,9 @@ defmodule OPCUA.Client.Connection do
 
     with {:ok, frames, channel} <- SecureChannel.encode(state.channel, :message, id, request),
          :ok <- :gen_tcp.send(state.socket, frames),
-         {:ok, response, state} <- await(%{state | channel: channel}, id) do
-      with {:ok, response} <- result(response), do: {:ok, response, state}
+         {:ok, response, state} <- await(%{state | channel: channel}, id),
+         {:ok, response} <- result(response, response_type(request)) do
+      {:ok, response, state}
     end
   end
 
@@ -395,13 +410,30 @@ defmodule OPCUA.Client.Connection do
   end
 
   @doc false
-  # A Bad service result or a ServiceFault is an error.
-  def result(%Types.ServiceFault{response_header: %{service_result: status}}),
+  # The response a request gets: a ReadResponse for a ReadRequest.
+  def response_type(%module{}) do
+    name = module |> Module.split() |> List.last() |> String.replace_suffix("Request", "Response")
+    Module.concat(Types, name)
+  end
+
+  @doc false
+  # A Bad service result or a ServiceFault is an error, and so is a response
+  # of another type than `expected`: a server can't answer a Read with a
+  # WriteResponse, say, and have the client take it.
+  def result(%Types.ServiceFault{response_header: %{service_result: status}}, _),
     do: {:error, status_name(status)}
 
-  def result(%{response_header: %{service_result: status}} = response) do
+  def result(%expected{response_header: %{service_result: status}} = response, expected) do
     if StatusCode.bad?(status), do: {:error, status_name(status)}, else: {:ok, response}
   end
+
+  def result(_, _), do: {:error, :bad_unknown_response}
+
+  @doc false
+  # A duration in ms from the server, within bounds: so that zero can't keep
+  # the client busy, nor NaN or 1e300 break a timer.
+  def ms(value, low, high) when is_number(value), do: value |> max(low) |> min(high) |> trunc()
+  def ms(_, low, _), do: low
 
   @doc false
   def status_name(status), do: StatusCode.name(status) || status

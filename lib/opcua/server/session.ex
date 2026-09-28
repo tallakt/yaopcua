@@ -15,8 +15,10 @@ defmodule OPCUA.Server.Session do
     :timeout,
     # For the client to sign when it activates the session.
     :nonce,
-    # When the last request came, which the timeout counts from.
+    # When the last request came, which the timeout counts from, and the
+    # timer that ends the session.
     :last,
+    :timer,
     activated: false,
     # :anonymous, a user name, or the application URI of a user certificate
     user: nil,

@@ -13,14 +13,21 @@ defmodule OPCUA.Server.Connection do
   alias OPCUA.Types
 
   @receive_buffer 65_535
-  @max_message 16_777_216
-  @hello_timeout 10_000
 
   def start_link({config, socket}), do: GenServer.start_link(__MODULE__, {config, socket})
 
   @impl true
   def init({config, socket}) do
-    Process.send_after(self(), :hello_timeout, @hello_timeout)
+    # Whatever a client makes it do, this process takes no more than its
+    # share of memory; the VM would rather close the connection.
+    Process.flag(:max_heap_size, %{
+      size: div(config.limits.connection_memory, :erlang.system_info(:wordsize)),
+      kill: true,
+      error_logger: true
+    })
+
+    # It must open its secure channel in time, and then have a session.
+    Process.send_after(self(), :open_timeout, config.limits.open_timeout)
 
     {:ok,
      %{
@@ -32,7 +39,8 @@ defmodule OPCUA.Server.Connection do
        receive_buffer: @receive_buffer,
        sessions: %{},
        request_id: nil,
-       outbox: []
+       outbox: [],
+       token_timer: nil
      }}
   end
 
@@ -62,8 +70,18 @@ defmodule OPCUA.Server.Connection do
 
   def handle_info({:tcp_closed, _}, state), do: {:stop, :normal, state}
   def handle_info({:tcp_error, _, _}, state), do: {:stop, :normal, state}
-  def handle_info(:hello_timeout, %{phase: :hello} = state), do: {:stop, :normal, state}
-  def handle_info(:hello_timeout, state), do: {:noreply, state}
+  def handle_info(:open_timeout, %{phase: :running} = state), do: {:noreply, state}
+  def handle_info(:open_timeout, state), do: {:stop, :normal, send_error(state, :bad_timeout)}
+
+  # A session only counts once it's activated: creating one needs no login.
+  def handle_info(:session_wait, state) do
+    if Enum.any?(Map.values(state.sessions), & &1.activated) do
+      Process.send_after(self(), :session_wait, state.config.limits.session_wait)
+      {:noreply, state}
+    else
+      {:stop, :normal, send_error(state, :bad_timeout)}
+    end
+  end
 
   # A channel whose token wasn't renewed in time is closed.
   def handle_info({:token_expired, token_id}, state) do
@@ -108,7 +126,7 @@ defmodule OPCUA.Server.Connection do
           protocol_version: 0,
           receive_buffer_size: min(@receive_buffer, hello.send_buffer_size),
           send_buffer_size: min(@receive_buffer, hello.receive_buffer_size),
-          max_message_size: @max_message,
+          max_message_size: state.config.limits.message_size,
           max_chunk_count: 0
         }
 
@@ -122,15 +140,17 @@ defmodule OPCUA.Server.Connection do
 
         channel =
           SecureChannel.new(limits,
-            receive_max_message: @max_message,
+            receive_max_message: state.config.limits.message_size,
             # None is always allowed for the channel, so clients can ask for
             # the endpoints; sessions check the endpoint they're made on.
             policies: Enum.uniq([:none | Enum.map(state.config.security, &elem(&1, 0))]),
             certificate: state.config.certificate,
-            private_key: state.config.private_key
+            private_key: state.config.private_key,
+            trust: state.config.trust
           )
 
-        :ok =
+        # If the client has gone, the socket says so next.
+        _ =
           :gen_tcp.send(
             state.socket,
             Transport.frame(:acknowledge, :final, Transport.acknowledge(ack))
@@ -193,10 +213,6 @@ defmodule OPCUA.Server.Connection do
       renew and request.security_mode != state.channel.mode ->
         {:halt, {:close, send_error(state, :bad_security_mode_rejected)}}
 
-      policy != :none and
-          not OPCUA.Certificate.trusted?(state.channel.remote_certificate, state.config.trust) ->
-        {:halt, {:close, send_error(state, :bad_certificate_untrusted)}}
-
       byte_size(request.client_nonce || "") != OPCUA.SecurityPolicy.nonce_length(policy) ->
         {:halt, {:close, send_error(state, :bad_nonce_invalid)}}
 
@@ -233,10 +249,17 @@ defmodule OPCUA.Server.Connection do
         }
 
         # The client should renew at 75% of the lifetime; give it until 125%.
-        Process.send_after(self(), {:token_expired, token.token_id}, trunc(lifetime * 1.25))
+        # A renewal replaces the timer, so renewing often leaves none behind.
+        if state.token_timer, do: Process.cancel_timer(state.token_timer)
 
-        {:cont,
-         {:ok, send_response(%{state | channel: channel, phase: :running}, :open, id, response)}}
+        timer =
+          Process.send_after(self(), {:token_expired, token.token_id}, trunc(lifetime * 1.25))
+
+        unless renew,
+          do: Process.send_after(self(), :session_wait, state.config.limits.session_wait)
+
+        state = %{state | channel: channel, phase: :running, token_timer: timer}
+        {:cont, {:ok, send_response(state, :open, id, response)}}
     end
   end
 

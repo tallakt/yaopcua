@@ -36,6 +36,11 @@ defmodule OPCUA.PubSub.Subscriber do
   alias OPCUA.{DataValue, StatusCode, Variant}
   alias OPCUA.PubSub.UADP
 
+  # At most this many datagrams wait in the mailbox. Past that the socket's
+  # buffer, and then the network, drops them, so that a flood can't take the
+  # VM's memory.
+  @active 100
+
   @doc "Starts receiving. See the module doc for the options."
   @spec start_link(keyword) :: GenServer.on_start()
   def start_link(opts),
@@ -60,7 +65,7 @@ defmodule OPCUA.PubSub.Subscriber do
          {:ok, socket} <-
            :gen_udp.open(
              port,
-             [:binary, active: true, reuseaddr: true, reuseport: true] ++ listen
+             [:binary, active: @active, reuseaddr: true, reuseport: true] ++ listen
            ) do
       readers =
         for reader <- Keyword.fetch!(opts, :readers) do
@@ -116,6 +121,11 @@ defmodule OPCUA.PubSub.Subscriber do
       {:error, _} ->
         {:noreply, state}
     end
+  end
+
+  def handle_info({:udp_passive, socket}, state) do
+    :ok = :inet.setopts(socket, active: @active)
+    {:noreply, state}
   end
 
   def handle_info({:timeout, index}, state) do

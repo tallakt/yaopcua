@@ -6,7 +6,7 @@ defmodule OPCUA.Server.Services do
 
   require Logger
 
-  alias OPCUA.{Certificate, NodeId, NodeIds, SecurityPolicy, StatusCode, Variant}
+  alias OPCUA.{Certificate, LocalizedText, NodeId, NodeIds, SecurityPolicy, StatusCode, Variant}
   alias OPCUA.Server.{AddressSpace, Conditions, Node, Session, Subscriptions}
   alias OPCUA.Types
 
@@ -105,7 +105,8 @@ defmodule OPCUA.Server.Services do
     channel = state.channel
     config = state.config
 
-    with :ok <- offered(channel, config),
+    with :ok <- room(map_size(state.sessions), config.limits.sessions, :bad_too_many_sessions),
+         :ok <- offered(channel, config),
          :ok <- client_certificate(request, channel) do
       timeout = request.requested_session_timeout |> max(1000.0) |> min(3_600_000.0)
       auth = %NodeId{ns: 0, id: {:opaque, :crypto.strong_rand_bytes(32)}}
@@ -157,6 +158,9 @@ defmodule OPCUA.Server.Services do
       {:error, status} -> {fault(request, status), state}
     end
   end
+
+  defp room(used, limit, _) when used < limit, do: :ok
+  defp room(_, _, status), do: {:error, status}
 
   # A session is only made on an endpoint the server offers; without a None
   # endpoint, a None channel is only for asking the endpoints.
@@ -264,7 +268,7 @@ defmodule OPCUA.Server.Services do
       valid =
         case config.users do
           nil -> false
-          users when is_map(users) -> Map.fetch(users, token.user_name) == {:ok, password}
+          users when is_map(users) -> same?(Map.get(users, token.user_name), password)
           fun when is_function(fun, 2) -> fun.(token.user_name, password) == true
         end
 
@@ -290,13 +294,20 @@ defmodule OPCUA.Server.Services do
       not Certificate.trusted?(certificate, config.user_certificates) ->
         {:error, :bad_identity_token_rejected}
 
-      policy == nil or not is_binary(signature.signature) or
-          not SecurityPolicy.verify(
-            policy,
-            config.certificate <> session.nonce,
-            signature.signature,
-            Certificate.public_key(certificate)
-          ) ->
+      policy == nil or not is_binary(signature.signature) ->
+        {:error, :bad_user_signature_invalid}
+
+      # An RSA key of the size the policies allow; `:any` trusts whatever
+      # certificate comes.
+      not SecurityPolicy.key_bits?(policy, Certificate.key_bits(certificate)) ->
+        {:error, :bad_identity_token_rejected}
+
+      not SecurityPolicy.verify(
+        policy,
+        config.certificate <> session.nonce,
+        signature.signature,
+        Certificate.public_key(certificate)
+      ) ->
         {:error, :bad_user_signature_invalid}
 
       true ->
@@ -307,6 +318,13 @@ defmodule OPCUA.Server.Services do
   end
 
   defp login(_, _, _, _), do: {:error, :bad_identity_token_invalid}
+
+  # In the same time whatever the password, so that timing gives away
+  # nothing about it.
+  defp same?(a, b) when is_binary(a) and is_binary(b),
+    do: :crypto.hash_equals(:crypto.hash(:sha256, a), :crypto.hash(:sha256, b))
+
+  defp same?(_, _), do: false
 
   # The policy that protects user secrets on an endpoint: a secure channel's
   # own, and on a None endpoint the strongest the server has.
@@ -353,11 +371,13 @@ defmodule OPCUA.Server.Services do
 
   defp guid, do: :crypto.strong_rand_bytes(16) |> OPCUA.Binary.take(:guid) |> elem(0)
 
-  # Each request restarts the session's timeout.
+  # Each request restarts the session's timeout, with one timer per session
+  # however many requests come.
   defp touch(session) do
+    if session.timer, do: Process.cancel_timer(session.timer)
     last = System.monotonic_time()
-    Process.send_after(self(), {:session_timeout, session.auth, last}, trunc(session.timeout))
-    %{session | last: last}
+    message = {:session_timeout, session.auth, last}
+    %{session | last: last, timer: Process.send_after(self(), message, trunc(session.timeout))}
   end
 
   # Publish requests still waiting are answered before the session goes.
@@ -519,10 +539,11 @@ defmodule OPCUA.Server.Services do
     space = state.config.space
 
     case {method, call.input_arguments || []} do
-      {@refresh, [%Variant{type: :uint32, value: sub}]} ->
+      {@refresh, [%Variant{type: :uint32, value: sub}]} when is_integer(sub) ->
         refresh(session, sub, nil, space)
 
-      {@refresh2, [%Variant{type: :uint32, value: sub}, %Variant{type: :uint32, value: item}]} ->
+      {@refresh2, [%Variant{type: :uint32, value: sub}, %Variant{type: :uint32, value: item}]}
+      when is_integer(sub) and is_integer(item) ->
         refresh(session, sub, item, space)
 
       {_, args} ->
@@ -565,10 +586,13 @@ defmodule OPCUA.Server.Services do
 
   defp condition_method(method, condition, args, session, state)
        when method in [@acknowledge, @add_comment] do
+    # Scalars: an array of either is a Variant of the same type.
     with [
            %Variant{type: :byte_string, value: event_id},
            %Variant{type: :localized_text, value: comment}
-         ] <- args,
+         ]
+         when is_binary(event_id) and (comment == nil or is_struct(comment, LocalizedText)) <-
+           args,
          comment = comment && comment.text,
          {:ok, condition} <- check_event(method, condition, event_id, state.config.space),
          :ok <- if(method == @acknowledge, do: acknowledged(condition, comment), else: :ok) do
