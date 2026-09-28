@@ -9,7 +9,16 @@ defmodule OPCUA.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       elixirc_paths: if(Mix.env() == :test, do: ["lib", "test/support"], else: ["lib"]),
-      aliases: ["opcua.schema": &schema/1]
+      aliases: ["opcua.schema": &schema/1],
+      package: package()
+    ]
+  end
+
+  # schema/ ships too: the modules that need it read it while compiling.
+  defp package do
+    [
+      licenses: ["Apache-2.0"],
+      files: ~w(lib schema mix.exs .formatter.exs README.md LICENSE NOTICE)
     ]
   end
 

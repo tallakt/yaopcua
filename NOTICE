@@ -1,0 +1,10 @@
+yaopcua
+Copyright 2026 Tallak Tveide
+
+This product includes software developed by Tallak Tveide, licensed under
+the Apache License, Version 2.0 (see LICENSE).
+
+The files in schema/ are unmodified copies of OPC Foundation definition
+files from https://github.com/OPCFoundation/UA-Nodeset, Copyright (c) The
+OPC Foundation, Inc., under the OPC Foundation MIT License 1.00, as stated
+in their headers. They are read while compiling, to generate code.

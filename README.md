@@ -425,3 +425,9 @@ rare branch.
 
 Out of scope on purpose: the XML and JSON encodings. Everything else not
 done is under [What's missing](#whats-missing).
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE). The OPC Foundation's definition
+files in `schema/` keep their own license, the OPC Foundation MIT License
+1.00; see [NOTICE](NOTICE).
