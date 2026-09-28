@@ -20,6 +20,14 @@ defmodule OPCUA.Client do
   couldn't get there. When the connection drops the client stops with
   `{:shutdown, reason}`, so run it under a supervisor to reconnect.
 
+  ## Not supported
+
+  No reconnecting (a supervisor starts a new client, with new sessions and
+  subscriptions), no Republish of lost notifications, no
+  TransferSubscriptions, no custom structure decoding, and no helpers for
+  history, Query, node management or SetTriggering (`request/3` sends them).
+  IPv4 only. See "What's missing" in the README.
+
   ## Security
 
       OPCUA.Client.start_link(url: url, security: {:basic256sha256, :sign_and_encrypt},
@@ -891,6 +899,9 @@ defmodule OPCUA.Client do
     end
   end
 
+  # The PublishResponse's available_sequence_numbers, which say what the
+  # server still holds, aren't used: a notification lost on the way isn't
+  # asked for again with Republish.
   defp published(state, %Types.PublishResponse{
          subscription_id: sub,
          notification_message: message

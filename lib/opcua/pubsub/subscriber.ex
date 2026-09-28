@@ -154,6 +154,7 @@ defmodule OPCUA.PubSub.Subscriber do
           |> Enum.with_index()
           |> Map.new(fn {field, i} -> {name(reader, i), value(field)} end)
 
+        # Event datasets (and keep-alives) carry no values to pass on.
         :delta_frame when reader.values != nil ->
           Enum.reduce(dataset.fields, reader.values, fn {i, field}, acc ->
             Map.put(acc, name(reader, i), value(field))

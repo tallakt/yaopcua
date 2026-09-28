@@ -8,6 +8,10 @@ defmodule OPCUA.Server.Conditions do
   #
   # A condition is retained, and reported by ConditionRefresh, while it's
   # enabled and either active or not yet acknowledged.
+  #
+  # Not supported: Confirm, shelving, suppression, silencing, latching,
+  # branches, the fields of specific alarm types (such as limits), and
+  # Acknowledge method nodes on each condition; clients call the type's.
 
   alias OPCUA.{LocalizedText, NodeId, QualifiedName, StatusCode, Variant}
   alias OPCUA.Server.{AddressSpace, Events, Node}

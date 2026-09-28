@@ -760,6 +760,9 @@ defmodule OPCUA.Server.Subscriptions do
 
   ## Helpers
 
+  # max_notifications and priority are kept but not used: every queued
+  # notification goes in one PublishResponse, and subscriptions are served in
+  # no particular order. The overflow bit of a full queue isn't set either.
   defp revise(sub, request) do
     interval =
       request.requested_publishing_interval |> max(@min_interval) |> min(@max_interval) |> trunc()

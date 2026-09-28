@@ -447,7 +447,8 @@ defmodule OPCUA.Binary do
   defp not_a_number(bits, _, bits), do: :neg_infinity
   defp not_a_number(_, _, _), do: :nan
 
-  defp date_time(ticks) when ticks <= 0, do: nil
+  # Less than a microsecond after 1601 rounds to the start, which is null too.
+  defp date_time(ticks) when ticks < 10, do: nil
   defp date_time(ticks) when ticks >= @end_ticks, do: @end_of_time
 
   defp date_time(ticks),
@@ -460,8 +461,11 @@ defmodule OPCUA.Binary do
   defp node_id_body(2, <<ns::little-16, id::little-32, rest::binary>>), do: {ns, id, rest}
 
   defp node_id_body(3, <<ns::little-16, rest::binary>>) do
-    {id, rest} = take(rest, :string)
-    {ns, id, rest}
+    # A null string is no identifier; it couldn't be encoded again either.
+    case take(rest, :string) do
+      {nil, _} -> raise DecodeError, "NodeId with a null string"
+      {id, rest} -> {ns, id, rest}
+    end
   end
 
   defp node_id_body(4, <<ns::little-16, rest::binary>>) do

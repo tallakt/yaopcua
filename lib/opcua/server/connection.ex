@@ -158,6 +158,11 @@ defmodule OPCUA.Server.Connection do
       {:ok, {:close, _, _}, channel} ->
         {:halt, {:close, %{state | channel: channel}}}
 
+      # A message that decodes as some other structure has no header to
+      # answer to; the connection is closed.
+      {:ok, {:message, _, message}, _} when not is_map_key(message, :request_header) ->
+        {:halt, {:close, fail(state, :bad_service_unsupported)}}
+
       {:ok, {:message, id, request}, channel} when state.phase == :running ->
         {:cont, {:ok, respond(%{state | channel: channel}, id, request)}}
 
@@ -217,6 +222,9 @@ defmodule OPCUA.Server.Connection do
           server_nonce: nonce
         }
 
+        # The new token is used for sending at once. The spec has the server
+        # wait until the client first uses it; clients accept either, as the
+        # response that brings the token arrives before anything sent with it.
         channel = %{
           SecureChannel.token(state.channel, token, nonce, request.client_nonce)
           | mode: request.security_mode

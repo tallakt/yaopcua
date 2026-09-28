@@ -207,7 +207,7 @@ defmodule OPCUA.PubSub.UADP do
     # Chunked, discovery and secured messages aren't handled.
     true = (extended2 &&& 0x1D) == 0 and (extended &&& 0x10) == 0
 
-    publisher_type = Enum.at(@publisher_types, extended &&& 0x07)
+    publisher_type = known(@publisher_types, extended &&& 0x07)
     {publisher, rest} = optional(rest, flags &&& 0x10, publisher_type)
     {class_id, rest} = optional(rest, extended &&& 0x08, :guid)
 
@@ -252,6 +252,10 @@ defmodule OPCUA.PubSub.UADP do
 
   defp split_byte(<<byte, rest::binary>>), do: {byte, rest}
 
+  # A reserved value in a flags field is a malformed message.
+  defp known(list, index),
+    do: Enum.at(list, index) || raise(OPCUA.DecodeError, "reserved value #{index}")
+
   defp optional(binary, 0, _), do: {nil, binary}
   defp optional(binary, _, type), do: Binary.take(binary, type)
 
@@ -290,8 +294,8 @@ defmodule OPCUA.PubSub.UADP do
 
   defp take_message(<<flags1, rest::binary>>, id, raw_types) do
     {flags2, rest} = if (flags1 &&& 0x80) != 0, do: split_byte(rest), else: {0, rest}
-    encoding = Enum.at(@encodings, flags1 >>> 1 &&& 0x03)
-    type = Enum.at(@message_types, flags2 &&& 0x0F)
+    encoding = known(@encodings, flags1 >>> 1 &&& 0x03)
+    type = known(@message_types, flags2 &&& 0x0F)
     {sequence, rest} = optional(rest, flags1 &&& 0x08, :uint16)
     {timestamp, rest} = optional(rest, flags2 &&& 0x10, :date_time)
     {picoseconds, rest} = optional(rest, flags2 &&& 0x20, :uint16)
@@ -342,6 +346,9 @@ defmodule OPCUA.PubSub.UADP do
 
   defp take_field(:variant, rest, _), do: Binary.take(rest, :variant)
   defp take_field(:data_value, rest, _), do: Binary.take(rest, :data_value)
+
+  # A delta frame can name a raw field past the ones whose types are known.
+  defp take_field(:raw, _rest, nil), do: raise(OPCUA.DecodeError, "raw field of unknown type")
 
   defp take_field(:raw, rest, type) do
     {value, rest} = Binary.take(rest, type)

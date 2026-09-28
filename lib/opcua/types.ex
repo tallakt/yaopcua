@@ -149,6 +149,11 @@ defmodule OPCUA.Types do
         @doc "The node id of this data type, in namespace 0."
         def type_id, do: unquote(ids[t.name])
 
+        @doc false
+        # The fields and their types, in encoding order: for generating
+        # values in tests, and for tools.
+        def __fields__, do: unquote(Macro.escape(for f <- t.fields, do: {f.name, f.type}))
+
         @doc "The node id of this type's binary encoding, which tags it on the wire, in namespace 0."
         def encoding_id, do: unquote(ids[t.name <> "_Encoding_DefaultBinary"])
 

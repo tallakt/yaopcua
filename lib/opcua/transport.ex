@@ -153,7 +153,7 @@ defmodule OPCUA.Transport do
 
   @doc """
   Parses `opc.tcp://host:port/path` into `{host, port}`, with 4840 as the
-  default port.
+  default port. Connections are made over IPv4 only.
   """
   @spec endpoint(String.t()) ::
           {:ok, {charlist, :inet.port_number()}} | {:error, :bad_tcp_endpoint_url_invalid}

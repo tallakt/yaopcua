@@ -19,8 +19,12 @@ defmodule OPCUA.PubSub do
   A multicast address (224.0.0.0 to 239.255.255.255) reaches every
   subscriber on the network; a unicast one reaches one host.
 
-  See `OPCUA.PubSub.UADP` for the message format. Message security is not
-  implemented.
+  See `OPCUA.PubSub.UADP` for the message format.
+
+  Not supported: message security and the Security Key Service, network
+  messages chunked over several datagrams, discovery and metadata messages,
+  transports other than UDP (Ethernet/TSN, MQTT, AMQP), the JSON mapping,
+  configuration as server nodes, and event datasets. IPv4 only.
   """
 
   @doc false

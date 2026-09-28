@@ -121,6 +121,28 @@ defmodule OPCUA.PubSub.UADPTest do
     assert [%DataSetMessage{fields: <<5, 0>>}] = round_trip(message).messages
   end
 
+  test "a raw delta frame field past the known types is an error" do
+    message = fn index ->
+      %UADP{
+        publisher_id: {:byte, 1},
+        messages: [
+          %DataSetMessage{
+            writer_id: 1,
+            type: :delta_frame,
+            encoding: :raw,
+            fields: [{index, {:int16, 5}}]
+          }
+        ]
+      }
+      |> UADP.encode()
+      |> IO.iodata_to_binary()
+      |> UADP.decode(%{1 => [:int16]})
+    end
+
+    assert {:ok, %UADP{messages: [%{fields: [{0, {:int16, 5}}]}]}} = message.(0)
+    assert message.(1) == {:error, :bad_decoding_error}
+  end
+
   test "malformed or unsupported messages are errors" do
     assert UADP.decode(<<>>) == {:error, :bad_decoding_error}
     assert UADP.decode(<<0x02>>) == {:error, :bad_decoding_error}

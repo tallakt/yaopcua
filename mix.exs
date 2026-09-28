@@ -8,6 +8,7 @@ defmodule OPCUA.MixProject do
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
+      elixirc_paths: if(Mix.env() == :test, do: ["lib", "test/support"], else: ["lib"]),
       aliases: ["opcua.schema": &schema/1]
     ]
   end
@@ -20,7 +21,10 @@ defmodule OPCUA.MixProject do
   end
 
   defp deps do
-    []
+    [
+      # Only for the fuzz and property tests.
+      {:stream_data, "~> 1.1", only: :test}
+    ]
   end
 
   # mix opcua.schema UA-1.05.07-2026-07-30

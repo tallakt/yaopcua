@@ -17,7 +17,14 @@ defmodule OPCUA.Server do
   `OPCUA.Schema.version/0`. Each client connection gets its own process, so a
   misbehaving client can't disturb the others.
 
-  Sessions live as long as the connection that made them.
+  ## Not supported
+
+  Sessions live as long as the connection that made them, so they can't be
+  reactivated, nor their subscriptions transferred, on a new connection.
+  There's no history, Query, node management from clients, SetTriggering or
+  views; only built-in data types for variables; no limits on connections,
+  sessions or subscriptions per client; and most of namespace 0 has no
+  values. See "What's missing" in the README.
 
   ## Security
 

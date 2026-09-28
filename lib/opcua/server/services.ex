@@ -508,6 +508,8 @@ defmodule OPCUA.Server.Services do
     {%Types.UnregisterNodesResponse{response_header: header(request, 0)}, session}
   end
 
+  # History, Query, node management, SetTriggering, TransferSubscriptions and
+  # anything else not above.
   defp call(request, session, _state), do: {fault(request, :bad_service_unsupported), session}
 
   # The first `max` references, and a continuation point for the rest.

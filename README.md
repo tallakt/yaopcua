@@ -13,8 +13,8 @@ speaks the binary protocol over TCP only; the XML and JSON encodings are out.
 
 **Status:** a client and a server that read, write, browse, call methods,
 subscribe to value changes and events, and handle alarms, over signed and
-encrypted channels; and PubSub over UDP for PLC to PLC. Fuzzing comes next;
-see [the roadmap](#roadmap).
+encrypted channels; and PubSub over UDP for PLC to PLC. What's left is under
+[What's missing](#whats-missing).
 
 ## Client
 
@@ -360,6 +360,8 @@ out on purpose, this is what it doesn't do, by area.
 **Quality**
 - Tested against asyncua only, not against open62541, the OPC Foundation's
   .NET stack, real PLCs, or the Compliance Test Tool.
+- Fuzzed in runs of hours, not continuously the way OSS-Fuzz fuzzes
+  open62541, and without coverage guidance.
 - Performance hasn't been measured.
 
 ## Tests
@@ -382,6 +384,29 @@ a Python OPC UA stack written independently of this one, in two ways:
 
 Python only ever runs in tests, never inside yaopcua.
 
+`test/opcua/fuzz_test.exs` fuzzes with
+[StreamData](https://github.com/whatyouhide/stream_data), in the spirit of
+open62541's fuzzers. Random and mutated bytes go into:
+
+* every decoder;
+* the transport framing;
+* the secure channel, with each policy and mode;
+* UADP;
+* a running server, on new connections and on open sessions.
+
+Random requests go to the server too, for every service except Publish and
+those that manage the channel and session. Nothing may crash. The server must
+answer or refuse, and whatever decodes must encode and decode back to itself. Each property runs 100 cases with `mix test`. For more:
+
+```
+FUZZ_RUNS=10000 mix test test/opcua/fuzz_test.exs   # cases per property
+FUZZ_SECONDS=600 mix test test/opcua/fuzz_test.exs  # or seconds per property
+```
+
+StreamData generates values from the types, where libFuzzer follows code
+coverage. It knows every structure's shape, but it won't work its way into a
+rare branch.
+
 ## Roadmap
 
 | | Feature | Spec |
@@ -395,7 +420,7 @@ Python only ever runs in tests, never inside yaopcua.
 | ✅ | Events and alarms in the server: event filters, conditions, acknowledge, ConditionRefresh | Parts 4, 9 |
 | ✅ | Security: Basic256Sha256, Aes128_Sha256_RsaOaep and Aes256_Sha256_RsaPss, encrypted passwords and certificate logins, with OTP's `:crypto` and `:public_key` only | Parts 2, 4, 6, 7 |
 | ✅ | PubSub: UADP over UDP, unicast and multicast, key and delta frames | Part 14 |
-| | Fuzzing with [StreamData](https://github.com/whatyouhide/stream_data): random and mutated bytes into the decoder, the secure channel and the server | |
+| ✅ | Fuzzing with [StreamData](https://github.com/whatyouhide/stream_data): random and mutated bytes into the decoder, the secure channel and the server | |
 
 Out of scope on purpose: the XML and JSON encodings. Everything else not
 done is under [What's missing](#whats-missing).

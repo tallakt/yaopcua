@@ -21,6 +21,9 @@ defmodule OPCUA.Server.Events do
   @has_event_source %NodeId{id: 36}
   @has_notifier %NodeId{id: 48}
 
+  # The where-clause operators evaluated here. Like, Cast, InView, RelatedTo,
+  # BitwiseAnd and BitwiseOr aren't, nor is AttributeOperand; index ranges in
+  # select clauses are ignored, and no overflow event marks a full queue.
   @operators [
     :equals,
     :is_null,

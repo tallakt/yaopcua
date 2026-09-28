@@ -10,6 +10,10 @@ defmodule OPCUA.Certificate do
       :ok = OPCUA.Certificate.write("server.der", cert)
       :ok = OPCUA.Certificate.write_key("server.pem", key)
 
+  Not supported: certificate chains (each side sends one certificate),
+  revocation lists, and certificate signing requests. Trust is a list of
+  certificates, or of the CAs that signed them.
+
   A self-signed certificate should be made once and kept: a new one on every
   start means every peer has to trust it again.
   """

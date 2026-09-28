@@ -17,6 +17,9 @@ defmodule OPCUA.SecureChannel do
     * Other chunks are signed with HMAC-SHA256 in the `:sign` mode, and also
       encrypted with AES-CBC in `:sign_and_encrypt`, with keys derived from the
       nonces the two sides exchanged when they opened or renewed the channel.
+
+  Not supported: the ECC policies, the deprecated Basic128Rsa15 and
+  Basic256, and a chain of certificates in the OpenSecureChannel header.
   """
 
   alias OPCUA.{Binary, Certificate, NodeId, SecurityPolicy, Transport}
