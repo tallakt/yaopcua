@@ -2,7 +2,7 @@
 
 *Implemented by AI under the supervision of Tallak Tveide.*
 
-Yet another OPC UA: a clean-room OPC UA stack in pure Elixir, for talking to
+Yet another OPC UA: an independent OPC UA stack in pure Elixir, for talking to
 PLCs, SCADA systems and HMIs without running C inside the BEAM.
 
 It implements a subset of what [open62541](https://github.com/open62541/open62541)
