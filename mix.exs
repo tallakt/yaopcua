@@ -1,16 +1,25 @@
 defmodule OPCUA.MixProject do
   use Mix.Project
 
+  @version "0.1.0"
+  @source_url "https://github.com/tallakt/yaopcua"
+
   def project do
     [
       app: :yaopcua,
-      version: "0.1.0",
+      version: @version,
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       elixirc_paths: if(Mix.env() == :test, do: ["lib", "test/support"], else: ["lib"]),
       aliases: ["opcua.schema": &schema/1],
-      package: package()
+      description:
+        "OPC UA in pure Elixir: client, server, events and alarms, security " <>
+          "policies, and PubSub over UDP, for talking to PLCs, SCADA and HMIs " <>
+          "without C in the BEAM.",
+      package: package(),
+      source_url: @source_url,
+      docs: docs()
     ]
   end
 
@@ -18,7 +27,36 @@ defmodule OPCUA.MixProject do
   defp package do
     [
       licenses: ["Apache-2.0"],
+      links: %{"GitHub" => @source_url},
       files: ~w(lib schema mix.exs .formatter.exs README.md LICENSE NOTICE)
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      extras: ["README.md", "LICENSE", "NOTICE"],
+      source_ref: "v#{@version}",
+      # Hundreds of generated structures and enumerations, kept apart.
+      groups_for_modules: [
+        Client: [OPCUA.Client],
+        Server: [OPCUA.Server, OPCUA.Server.Node],
+        PubSub: [OPCUA.PubSub, ~r/^OPCUA\.PubSub\./],
+        Security: [OPCUA.Certificate, OPCUA.SecurityPolicy, OPCUA.SecureChannel],
+        "Built-in types": [
+          OPCUA.NodeId,
+          OPCUA.ExpandedNodeId,
+          OPCUA.QualifiedName,
+          OPCUA.LocalizedText,
+          OPCUA.Variant,
+          OPCUA.DataValue,
+          OPCUA.DiagnosticInfo,
+          OPCUA.ExtensionObject,
+          OPCUA.StatusCode
+        ],
+        "Generated types": [OPCUA.Types, ~r/^OPCUA\.Types\./]
+      ],
+      nest_modules_by_prefix: [OPCUA.Types, OPCUA.PubSub]
     ]
   end
 
@@ -32,7 +70,8 @@ defmodule OPCUA.MixProject do
   defp deps do
     [
       # Only for the fuzz and property tests.
-      {:stream_data, "~> 1.1", only: :test}
+      {:stream_data, "~> 1.1", only: :test},
+      {:ex_doc, "~> 0.40", only: :dev, runtime: false}
     ]
   end
 

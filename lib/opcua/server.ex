@@ -88,7 +88,9 @@ defmodule OPCUA.Server do
   # slot of an :atomics array.
   @ids %{channel: 1, token: 2, subscription: 3}
 
-  @type server :: GenServer.server() | AddressSpace.t()
+  @typedoc "A server's address space, from `space/1`."
+  @opaque space :: AddressSpace.t()
+  @type server :: GenServer.server() | space
   @type node_ref :: NodeId.t() | String.t()
 
   @doc "Starts the server. See the module doc for the options."
@@ -446,7 +448,7 @@ defmodule OPCUA.Server do
   def get(server, node), do: get(space(server), node)
 
   @doc "The server's address space, to pass to `set/3` and `get/2`."
-  @spec space(GenServer.server()) :: AddressSpace.t()
+  @spec space(GenServer.server()) :: space
   def space(server), do: GenServer.call(server, :space)
 
   defp node_id(%NodeId{} = node), do: node

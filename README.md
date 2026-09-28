@@ -428,6 +428,6 @@ done is under [What's missing](#whats-missing).
 
 ## License
 
-Apache License 2.0; see [LICENSE](LICENSE). The OPC Foundation's definition
+Apache License 2.0; see [LICENSE](https://github.com/tallakt/yaopcua/blob/main/LICENSE). The OPC Foundation's definition
 files in `schema/` keep their own license, the OPC Foundation MIT License
-1.00; see [NOTICE](NOTICE).
+1.00; see [NOTICE](https://github.com/tallakt/yaopcua/blob/main/NOTICE).
