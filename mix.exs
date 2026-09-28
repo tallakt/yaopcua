@@ -1,14 +1,14 @@
 defmodule OPCUA.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.1.1"
   @source_url "https://github.com/tallakt/yaopcua"
 
   def project do
     [
       app: :yaopcua,
       version: @version,
-      elixir: "~> 1.18",
+      elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       elixirc_paths: if(Mix.env() == :test, do: ["lib", "test/support"], else: ["lib"]),

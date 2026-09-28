@@ -1,5 +1,10 @@
 # yaopcua
 
+[![CI](https://github.com/tallakt/yaopcua/actions/workflows/ci.yml/badge.svg)](https://github.com/tallakt/yaopcua/actions/workflows/ci.yml)
+[![Hex.pm](https://img.shields.io/hexpm/v/yaopcua.svg)](https://hex.pm/packages/yaopcua)
+[![Documentation](https://img.shields.io/badge/docs-hexdocs-purple.svg)](https://hexdocs.pm/yaopcua)
+[![License](https://img.shields.io/hexpm/l/yaopcua.svg)](https://github.com/tallakt/yaopcua/blob/main/LICENSE)
+
 *Implemented by AI under the supervision of Tallak Tveide.*
 
 Yet another OPC UA: an independent OPC UA stack in pure Elixir, for talking to
