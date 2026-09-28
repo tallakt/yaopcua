@@ -391,11 +391,12 @@ open62541's fuzzers. Random and mutated bytes go into:
 * every decoder;
 * the transport framing;
 * the secure channel, with each policy and mode;
-* UADP;
+* UADP, and a running subscriber;
 * a running server, on new connections and on open sessions.
 
 Random requests go to the server too, for every service except Publish and
-those that manage the channel and session. Nothing may crash. The server must
+those that manage the channel and session, and random arguments to its
+methods and alarm methods. Nothing may crash. The server must
 answer or refuse, and whatever decodes must encode and decode back to itself. Each property runs 100 cases with `mix test`. For more:
 
 ```

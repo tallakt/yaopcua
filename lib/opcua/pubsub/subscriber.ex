@@ -18,7 +18,8 @@ defmodule OPCUA.PubSub.Subscriber do
       * `:publisher_id`, `:writer_id` - whose dataset (required)
       * `:writer_group_id` - and in which group (default any)
       * `:fields` - `{name, type}` for each field, in order; needed for raw
-        fields, and to name the fields (otherwise they're numbered from 0)
+        fields (a raw dataset is dropped without them), and to name the
+        fields (otherwise they're numbered from 0)
       * `:name` - what the messages call the reader (default
         `{publisher_id, writer_id}`)
       * `:timeout` - ms without a message before `:timeout` (default 5000)
@@ -82,20 +83,33 @@ defmodule OPCUA.PubSub.Subscriber do
           }
         end
 
-      # Raw fields can only be read knowing their types.
-      raw_types = for r <- readers, r.types, into: %{}, do: {r.writer, r.types}
-
-      {:ok,
-       %{socket: socket, readers: readers, raw_types: raw_types, to: Keyword.fetch!(opts, :to)}}
+      {:ok, %{socket: socket, readers: readers, to: Keyword.fetch!(opts, :to)}}
     end
   end
 
   defp publisher_value({_type, value}), do: value
   defp publisher_value(value), do: value
 
+  # The index of the reader of a writer's dataset, going by the network
+  # message's publisher and group, or nil.
+  defp find_reader(readers, message, writer) do
+    publisher = message.publisher_id && publisher_value(message.publisher_id)
+
+    Enum.find_index(
+      readers,
+      &(&1.publisher == publisher and &1.writer == writer and
+          &1.group in [nil, message.writer_group_id])
+    )
+  end
+
+  # Raw fields can only be read knowing their types, which the reader has.
+  defp raw_types(readers, message, writer) do
+    if index = find_reader(readers, message, writer), do: Enum.at(readers, index).types
+  end
+
   @impl true
   def handle_info({:udp, _, _, _, data}, state) do
-    case UADP.decode(data, state.raw_types) do
+    case UADP.decode(data, &raw_types(state.readers, &1, &2)) do
       {:ok, message} ->
         {:noreply, Enum.reduce(message.messages, state, &dataset(message, &1, &2))}
 
@@ -111,23 +125,19 @@ defmodule OPCUA.PubSub.Subscriber do
   end
 
   defp dataset(message, dataset, state) do
-    publisher = message.publisher_id && publisher_value(message.publisher_id)
-
-    case Enum.find_index(
-           state.readers,
-           &(&1.publisher == publisher and &1.writer == dataset.writer_id and
-               &1.group in [nil, message.writer_group_id])
-         ) do
+    case find_reader(state.readers, message, dataset.writer_id) do
       nil ->
         state
 
       index ->
         reader = Enum.at(state.readers, index)
 
-        # A message the publisher marked invalid is skipped.
-        if dataset.valid and newer?(reader.sequence, dataset.sequence_number),
-          do: put_reader(state, index, receive_dataset(reader, dataset, index, state.to)),
-          else: state
+        # A message the publisher marked invalid is skipped, and so are raw
+        # fields the reader has no types for, which stay a binary.
+        if dataset.valid and is_list(dataset.fields) and
+             newer?(reader.sequence, dataset.sequence_number),
+           do: put_reader(state, index, receive_dataset(reader, dataset, index, state.to)),
+           else: state
     end
   end
 

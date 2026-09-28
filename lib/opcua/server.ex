@@ -64,19 +64,29 @@ defmodule OPCUA.Server do
 
   use GenServer
 
-  alias OPCUA.{DataValue, LocalizedText, NodeId, QualifiedName, Variant}
+  alias OPCUA.{DataValue, LocalizedText, NodeId, NodeIds, QualifiedName, Variant}
   alias OPCUA.Server.{AddressSpace, Conditions, Connection, Events, Node}
   alias OPCUA.Types
 
-  @objects %NodeId{id: 85}
-  @organizes %NodeId{id: 35}
-  @has_component %NodeId{id: 47}
-  @has_property %NodeId{id: 46}
-  @folder_type %NodeId{id: 61}
-  @base_object_type %NodeId{id: 58}
-  @base_data_variable_type %NodeId{id: 63}
-  @property_type %NodeId{id: 68}
-  @argument %NodeId{id: 296}
+  @objects NodeIds.node_id!("ObjectsFolder")
+  @server NodeIds.node_id!("Server")
+  @organizes NodeIds.node_id!("Organizes")
+  @has_component NodeIds.node_id!("HasComponent")
+  @has_property NodeIds.node_id!("HasProperty")
+  @folder_type NodeIds.node_id!("FolderType")
+  @base_object_type NodeIds.node_id!("BaseObjectType")
+  @base_data_variable_type NodeIds.node_id!("BaseDataVariableType")
+  @property_type NodeIds.node_id!("PropertyType")
+  @argument NodeIds.node_id!("Argument")
+  @base_event_type NodeIds.node_id!("BaseEventType")
+  @namespace_array NodeIds.node_id!("Server_NamespaceArray")
+
+  @readable Types.AccessLevelType.mask([:current_read])
+  @writable Types.AccessLevelType.mask([:current_read, :current_write])
+
+  # Ids unique across the server's connections, each counted in its own
+  # slot of an :atomics array.
+  @ids %{channel: 1, token: 2, subscription: 3}
 
   @type server :: GenServer.server() | AddressSpace.t()
   @type node_ref :: NodeId.t() | String.t()
@@ -134,7 +144,12 @@ defmodule OPCUA.Server do
   """
   @spec add_folder(GenServer.server(), node_ref, String.t(), keyword) :: :ok | {:error, atom}
   def add_folder(server, node, name, opts \\ []) do
-    add(server, node, :object, name, opts, %{event_notifier: 0}, nil, @organizes, @folder_type)
+    add(server, node, name, opts,
+      class: :object,
+      attributes: %{event_notifier: 0},
+      reference: @organizes,
+      type_definition: @folder_type
+    )
   end
 
   @doc """
@@ -143,8 +158,12 @@ defmodule OPCUA.Server do
   """
   @spec add_object(GenServer.server(), node_ref, String.t(), keyword) :: :ok | {:error, atom}
   def add_object(server, node, name, opts \\ []) do
-    type = node_id(Keyword.get(opts, :type_definition, @base_object_type))
-    add(server, node, :object, name, opts, %{event_notifier: 0}, nil, @organizes, type)
+    add(server, node, name, opts,
+      class: :object,
+      attributes: %{event_notifier: 0},
+      reference: @organizes,
+      type_definition: node_id(Keyword.get(opts, :type_definition, @base_object_type))
+    )
   end
 
   @doc """
@@ -167,9 +186,9 @@ defmodule OPCUA.Server do
   @spec add_variable(GenServer.server(), node_ref, String.t(), keyword) :: :ok | {:error, atom}
   def add_variable(server, node, name, opts) do
     type = Keyword.fetch!(opts, :type)
-    initial = Keyword.get_lazy(opts, :value, fn -> default(type) end)
+    initial = Keyword.get_lazy(opts, :value, fn -> OPCUA.Binary.default(type) end)
     array = is_list(initial) or Keyword.get(opts, :array, false)
-    access = if Keyword.get(opts, :writable, false), do: 3, else: 1
+    access = if Keyword.get(opts, :writable, false), do: @writable, else: @readable
 
     attributes = %{
       data_type: %NodeId{id: OPCUA.Binary.type_id(type)},
@@ -200,7 +219,13 @@ defmodule OPCUA.Server do
         do: {@has_property, @property_type},
         else: {@has_component, @base_data_variable_type}
 
-    add(server, node, :variable, name, opts, attributes, value, reference, type_definition)
+    add(server, node, name, opts,
+      class: :variable,
+      attributes: attributes,
+      value: value,
+      reference: reference,
+      type_definition: type_definition
+    )
   end
 
   @doc """
@@ -232,16 +257,10 @@ defmodule OPCUA.Server do
     method = node_id(node)
 
     with :ok <-
-           add(
-             server,
-             method,
-             :method,
-             name,
-             Keyword.put_new(opts, :parent, @objects),
-             attributes,
-             nil,
-             @has_component,
-             nil
+           add(server, method, name, opts,
+             class: :method,
+             attributes: attributes,
+             reference: @has_component
            ),
          :ok <- arguments(server, method, "InputArguments", inputs),
          :ok <- arguments(server, method, "OutputArguments", outputs) do
@@ -267,8 +286,8 @@ defmodule OPCUA.Server do
       data_type: @argument,
       value_rank: 1,
       array_dimensions: [length(value)],
-      access_level: 1,
-      user_access_level: 1,
+      access_level: @readable,
+      user_access_level: @readable,
       minimum_sampling_interval: 0.0,
       historizing: false
     }
@@ -276,17 +295,19 @@ defmodule OPCUA.Server do
     add(
       server,
       %NodeId{ns: method.ns, id: id},
-      :variable,
       %QualifiedName{ns: 0, name: name},
       [parent: method],
-      attributes,
-      %DataValue{value: %Variant{type: :extension_object, value: value}},
-      @has_property,
-      @property_type
+      class: :variable,
+      attributes: attributes,
+      value: %DataValue{value: %Variant{type: :extension_object, value: value}},
+      reference: @has_property,
+      type_definition: @property_type
     )
   end
 
-  defp add(server, node, class, name, opts, attributes, value, reference, type_definition) do
+  # `opts` are the caller's, and `spec` what the kind of node brings: its
+  # class, attributes, value, reference from its parent and type definition.
+  defp add(server, node, name, opts, spec) do
     node_id = node_id(node)
 
     browse_name =
@@ -297,16 +318,16 @@ defmodule OPCUA.Server do
 
     node = %Node{
       node_id: node_id,
-      class: class,
+      class: Keyword.fetch!(spec, :class),
       browse_name: browse_name,
       display_name: %LocalizedText{text: browse_name.name},
       description: if(text = opts[:description], do: %LocalizedText{text: text}),
-      attributes: attributes
+      attributes: Keyword.fetch!(spec, :attributes)
     }
 
     parent = node_id(Keyword.get(opts, :parent, @objects))
-    reference = node_id(Keyword.get(opts, :reference, reference))
-    GenServer.call(server, {:add, node, value, parent, reference, type_definition})
+    reference = node_id(Keyword.get(opts, :reference, Keyword.fetch!(spec, :reference)))
+    GenServer.call(server, {:add, node, spec[:value], parent, reference, spec[:type_definition]})
   end
 
   @doc """
@@ -340,9 +361,16 @@ defmodule OPCUA.Server do
   """
   @spec add_condition(GenServer.server(), node_ref, String.t(), keyword) :: :ok | {:error, atom}
   def add_condition(server, node, name, opts) do
-    opts = Keyword.update!(opts, :source, &node_id/1)
+    opts =
+      opts
+      |> Keyword.update!(:source, &node_id/1)
+      |> Keyword.update(:type, :off_normal, &condition_type/1)
+
     GenServer.call(server, {:add_condition, node_id(node), name, opts})
   end
+
+  defp condition_type(type) when type in [:off_normal, :alarm, :discrete], do: type
+  defp condition_type(type), do: node_id(type)
 
   @doc """
   Changes an alarm: `active:`, `acked:`, `enabled:`, `severity:` or
@@ -378,20 +406,25 @@ defmodule OPCUA.Server do
           }
       end
 
-    variable = AddressSpace.get(space, node)
-
     # Checked here, so a bad value raises in the caller rather than
     # breaking the responses of clients that read it.
-    if value.value do
-      :ok = AddressSpace.check(space, variable, value.value)
-      OPCUA.Binary.encode(value.value, :variant)
+    case AddressSpace.get(space, node) do
+      %Node{class: :variable} = variable when value.value != nil ->
+        if AddressSpace.check(space, variable, value.value) != :ok,
+          do: raise(ArgumentError, "#{inspect(value.value)} doesn't fit variable #{node}")
+
+        # This raises for a value outside its type, such as 300 as a Byte.
+        OPCUA.Binary.encode(value.value, :variant)
+
+      %Node{class: :variable} ->
+        :ok
+
+      _ ->
+        raise ArgumentError, "no variable #{node}"
     end
 
     AddressSpace.put_value(space, node, value)
     :ok
-  rescue
-    MatchError ->
-      reraise ArgumentError, "#{inspect(value)} doesn't fit variable #{node}", __STACKTRACE__
   end
 
   def set(server, node, value), do: set(space(server), node, value)
@@ -419,13 +452,9 @@ defmodule OPCUA.Server do
   defp node_id(%NodeId{} = node), do: node
   defp node_id(text) when is_binary(text), do: NodeId.parse!(text)
 
-  defp default(type) when type in [:float, :double], do: 0.0
-  defp default(:boolean), do: false
-
-  defp default(type) when type in [:string, :byte_string, :localized_text, :node_id, :date_time],
-    do: nil
-
-  defp default(_), do: 0
+  @doc false
+  # A new channel, token or subscription id.
+  def next_id(config, kind), do: :atomics.add_get(config.ids, Map.fetch!(@ids, kind), 1)
 
   ## The process
 
@@ -484,15 +513,13 @@ defmodule OPCUA.Server do
         private_key: private_key,
         trust: Keyword.get(opts, :trust, []),
         user_certificates: opts[:user_certificates],
-        # channel, token and subscription ids, unique across the server's connections
-        ids: :atomics.new(3, signed: false),
+        ids: :atomics.new(map_size(@ids), signed: false),
         server: self()
       }
 
       namespaces = ["http://opcfoundation.org/UA/", application_uri]
       server_nodes(space, config, namespaces)
-      server = self()
-      acceptor = spawn_link(fn -> accept(listen, connections, config, server) end)
+      acceptor = spawn_link(fn -> accept(listen, connections, config) end)
 
       {:ok,
        %{
@@ -533,39 +560,48 @@ defmodule OPCUA.Server do
       }
     end
 
+    info = "Server_ServerStatus_BuildInfo_"
+
     fixed = [
-      {2254, %Variant{type: :string, value: [config.application.application_uri]}},
-      {2255, %Variant{type: :string, value: namespaces}},
-      {2257, %Variant{type: :date_time, value: started}},
-      {2259, %Variant{type: :int32, value: 0}},
-      {2260, %Variant{type: :extension_object, value: build}},
-      {2261, %Variant{type: :string, value: build.product_name}},
-      {2262, %Variant{type: :string, value: build.product_uri}},
-      {2263, %Variant{type: :string, value: build.manufacturer_name}},
-      {2264, %Variant{type: :string, value: build.software_version}},
-      {2265, %Variant{type: :string, value: build.build_number}},
-      {2266, %Variant{type: :date_time, value: started}},
-      {2267, %Variant{type: :byte, value: 255}},
-      {2992, %Variant{type: :uint32, value: 0}},
-      {2993, %Variant{type: :localized_text, value: nil}}
+      {"Server_ServerArray", :string, [config.application.application_uri]},
+      {"Server_NamespaceArray", :string, namespaces},
+      {"Server_ServerStatus_StartTime", :date_time, started},
+      {"Server_ServerStatus_State", :int32, 0},
+      {"Server_ServerStatus_BuildInfo", :extension_object, build},
+      {info <> "ProductName", :string, build.product_name},
+      {info <> "ProductUri", :string, build.product_uri},
+      {info <> "ManufacturerName", :string, build.manufacturer_name},
+      {info <> "SoftwareVersion", :string, build.software_version},
+      {info <> "BuildNumber", :string, build.build_number},
+      {info <> "BuildDate", :date_time, started},
+      {"Server_ServiceLevel", :byte, 255},
+      {"Server_ServerStatus_SecondsTillShutdown", :uint32, 0},
+      {"Server_ServerStatus_ShutdownReason", :localized_text, nil}
     ]
 
-    for {id, variant} <- fixed,
-        do:
-          AddressSpace.put_value(space, %NodeId{id: id}, %DataValue{
-            value: variant,
-            source_timestamp: started
-          })
+    for {name, type, value} <- fixed do
+      AddressSpace.put_value(space, NodeIds.node_id!(name), %DataValue{
+        value: %Variant{type: type, value: value},
+        source_timestamp: started
+      })
+    end
 
-    AddressSpace.put_value(space, %NodeId{id: 2256}, {:read, status, :extension_object})
-    AddressSpace.put_value(space, %NodeId{id: 2258}, {:read, &DateTime.utc_now/0, :date_time})
+    AddressSpace.put_value(
+      space,
+      NodeIds.node_id!("Server_ServerStatus"),
+      {:read, status, :extension_object}
+    )
 
-    # The Server object reports events.
-    server = AddressSpace.get(space, %NodeId{id: 2253})
-    :ets.insert(space.nodes, {server.node_id, put_in(server.attributes[:event_notifier], 1)})
+    AddressSpace.put_value(
+      space,
+      NodeIds.node_id!("Server_ServerStatus_CurrentTime"),
+      {:read, &DateTime.utc_now/0, :date_time}
+    )
+
+    AddressSpace.notify_events(space, @server)
   end
 
-  defp accept(listen, connections, config, server) do
+  defp accept(listen, connections, config) do
     case :gen_tcp.accept(listen) do
       {:ok, socket} ->
         case DynamicSupervisor.start_child(connections, {Connection, {config, socket}}) do
@@ -577,7 +613,7 @@ defmodule OPCUA.Server do
             :gen_tcp.close(socket)
         end
 
-        accept(listen, connections, config, server)
+        accept(listen, connections, config)
 
       {:error, :closed} ->
         :ok
@@ -602,7 +638,7 @@ defmodule OPCUA.Server do
           source_timestamp: DateTime.utc_now()
         }
 
-        AddressSpace.put_value(state.config.space, %NodeId{id: 2255}, value)
+        AddressSpace.put_value(state.config.space, @namespace_array, value)
         {:reply, length(namespaces) - 1, %{state | namespaces: namespaces}}
 
       index ->
@@ -612,8 +648,8 @@ defmodule OPCUA.Server do
 
   def handle_call({:event, opts}, _, state) do
     space = state.config.space
-    source = node_id(Keyword.get(opts, :source, %NodeId{id: 2253}))
-    type = node_id(Keyword.get(opts, :type, %NodeId{id: 2041}))
+    source = node_id(Keyword.get(opts, :source, @server))
+    type = node_id(Keyword.get(opts, :type, @base_event_type))
 
     event =
       Events.new(

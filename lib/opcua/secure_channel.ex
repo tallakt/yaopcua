@@ -27,6 +27,16 @@ defmodule OPCUA.SecureChannel do
   # Sequence numbers wrap to below 1024 after this (Part 6, 6.7.2.4).
   @wrap 4_294_966_271
 
+  # What a chunk starts with: the 8-byte UA-TCP header and the channel id,
+  # then the token id in a symmetric one; and the sequence header of
+  # sequence number and request id.
+  @header 12
+  @symmetric_header 16
+  @sequence_header 8
+
+  @receive_max_message 16_777_216
+  @receive_max_chunks 4096
+
   defstruct policy: :none,
             mode: :none,
             # The policies a server lets a client open a channel with.
@@ -47,9 +57,13 @@ defmodule OPCUA.SecureChannel do
             send_max_message: 0,
             send_max_chunks: 0,
             # What we accept.
-            receive_max_message: 16_777_216,
-            receive_max_chunks: 4096,
-            partial: %{}
+            receive_max_message: @receive_max_message,
+            receive_max_chunks: @receive_max_chunks,
+            # Unfinished messages by request id, as {chunks, bytes, count},
+            # and the bytes and chunks of all of them together.
+            partial: %{},
+            held_bytes: 0,
+            held_chunks: 0
 
   @type t :: %__MODULE__{}
   @type kind :: :open | :message | :close
@@ -85,8 +99,8 @@ defmodule OPCUA.SecureChannel do
       send_chunk_size: limits.receive_buffer_size,
       send_max_message: limits.max_message_size,
       send_max_chunks: limits.max_chunk_count,
-      receive_max_message: Keyword.get(opts, :receive_max_message, 16_777_216),
-      receive_max_chunks: Keyword.get(opts, :receive_max_chunks, 4096)
+      receive_max_message: Keyword.get(opts, :receive_max_message, @receive_max_message),
+      receive_max_chunks: Keyword.get(opts, :receive_max_chunks, @receive_max_chunks)
     }
   end
 
@@ -171,24 +185,33 @@ defmodule OPCUA.SecureChannel do
 
   # How much of a message fits in one chunk, after the headers, padding and
   # signature, and rounded to the cipher's blocks.
-  defp room(channel, kind, :plain),
-    do: channel.send_chunk_size - 12 - IO.iodata_length(plain_header(channel, kind)) - 8
+  defp room(channel, kind, :plain) do
+    channel.send_chunk_size - @header - IO.iodata_length(plain_header(channel, kind)) -
+      @sequence_header
+  end
 
   defp room(channel, _, :asymmetric) do
     remote = Certificate.public_key(channel.remote_certificate)
     cipher = SecurityPolicy.key_size(remote)
     plain = SecurityPolicy.plain_block(channel.policy, remote)
-    blocks = div(channel.send_chunk_size - 12 - byte_size(asymmetric_header(channel)), cipher)
-    blocks * plain - 8 - SecurityPolicy.key_size(channel.private_key) - padding_bytes(plain)
+
+    blocks =
+      div(channel.send_chunk_size - @header - byte_size(asymmetric_header(channel)), cipher)
+
+    blocks * plain - @sequence_header - SecurityPolicy.key_size(channel.private_key) -
+      padding_bytes(plain)
   end
 
-  defp room(%{mode: :sign} = channel, _, :symmetric),
-    do: channel.send_chunk_size - 16 - 8 - SecurityPolicy.symmetric_signature_size()
+  defp room(%{mode: :sign} = channel, _, :symmetric) do
+    channel.send_chunk_size - @symmetric_header - @sequence_header -
+      SecurityPolicy.symmetric_signature_size()
+  end
 
+  # The padding takes at least its PaddingSize byte.
   defp room(channel, _, :symmetric) do
     block = SecurityPolicy.block_size()
 
-    div(channel.send_chunk_size - 16, block) * block - 8 -
+    div(channel.send_chunk_size - @symmetric_header, block) * block - @sequence_header -
       SecurityPolicy.symmetric_signature_size() - 1
   end
 
@@ -242,7 +265,7 @@ defmodule OPCUA.SecureChannel do
     signature = SecurityPolicy.sign(channel.policy, signed, channel.private_key)
 
     [
-      binary_part(signed, 0, 12 + byte_size(security)),
+      binary_part(signed, 0, @header + byte_size(security)),
       SecurityPolicy.encrypt(channel.policy, padded <> signature, remote)
     ]
   end
@@ -289,7 +312,7 @@ defmodule OPCUA.SecureChannel do
 
     keep = size - count - padding_bytes(block)
 
-    if keep >= 8,
+    if keep >= @sequence_header,
       do: {:ok, binary_part(data, 0, keep)},
       else: {:error, :bad_security_checks_failed}
   end
@@ -431,6 +454,8 @@ defmodule OPCUA.SecureChannel do
       {:ok, channel, plain}
     end
   rescue
+    # The other side's certificate and ciphertext are whatever it sent, and
+    # :public_key raises on what it can't parse.
     _ -> {:error, :bad_security_checks_failed}
   end
 
@@ -465,7 +490,7 @@ defmodule OPCUA.SecureChannel do
   defp check_sequence(_, _), do: {:error, :bad_sequence_number_invalid}
 
   defp assemble(channel, _kind, :abort, request_id, body) do
-    channel = %{channel | partial: Map.delete(channel.partial, request_id)}
+    {_, channel} = pop_partial(channel, request_id)
 
     case Transport.decode(:error, body) do
       {:ok, {status, reason}} -> {:abort, request_id, status, reason, channel}
@@ -475,25 +500,45 @@ defmodule OPCUA.SecureChannel do
 
   defp assemble(channel, kind, chunk, request_id, body) do
     {parts, size, count} = Map.get(channel.partial, request_id, {[], 0, 0})
-    parts = [body | parts]
-    size = size + byte_size(body)
-    count = count + 1
+    partial = {[body | parts], size + byte_size(body), count + 1}
+
+    channel = %{
+      channel
+      | partial: Map.put(channel.partial, request_id, partial),
+        held_bytes: channel.held_bytes + byte_size(body),
+        held_chunks: channel.held_chunks + 1
+    }
 
     cond do
-      size > channel.receive_max_message or count > channel.receive_max_chunks ->
+      # Unfinished messages, however many, together stay within the limits
+      # of one.
+      channel.held_bytes > channel.receive_max_message or
+          channel.held_chunks > channel.receive_max_chunks ->
         {:error, :bad_encoding_limits_exceeded}
 
       chunk == :continued ->
-        {:ok, %{channel | partial: Map.put(channel.partial, request_id, {parts, size, count})}}
+        {:ok, channel}
 
       true ->
-        channel = %{channel | partial: Map.delete(channel.partial, request_id)}
+        {{parts, _, _}, channel} = pop_partial(channel, request_id)
 
         case decode_message(parts |> Enum.reverse() |> IO.iodata_to_binary()) do
           {:ok, message} -> {:ok, {kind, request_id, message}, channel}
           {:error, _} = error -> error
         end
     end
+  end
+
+  defp pop_partial(channel, request_id) do
+    {{_, size, count} = partial, rest} = Map.pop(channel.partial, request_id, {[], 0, 0})
+
+    {partial,
+     %{
+       channel
+       | partial: rest,
+         held_bytes: channel.held_bytes - size,
+         held_chunks: channel.held_chunks - count
+     }}
   end
 
   @doc false

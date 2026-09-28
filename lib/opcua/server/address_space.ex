@@ -10,7 +10,7 @@ defmodule OPCUA.Server.AddressSpace do
 
   require Logger
 
-  alias OPCUA.{Binary, DataValue, ExpandedNodeId, LocalizedText, NodeId, QualifiedName, Variant}
+  alias OPCUA.{Binary, DataValue, ExpandedNodeId, NodeId, NodeIds, QualifiedName, Variant}
   alias OPCUA.Server.Node
   alias OPCUA.Types
 
@@ -18,9 +18,19 @@ defmodule OPCUA.Server.AddressSpace do
 
   @type t :: %__MODULE__{nodes: :ets.tid(), values: :ets.tid()}
 
-  @has_subtype %NodeId{id: 45}
-  @has_type_definition %NodeId{id: 40}
-  @hierarchical %NodeId{id: 33}
+  @has_subtype NodeIds.node_id!("HasSubtype")
+  @has_type_definition NodeIds.node_id!("HasTypeDefinition")
+  @hierarchical NodeIds.node_id!("HierarchicalReferences")
+
+  # Abstract data types, whose values are of any of their subtypes.
+  @number NodeIds.node_id!("Number")
+  @integer NodeIds.node_id!("Integer")
+  @unsigned NodeIds.node_id!("UInteger")
+  @enumeration NodeIds.node_id!("Enumeration")
+
+  @current_read Types.AccessLevelType.mask([:current_read])
+  @current_write Types.AccessLevelType.mask([:current_write])
+  @subscribe_to_events Types.EventNotifierType.mask([:subscribe_to_events])
 
   @classes %{
     object: 1,
@@ -81,10 +91,27 @@ defmodule OPCUA.Server.AddressSpace do
     end
   end
 
-  defp link(space, node_id, ref) do
-    node = get(space, node_id)
-    :ets.insert(space.nodes, {node_id, %{node | references: node.references ++ [ref]}})
+  defp link(space, node_id, ref),
+    do: update(space, node_id, &%{&1 | references: &1.references ++ [ref]})
+
+  @doc false
+  # Changes a node. Only the server process changes nodes, so nothing else
+  # changes it in between.
+  def update(space, node_id, fun),
+    do: :ets.insert(space.nodes, {node_id, fun.(get(space, node_id))})
+
+  @doc false
+  # Makes an object report events, so that clients can subscribe to them.
+  def notify_events(space, node_id) do
+    update(space, node_id, fn node ->
+      notifier = Bitwise.bor(node.attributes[:event_notifier] || 0, @subscribe_to_events)
+      put_in(node.attributes[:event_notifier], notifier)
+    end)
   end
+
+  @doc false
+  def notifier?(node),
+    do: Bitwise.band(node.attributes[:event_notifier] || 0, @subscribe_to_events) != 0
 
   @doc false
   def put_value(space, node_id, value), do: :ets.insert(space.values, {node_id, value})
@@ -187,7 +214,7 @@ defmodule OPCUA.Server.AddressSpace do
   end
 
   defp readable(space, node) do
-    if Bitwise.band(node.attributes.user_access_level, 1) == 1,
+    if Bitwise.band(node.attributes.user_access_level, @current_read) != 0,
       do: {:ok, value(space, node.node_id)},
       else: {:error, :bad_not_readable}
   end
@@ -290,7 +317,7 @@ defmodule OPCUA.Server.AddressSpace do
          :ok <-
            if(write.index_range in [nil, ""], do: :ok, else: {:error, :bad_write_not_supported}),
          :ok <-
-           if(Bitwise.band(node.attributes.user_access_level, 2) == 2,
+           if(Bitwise.band(node.attributes.user_access_level, @current_write) != 0,
              do: :ok,
              else: {:error, :bad_not_writable}
            ),
@@ -359,10 +386,10 @@ defmodule OPCUA.Server.AddressSpace do
   # The built-in type a data type is encoded as, following HasSubtype up
   # from types like Duration (a Double) or NodeClass (an enumeration).
   defp builtin(_, %NodeId{ns: 0, id: id}) when id in 1..25, do: Binary.type_name(id)
-  defp builtin(_, %NodeId{ns: 0, id: 26}), do: :number
-  defp builtin(_, %NodeId{ns: 0, id: 27}), do: :integer
-  defp builtin(_, %NodeId{ns: 0, id: 28}), do: :unsigned
-  defp builtin(_, %NodeId{ns: 0, id: 29}), do: :int32
+  defp builtin(_, @number), do: :number
+  defp builtin(_, @integer), do: :integer
+  defp builtin(_, @unsigned), do: :unsigned
+  defp builtin(_, @enumeration), do: :int32
 
   defp builtin(space, type) do
     case get(space, type) do
@@ -520,7 +547,4 @@ defmodule OPCUA.Server.AddressSpace do
           do: target
     )
   end
-
-  @doc false
-  def display_name(name), do: %LocalizedText{text: name}
 end

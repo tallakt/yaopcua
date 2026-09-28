@@ -275,6 +275,24 @@ defmodule OPCUA.ServerTest do
              Client.read(client, "ns=2;s=Pump1.Multiply.InputArguments")
   end
 
+  test "a null or array argument is a type mismatch", %{client: client} do
+    mismatch = OPCUA.StatusCode.code(:bad_type_mismatch)
+
+    for arg <- [nil, %Variant{type: :int32, value: [7]}] do
+      call = %Types.CallMethodRequest{
+        object_id: NodeId.parse!("ns=2;s=Pump1"),
+        method_id: NodeId.parse!("ns=2;s=Pump1.Multiply"),
+        input_arguments: [%Variant{type: :int32, value: 6}, arg]
+      }
+
+      assert {:ok, %{results: [result]}} =
+               Client.request(client, %Types.CallRequest{methods_to_call: [call]})
+
+      assert OPCUA.StatusCode.name(result.status_code) == :bad_invalid_argument
+      assert result.input_argument_results == [0, mismatch]
+    end
+  end
+
   test "a method from namespace 0 the server doesn't implement says so", %{client: client} do
     # Server.GetMonitoredItems
     assert Client.call(client, "i=2253", "i=11492", [%Variant{type: :uint32, value: 1}]) ==
@@ -842,6 +860,18 @@ defmodule OPCUA.ServerTest do
 
       assert Client.read(client, "ns=2;s=Pump1.Overload.Severity") == {:ok, 900}
       assert Client.read(client, "ns=2;s=Pump1.Overload.Retain") == {:ok, true}
+    end
+
+    test "a condition's type may be a node id", %{server: server, client: client} do
+      :ok =
+        Server.add_condition(server, "ns=2;s=Pump1.Hot", "Hot",
+          source: "ns=2;s=Pump1",
+          type: "i=2915"
+        )
+
+      # HasTypeDefinition
+      assert {:ok, [%{node_id: %OPCUA.ExpandedNodeId{ns: 0, id: 2915}}]} =
+               Client.browse(client, "ns=2;s=Pump1.Hot", reference_type: "i=40")
     end
 
     test "refuses conditions it doesn't have", %{server: server} do

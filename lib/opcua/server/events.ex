@@ -11,15 +11,15 @@ defmodule OPCUA.Server.Events do
   # A client's EventFilter picks fields with select clauses and events with a
   # where clause; both are evaluated here.
 
-  alias OPCUA.{LocalizedText, NodeId, QualifiedName, StatusCode, Variant}
+  alias OPCUA.{LocalizedText, NodeIds, QualifiedName, StatusCode, Variant}
   alias OPCUA.Server.AddressSpace
   alias OPCUA.Types
 
-  @base_event_type %NodeId{id: 2041}
-  @condition_type %NodeId{id: 2782}
-  @server %NodeId{id: 2253}
-  @has_event_source %NodeId{id: 36}
-  @has_notifier %NodeId{id: 48}
+  @base_event_type NodeIds.node_id!("BaseEventType")
+  @condition_type NodeIds.node_id!("ConditionType")
+  @server NodeIds.node_id!("Server")
+  @has_event_source NodeIds.node_id!("HasEventSource")
+  @has_notifier NodeIds.node_id!("HasNotifier")
 
   # The where-clause operators evaluated here. Like, Cast, InView, RelatedTo,
   # BitwiseAnd and BitwiseOr aren't, nor is AttributeOperand; index ranges in
@@ -73,14 +73,7 @@ defmodule OPCUA.Server.Events do
   # "ActiveState/Id" as a browse path.
   def path(path) when is_list(path), do: path
 
-  def path(path) do
-    for name <- String.split(path, "/") do
-      case Integer.parse(name) do
-        {ns, ":" <> name} -> %QualifiedName{ns: ns, name: name}
-        _ -> %QualifiedName{ns: 0, name: name}
-      end
-    end
-  end
+  def path(path), do: path |> String.split("/") |> Enum.map(&QualifiedName.parse/1)
 
   @doc false
   # The event's EventId.

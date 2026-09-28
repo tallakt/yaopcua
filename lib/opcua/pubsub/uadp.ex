@@ -22,7 +22,7 @@ defmodule OPCUA.PubSub.UADP do
 
   import Bitwise
 
-  alias OPCUA.Binary
+  alias OPCUA.{Binary, DecodeError}
 
   defmodule DataSetMessage do
     @moduledoc """
@@ -184,28 +184,41 @@ defmodule OPCUA.PubSub.UADP do
   # Encodes one field, raising ArgumentError if its value doesn't fit.
   def check_field(encoding, value), do: field(encoding, value)
 
+  @typedoc """
+  The field types of writers that send raw fields: a map by writer id, or a
+  function of the network message's headers (the `t` without its messages)
+  and a writer id, returning the types or `nil`.
+  """
+  @type raw_types ::
+          %{non_neg_integer => [Binary.type()]}
+          | (t, non_neg_integer | nil -> [Binary.type()] | nil)
+
   @doc """
   Decodes a network message. `raw_types` gives the field types of writers
-  that send raw fields, by writer id: `%{1 => [:int16, :double]}`. A dataset
-  message from a writer with raw fields and no types given keeps its fields
-  as a binary.
+  that send raw fields, such as `%{1 => [:int16, :double]}`. A dataset
+  message with raw fields and no types given keeps its fields as a binary.
+
+  Writer ids are only unique per publisher, so a subscriber to more than
+  one publisher looks the types up by both, with a function.
   """
-  @spec decode(binary, %{non_neg_integer => [OPCUA.Binary.type()]}) ::
-          {:ok, t} | {:error, :bad_decoding_error}
+  @spec decode(binary, raw_types) :: {:ok, t} | {:error, :bad_decoding_error}
   def decode(binary, raw_types \\ %{}) do
     {:ok, take(binary, raw_types)}
   rescue
-    _ in [OPCUA.DecodeError, MatchError, CaseClauseError, FunctionClauseError, ArgumentError] ->
-      {:error, :bad_decoding_error}
+    DecodeError -> {:error, :bad_decoding_error}
   end
 
-  defp take(<<flags, rest::binary>>, raw_types) do
-    1 = flags &&& 0x0F
+  defp take(binary, raw_types) do
+    {flags, rest} = Binary.take(binary, :byte)
+    check((flags &&& 0x0F) == 1, "UADP version")
 
-    {extended, rest} = if (flags &&& 0x80) != 0, do: split_byte(rest), else: {0, rest}
-    {extended2, rest} = if (extended &&& 0x80) != 0, do: split_byte(rest), else: {0, rest}
-    # Chunked, discovery and secured messages aren't handled.
-    true = (extended2 &&& 0x1D) == 0 and (extended &&& 0x10) == 0
+    {extended, rest} = if (flags &&& 0x80) != 0, do: Binary.take(rest, :byte), else: {0, rest}
+    {extended2, rest} = if (extended &&& 0x80) != 0, do: Binary.take(rest, :byte), else: {0, rest}
+
+    check(
+      (extended2 &&& 0x1D) == 0 and (extended &&& 0x10) == 0,
+      "chunked, discovery or secured message"
+    )
 
     publisher_type = known(@publisher_types, extended &&& 0x07)
     {publisher, rest} = optional(rest, flags &&& 0x10, publisher_type)
@@ -220,8 +233,8 @@ defmodule OPCUA.PubSub.UADP do
 
     {writer_ids, rest} =
       if (flags &&& 0x40) != 0 do
-        <<count, rest::binary>> = rest
-        <<ids::binary-size(count * 2), rest::binary>> = rest
+        {count, rest} = Binary.take(rest, :byte)
+        {ids, rest} = bytes(rest, count * 2)
         {for(<<id::little-16 <- ids>>, do: id), rest}
       else
         {nil, rest}
@@ -233,13 +246,13 @@ defmodule OPCUA.PubSub.UADP do
     # Promoted fields are skipped; they repeat values from the messages.
     rest =
       if (extended2 &&& 0x02) != 0 do
-        <<size::little-16, _::binary-size(size), rest::binary>> = rest
-        rest
+        {size, rest} = Binary.take(rest, :uint16)
+        rest |> bytes(size) |> elem(1)
       else
         rest
       end
 
-    messages = take_messages(rest, writer_ids, raw_types)
+    messages = take_messages(rest, writer_ids, &raw_types(raw_types, m, &1))
 
     %{
       m
@@ -250,16 +263,26 @@ defmodule OPCUA.PubSub.UADP do
     }
   end
 
-  defp split_byte(<<byte, rest::binary>>), do: {byte, rest}
+  defp raw_types(types, _headers, writer) when is_map(types), do: types[writer]
+  defp raw_types(fun, headers, writer) when is_function(fun, 2), do: fun.(headers, writer)
+
+  defp check(true, _), do: :ok
+  defp check(false, what), do: raise(DecodeError, "unsupported or malformed: #{what}")
+
+  defp bytes(binary, n) when byte_size(binary) >= n,
+    do: {binary_part(binary, 0, n), binary_part(binary, n, byte_size(binary) - n)}
+
+  defp bytes(_, n), do: raise(DecodeError, "#{n} bytes past the end")
 
   # A reserved value in a flags field is a malformed message.
   defp known(list, index),
-    do: Enum.at(list, index) || raise(OPCUA.DecodeError, "reserved value #{index}")
+    do: Enum.at(list, index) || raise(DecodeError, "reserved value #{index}")
 
   defp optional(binary, 0, _), do: {nil, binary}
   defp optional(binary, _, type), do: Binary.take(binary, type)
 
-  defp take_group(m, <<flags, rest::binary>>) do
+  defp take_group(m, binary) do
+    {flags, rest} = Binary.take(binary, :byte)
     {writer_group_id, rest} = optional(rest, flags &&& 0x01, :uint16)
     {group_version, rest} = optional(rest, flags &&& 0x02, :uint32)
     {number, rest} = optional(rest, flags &&& 0x04, :uint16)
@@ -275,25 +298,26 @@ defmodule OPCUA.PubSub.UADP do
   end
 
   # Without a payload header there's one message, of unknown writer.
-  defp take_messages(rest, nil, raw_types), do: [take_message(rest, nil, raw_types)]
-  defp take_messages(rest, [id], raw_types), do: [take_message(rest, id, raw_types)]
+  defp take_messages(rest, nil, types), do: [take_message(rest, nil, types)]
+  defp take_messages(rest, [id], types), do: [take_message(rest, id, types)]
 
-  defp take_messages(rest, ids, raw_types) do
-    <<sizes::binary-size(length(ids) * 2), rest::binary>> = rest
+  defp take_messages(rest, ids, types) do
+    {sizes, rest} = bytes(rest, length(ids) * 2)
     sizes = for <<size::little-16 <- sizes>>, do: size
 
     {messages, _} =
       Enum.zip(ids, sizes)
       |> Enum.map_reduce(rest, fn {id, size}, rest ->
-        <<message::binary-size(size), rest::binary>> = rest
-        {take_message(message, id, raw_types), rest}
+        {message, rest} = bytes(rest, size)
+        {take_message(message, id, types), rest}
       end)
 
     messages
   end
 
-  defp take_message(<<flags1, rest::binary>>, id, raw_types) do
-    {flags2, rest} = if (flags1 &&& 0x80) != 0, do: split_byte(rest), else: {0, rest}
+  defp take_message(binary, id, types) do
+    {flags1, rest} = Binary.take(binary, :byte)
+    {flags2, rest} = if (flags1 &&& 0x80) != 0, do: Binary.take(rest, :byte), else: {0, rest}
     encoding = known(@encodings, flags1 >>> 1 &&& 0x03)
     type = known(@message_types, flags2 &&& 0x0F)
     {sequence, rest} = optional(rest, flags1 &&& 0x08, :uint16)
@@ -314,14 +338,16 @@ defmodule OPCUA.PubSub.UADP do
       status: status,
       major_version: major,
       minor_version: minor,
-      fields: take_fields(type, encoding, rest, raw_types[id])
+      fields: take_fields(type, encoding, rest, types.(id))
     }
   end
 
   defp take_fields(:keep_alive, _, _, _), do: []
   defp take_fields(_, :raw, rest, nil), do: rest
 
-  defp take_fields(:delta_frame, encoding, <<count::little-16, rest::binary>>, types) do
+  defp take_fields(:delta_frame, encoding, rest, types) do
+    {count, rest} = Binary.take(rest, :uint16)
+
     {fields, _} =
       Enum.map_reduce(1..count//1, rest, fn _, rest ->
         {index, rest} = Binary.take(rest, :uint16)
@@ -337,7 +363,9 @@ defmodule OPCUA.PubSub.UADP do
     fields
   end
 
-  defp take_fields(_, encoding, <<count::little-16, rest::binary>>, _) do
+  defp take_fields(_, encoding, rest, _) do
+    {count, rest} = Binary.take(rest, :uint16)
+
     {fields, _} =
       Enum.map_reduce(1..count//1, rest, fn _, rest -> take_field(encoding, rest, nil) end)
 
@@ -348,7 +376,7 @@ defmodule OPCUA.PubSub.UADP do
   defp take_field(:data_value, rest, _), do: Binary.take(rest, :data_value)
 
   # A delta frame can name a raw field past the ones whose types are known.
-  defp take_field(:raw, _rest, nil), do: raise(OPCUA.DecodeError, "raw field of unknown type")
+  defp take_field(:raw, _rest, nil), do: raise(DecodeError, "raw field of unknown type")
 
   defp take_field(:raw, rest, type) do
     {value, rest} = Binary.take(rest, type)

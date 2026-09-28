@@ -121,6 +121,26 @@ defmodule OPCUA.PubSub.UADPTest do
     assert [%DataSetMessage{fields: <<5, 0>>}] = round_trip(message).messages
   end
 
+  test "raw field types can depend on the publisher, through a function" do
+    bytes = fn publisher ->
+      %UADP{
+        publisher_id: {:byte, publisher},
+        writer_group_id: 3,
+        messages: [%DataSetMessage{writer_id: 1, encoding: :raw, fields: [{:int16, 5}]}]
+      }
+      |> UADP.encode()
+      |> IO.iodata_to_binary()
+    end
+
+    types = fn
+      %UADP{publisher_id: {:byte, 1}, writer_group_id: 3}, 1 -> [:int16]
+      _, _ -> nil
+    end
+
+    assert {:ok, %UADP{messages: [%{fields: [{:int16, 5}]}]}} = UADP.decode(bytes.(1), types)
+    assert {:ok, %UADP{messages: [%{fields: <<5, 0>>}]}} = UADP.decode(bytes.(2), types)
+  end
+
   test "a raw delta frame field past the known types is an error" do
     message = fn index ->
       %UADP{

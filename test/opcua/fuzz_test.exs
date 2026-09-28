@@ -10,8 +10,8 @@ defmodule OPCUA.FuzzTest do
 
   import OPCUA.Fuzz
 
-  alias OPCUA.{Binary, Client, SecureChannel, Server, Transport}
-  alias OPCUA.PubSub.UADP
+  alias OPCUA.{Binary, Client, NodeId, SecureChannel, Server, Transport, Variant}
+  alias OPCUA.PubSub.{Subscriber, UADP}
   alias OPCUA.Types
 
   @moduletag timeout: :infinity
@@ -298,6 +298,96 @@ defmodule OPCUA.FuzzTest do
         end
       end
     end
+
+    property "a subscriber survives random and mutated datagrams" do
+      {:ok, socket} = :gen_udp.open(0, [:binary])
+      {:ok, port} = :inet.port(socket)
+      :gen_udp.close(socket)
+
+      # Readers with and without field types, and a writer id that two
+      # publishers share.
+      readers = [
+        [publisher_id: 42, writer_id: 1, fields: [{"a", :int16}, {"b", :string}]],
+        [publisher_id: 42, writer_id: 2],
+        [publisher_id: 43, writer_id: 1, fields: [{"c", :double}]]
+      ]
+
+      sink = spawn_link(&drain/0)
+
+      subscriber =
+        start_supervised!(
+          {Subscriber, url: "opc.udp://127.0.0.1:#{port}", to: sink, readers: readers}
+        )
+
+      {:ok, socket} = :gen_udp.open(0, [:binary])
+
+      check all(
+              bytes <-
+                one_of([
+                  network_message(),
+                  bind(network_message(), &mutations/1),
+                  binary(max_length: 96)
+                ]),
+              max_runs: runs(),
+              max_run_time: run_time()
+            ) do
+        # Within what a UDP datagram can carry here (9216 bytes on macOS).
+        :ok = :gen_udp.send(socket, {127, 0, 0, 1}, port, binary_slice(bytes, 0, 8192))
+        :sys.get_state(subscriber)
+        assert Process.alive?(subscriber)
+      end
+
+      Process.sleep(50)
+      assert Process.alive?(subscriber)
+    end
+
+    defp drain do
+      receive do
+        _ -> drain()
+      end
+    end
+
+    defp network_message do
+      gen all(
+            publisher <- member_of([{:byte, 42}, {:uint16, 42}, {:byte, 43}, {:byte, 44}]),
+            messages <- list_of(dataset_message(), min_length: 1, max_length: 3)
+          ) do
+        %UADP{publisher_id: publisher, writer_group_id: 1, sequence_number: 1, messages: messages}
+        |> UADP.encode()
+        |> IO.iodata_to_binary()
+      end
+    end
+
+    defp dataset_message do
+      gen all(
+            writer <- member_of([1, 2]),
+            encoding <- member_of([:variant, :raw, :data_value]),
+            type <- member_of([:key_frame, :delta_frame, :keep_alive]),
+            sequence <- integer(0..0xFFFF),
+            fields <- list_of(field(encoding), max_length: 3)
+          ) do
+        fields =
+          case type do
+            :key_frame -> fields
+            :delta_frame -> Enum.with_index(fields, &{&2, &1})
+            :keep_alive -> []
+          end
+
+        %UADP.DataSetMessage{
+          writer_id: writer,
+          type: type,
+          encoding: encoding,
+          sequence_number: sequence,
+          fields: fields
+        }
+      end
+    end
+
+    defp field(:raw),
+      do:
+        bind(member_of([:int16, :string, :double]), fn type -> map(value(type), &{type, &1}) end)
+
+    defp field(encoding), do: value(encoding)
   end
 
   describe "a running server" do
@@ -397,6 +487,57 @@ defmodule OPCUA.FuzzTest do
         refute log =~ "failed", log
         refute log =~ "terminating", log
         assert Process.alive?(client), "the connection closed on #{inspect(module)}"
+        assert Process.alive?(server)
+      end
+
+      with {client, _} <- Process.get(:fuzz_client), do: Client.close(client)
+      healthy(url)
+    end
+
+    property "method calls with random arguments get an answer, and no internal error", %{
+      url: url,
+      server: server
+    } do
+      # The application's method, and the alarm methods on its condition.
+      methods = [
+        {"ns=2;s=Pump", "ns=2;s=Pump.Add"},
+        {"ns=2;s=Pump.Fault", "i=9111"},
+        {"ns=2;s=Pump.Fault", "i=9029"},
+        {"ns=2;s=Pump.Fault", "i=9027"},
+        {"ns=2;s=Pump.Fault", "i=9028"},
+        {"i=2782", "i=3875"},
+        {"i=2782", "i=12912"}
+      ]
+
+      argument =
+        one_of([
+          constant(nil),
+          value(:variant),
+          map(integer(-100..100), &%Variant{type: :int32, value: &1}),
+          map(integer(0..10), &%Variant{type: :uint32, value: &1})
+        ])
+
+      check all(
+              {object, method} <- member_of(methods),
+              args <- one_of([constant(nil), list_of(argument, max_length: 3)]),
+              max_runs: runs(),
+              max_run_time: run_time()
+            ) do
+        call = %Types.CallMethodRequest{
+          object_id: NodeId.parse!(object),
+          method_id: NodeId.parse!(method),
+          input_arguments: args
+        }
+
+        client = client(url)
+        request = %Types.CallRequest{methods_to_call: [call]}
+
+        {result, log} =
+          ExUnit.CaptureLog.with_log(fn -> Client.request(client, request, 2000) end)
+
+        assert match?({:ok, _}, result) or match?({:error, _}, result), inspect(result)
+        refute log =~ "failed", log
+        refute log =~ "terminating", log
         assert Process.alive?(server)
       end
 

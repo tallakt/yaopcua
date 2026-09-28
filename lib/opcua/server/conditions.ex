@@ -13,25 +13,39 @@ defmodule OPCUA.Server.Conditions do
   # branches, the fields of specific alarm types (such as limits), and
   # Acknowledge method nodes on each condition; clients call the type's.
 
-  alias OPCUA.{LocalizedText, NodeId, QualifiedName, StatusCode, Variant}
+  alias OPCUA.{LocalizedText, NodeId, NodeIds, QualifiedName, Variant}
   alias OPCUA.Server.{AddressSpace, Events, Node}
+  alias OPCUA.Types
 
-  @has_condition %NodeId{id: 9006}
-  @has_component %NodeId{id: 47}
-  @has_property %NodeId{id: 46}
-  @two_state_variable %NodeId{id: 8995}
-  @property %NodeId{id: 68}
-  @base_condition_class %NodeId{id: 11163}
-  @refresh_start %NodeId{id: 2787}
-  @refresh_end %NodeId{id: 2788}
-  @server %NodeId{id: 2253}
+  @has_condition NodeIds.node_id!("HasCondition")
+  @has_component NodeIds.node_id!("HasComponent")
+  @has_property NodeIds.node_id!("HasProperty")
+  @two_state_variable NodeIds.node_id!("TwoStateVariableType")
+  @property NodeIds.node_id!("PropertyType")
+  @base_condition_class NodeIds.node_id!("BaseConditionClassType")
+  @refresh_start NodeIds.node_id!("RefreshStartEventType")
+  @refresh_end NodeIds.node_id!("RefreshEndEventType")
+  @server NodeIds.node_id!("Server")
 
-  @types %{off_normal: %NodeId{id: 10637}, alarm: %NodeId{id: 2915}, discrete: %NodeId{id: 10523}}
+  @types %{
+    off_normal: NodeIds.node_id!("OffNormalAlarmType"),
+    alarm: NodeIds.node_id!("AlarmConditionType"),
+    discrete: NodeIds.node_id!("DiscreteAlarmType")
+  }
+
+  # The TwoStateVariables of a condition: the state they show, and what they
+  # say when it's true and false.
+  @two_states [
+    {"EnabledState", :enabled, "Enabled", "Disabled"},
+    {"ActiveState", :active, "Active", "Inactive"},
+    {"AckedState", :acked, "Acknowledged", "Unacknowledged"}
+  ]
 
   @doc false
   def add(space, %NodeId{} = id, name, opts) do
     source = Keyword.fetch!(opts, :source)
-    type = Map.get(@types, Keyword.get(opts, :type, :off_normal), Keyword.get(opts, :type))
+    type = Keyword.get(opts, :type, :off_normal)
+    type = Map.get(@types, type, type)
 
     node = %Node{
       node_id: id,
@@ -64,14 +78,7 @@ defmodule OPCUA.Server.Conditions do
            AddressSpace.get(space, source) || {:error, :bad_parent_node_id_invalid},
          :ok <- AddressSpace.add(space, node, nil, source, @has_condition, type) do
       # The source reports its conditions' events.
-      if source_node.class == :object do
-        notifier = Bitwise.bor(source_node.attributes[:event_notifier] || 0, 1)
-
-        :ets.insert(
-          space.nodes,
-          {source, put_in(AddressSpace.get(space, source).attributes[:event_notifier], notifier)}
-        )
-      end
+      if source_node.class == :object, do: AddressSpace.notify_events(space, source)
 
       put(space, state)
       children(space, id)
@@ -79,51 +86,35 @@ defmodule OPCUA.Server.Conditions do
     end
   end
 
-  # Readable children, for clients that look at the condition itself.
+  # Readable children, for clients that look at the condition itself. Each
+  # reads the condition's state with `read`.
   defp children(space, id) do
-    two_states = [
-      {"EnabledState", :enabled, "Enabled", "Disabled"},
-      {"ActiveState", :active, "Active", "Inactive"},
-      {"AckedState", :acked, "Acknowledged", "Unacknowledged"}
-    ]
-
-    for {name, key, yes, no} <- two_states do
-      node =
-        child(space, id, id, name, @has_component, @two_state_variable, :localized_text, fn s ->
-          %LocalizedText{locale: "en", text: if(s[key], do: yes, else: no)}
-        end)
-
-      child(space, id, node, "Id", @has_property, @property, :boolean, & &1[key])
+    for {name, key, yes, no} <- @two_states do
+      node = child(space, id, id, {name, :two_state, :localized_text, &text(&1[key], yes, no)})
+      child(space, id, node, {"Id", :property, :boolean, & &1[key]})
     end
 
-    child(space, id, id, "Retain", @has_property, @property, :boolean, &retain?/1)
-    child(space, id, id, "Severity", @has_property, @property, :uint16, & &1.severity)
+    properties = [
+      {"Retain", :boolean, &retain?/1},
+      {"Severity", :uint16, & &1.severity},
+      {"Message", :localized_text, &%LocalizedText{text: &1.message}},
+      {"Comment", :localized_text, &(&1.comment && %LocalizedText{text: &1.comment})}
+    ]
 
-    child(
-      space,
-      id,
-      id,
-      "Message",
-      @has_property,
-      @property,
-      :localized_text,
-      &%LocalizedText{text: &1.message}
-    )
-
-    child(
-      space,
-      id,
-      id,
-      "Comment",
-      @has_property,
-      @property,
-      :localized_text,
-      &(&1.comment && %LocalizedText{text: &1.comment})
-    )
+    for {name, type, read} <- properties,
+        do: child(space, id, id, {name, :property, type, read})
   end
 
-  defp child(space, id, parent, name, reference, type_definition, type, read) do
+  defp text(on, yes, no), do: %LocalizedText{locale: "en", text: if(on, do: yes, else: no)}
+
+  defp child(space, id, parent, {name, kind, type, read}) do
     child_id = %NodeId{ns: parent.ns, id: label(parent) <> "." <> name}
+
+    {reference, type_definition} =
+      case kind do
+        :two_state -> {@has_component, @two_state_variable}
+        :property -> {@has_property, @property}
+      end
 
     node = %Node{
       node_id: child_id,
@@ -134,8 +125,8 @@ defmodule OPCUA.Server.Conditions do
         data_type: %NodeId{id: OPCUA.Binary.type_id(type)},
         value_rank: -1,
         array_dimensions: nil,
-        access_level: 1,
-        user_access_level: 1,
+        access_level: Types.AccessLevelType.mask([:current_read]),
+        user_access_level: Types.AccessLevelType.mask([:current_read]),
         minimum_sampling_interval: 0.0,
         historizing: false
       }
@@ -219,16 +210,13 @@ defmodule OPCUA.Server.Conditions do
   @doc false
   # The event that announces a condition's state.
   def event(space, state, event_id \\ nil) do
-    two_state = fn name, on, yes, no ->
-      [
-        {name,
-         %Variant{
-           type: :localized_text,
-           value: %LocalizedText{locale: "en", text: if(on, do: yes, else: no)}
-         }},
-        {name <> "/Id", %Variant{type: :boolean, value: on}}
-      ]
-    end
+    two_states =
+      for {name, key, yes, no} <- @two_states,
+          field <- [
+            {name, %Variant{type: :localized_text, value: text(state[key], yes, no)}},
+            {name <> "/Id", %Variant{type: :boolean, value: state[key]}}
+          ],
+          do: field
 
     fields =
       [
@@ -247,10 +235,7 @@ defmodule OPCUA.Server.Conditions do
          }},
         {"ClientUserId", %Variant{type: :string, value: state.user}},
         {"SuppressedOrShelved", %Variant{type: :boolean, value: false}}
-      ] ++
-        two_state.("EnabledState", state.enabled, "Enabled", "Disabled") ++
-        two_state.("ActiveState", state.active, "Active", "Inactive") ++
-        two_state.("AckedState", state.acked, "Acknowledged", "Unacknowledged")
+      ] ++ two_states
 
     event = Events.new(space, state.type, state.source, state.message, state.severity, fields)
     event = %{event | condition: state.id}
@@ -278,7 +263,4 @@ defmodule OPCUA.Server.Conditions do
 
   @doc false
   def marker?(%{type: type}), do: type in [@refresh_start, @refresh_end]
-
-  @doc false
-  def status(status), do: StatusCode.code(status)
 end

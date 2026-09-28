@@ -56,7 +56,7 @@ defmodule OPCUA.Server.Connection do
         end
 
       {:error, status} ->
-        {:stop, :normal, fail(state, status)}
+        {:stop, :normal, send_error(state, status)}
     end
   end
 
@@ -68,7 +68,7 @@ defmodule OPCUA.Server.Connection do
   # A channel whose token wasn't renewed in time is closed.
   def handle_info({:token_expired, token_id}, state) do
     if state.channel.token_id == token_id,
-      do: {:stop, :normal, fail(state, :bad_secure_channel_token_unknown)},
+      do: {:stop, :normal, send_error(state, :bad_secure_channel_token_unknown)},
       else: {:noreply, state}
   end
 
@@ -140,12 +140,12 @@ defmodule OPCUA.Server.Connection do
          {:ok, %{state | phase: :open, channel: channel, receive_buffer: ack.receive_buffer_size}}}
 
       {:error, status} ->
-        {:halt, {:close, fail(state, status)}}
+        {:halt, {:close, send_error(state, status)}}
     end
   end
 
   defp chunk(_, {:ok, %{phase: :hello} = state}),
-    do: {:halt, {:close, fail(state, :bad_tcp_message_type_invalid)}}
+    do: {:halt, {:close, send_error(state, :bad_tcp_message_type_invalid)}}
 
   defp chunk(chunk, {:ok, state}) do
     case SecureChannel.receive(state.channel, chunk) do
@@ -161,20 +161,20 @@ defmodule OPCUA.Server.Connection do
       # A message that decodes as some other structure has no header to
       # answer to; the connection is closed.
       {:ok, {:message, _, message}, _} when not is_map_key(message, :request_header) ->
-        {:halt, {:close, fail(state, :bad_service_unsupported)}}
+        {:halt, {:close, send_error(state, :bad_service_unsupported)}}
 
       {:ok, {:message, id, request}, channel} when state.phase == :running ->
         {:cont, {:ok, respond(%{state | channel: channel}, id, request)}}
 
       {:ok, _, _} ->
-        {:halt, {:close, fail(state, :bad_tcp_message_type_invalid)}}
+        {:halt, {:close, send_error(state, :bad_tcp_message_type_invalid)}}
 
       # the client gave up on a request it was still sending
       {:abort, _, _, _, channel} ->
         {:cont, {:ok, %{state | channel: channel}}}
 
       {:error, status} ->
-        {:halt, {:close, fail(state, status)}}
+        {:halt, {:close, send_error(state, status)}}
     end
   end
 
@@ -185,30 +185,32 @@ defmodule OPCUA.Server.Connection do
 
     cond do
       renew != (state.phase == :running) ->
-        {:halt, {:close, fail(state, :bad_request_type_invalid)}}
+        {:halt, {:close, send_error(state, :bad_request_type_invalid)}}
 
       not offered or (policy == :none and request.security_mode != :none) ->
-        {:halt, {:close, fail(state, :bad_security_mode_rejected)}}
+        {:halt, {:close, send_error(state, :bad_security_mode_rejected)}}
 
       renew and request.security_mode != state.channel.mode ->
-        {:halt, {:close, fail(state, :bad_security_mode_rejected)}}
+        {:halt, {:close, send_error(state, :bad_security_mode_rejected)}}
 
       policy != :none and
           not OPCUA.Certificate.trusted?(state.channel.remote_certificate, state.config.trust) ->
-        {:halt, {:close, fail(state, :bad_certificate_untrusted)}}
+        {:halt, {:close, send_error(state, :bad_certificate_untrusted)}}
 
       byte_size(request.client_nonce || "") != OPCUA.SecurityPolicy.nonce_length(policy) ->
-        {:halt, {:close, fail(state, :bad_nonce_invalid)}}
+        {:halt, {:close, send_error(state, :bad_nonce_invalid)}}
 
       true ->
         channel_id =
-          if renew, do: state.channel.channel_id, else: :atomics.add_get(state.config.ids, 1, 1)
+          if renew,
+            do: state.channel.channel_id,
+            else: OPCUA.Server.next_id(state.config, :channel)
 
         lifetime = request.requested_lifetime |> max(1000) |> min(3_600_000)
 
         token = %Types.ChannelSecurityToken{
           channel_id: channel_id,
-          token_id: :atomics.add_get(state.config.ids, 2, 1),
+          token_id: OPCUA.Server.next_id(state.config, :token),
           created_at: DateTime.utc_now(),
           revised_lifetime: lifetime
         }
@@ -268,13 +270,12 @@ defmodule OPCUA.Server.Connection do
     waiting =
       for {_, session} <- state.sessions, response <- Enum.reverse(session.outbox), do: response
 
+    responses = state.outbox ++ waiting
     sessions = Map.new(state.sessions, fn {auth, session} -> {auth, %{session | outbox: []}} end)
 
-    Enum.reduce(state.outbox ++ waiting, %{state | outbox: [], sessions: sessions}, fn {id,
-                                                                                        response},
-                                                                                       state ->
-      send_response(state, :message, id, response)
-    end)
+    for {id, response} <- responses, reduce: %{state | outbox: [], sessions: sessions} do
+      state -> send_response(state, :message, id, response)
+    end
   end
 
   defp send_response(state, kind, id, response) do
@@ -310,7 +311,7 @@ defmodule OPCUA.Server.Connection do
   end
 
   # Tells the client why the connection is closing.
-  defp fail(state, status) do
+  defp send_error(state, status) do
     code = StatusCode.code(status)
 
     :gen_tcp.send(

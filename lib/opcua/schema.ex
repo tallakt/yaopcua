@@ -209,22 +209,6 @@ defmodule OPCUA.Schema do
   defp type(name), do: Map.fetch!(@builtins, name)
 
   defp default({:array, _}, _, _), do: nil
-  defp default(:boolean, _, _), do: false
-  defp default(type, _, _) when type in [:float, :double], do: 0.0
-
-  defp default(type, _, _)
-       when type in [
-              :sbyte,
-              :byte,
-              :int16,
-              :uint16,
-              :int32,
-              :uint32,
-              :int64,
-              :uint64,
-              :status_code
-            ],
-       do: 0
 
   defp default(_, "tns:" <> name, enums) do
     case enums do
@@ -239,7 +223,7 @@ defmodule OPCUA.Schema do
     end
   end
 
-  defp default(_, _, _), do: nil
+  defp default(type, _, _), do: OPCUA.Binary.default(type)
 
   defp module(name), do: Module.concat(OPCUA.Types, name)
 

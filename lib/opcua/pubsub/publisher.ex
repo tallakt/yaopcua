@@ -23,8 +23,8 @@ defmodule OPCUA.PubSub.Publisher do
     * `:ttl` - multicast hops (default 1, the local network)
     * `:name` - to register the process
 
-  A field without a value is sent as null, or as zero for raw fields, which
-  can't be null.
+  A field without a value is sent as null, or for raw fields, which can't
+  be null, as its type's default (see `OPCUA.Binary.default/1`).
   """
 
   use GenServer
@@ -202,11 +202,6 @@ defmodule OPCUA.PubSub.Publisher do
   defp field(:variant, type, value), do: %Variant{type: type, value: value}
   defp field(:data_value, _type, nil), do: %DataValue{}
   defp field(:data_value, type, value), do: %DataValue{value: %Variant{type: type, value: value}}
-  defp field(:raw, type, nil), do: {type, default(type)}
+  defp field(:raw, type, nil), do: {type, OPCUA.Binary.default(type)}
   defp field(:raw, type, value), do: {type, value}
-
-  defp default(type) when type in [:float, :double], do: 0.0
-  defp default(:boolean), do: false
-  defp default(type) when type in [:string, :byte_string, :date_time, :guid, :node_id], do: nil
-  defp default(_), do: 0
 end

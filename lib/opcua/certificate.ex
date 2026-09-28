@@ -219,6 +219,8 @@ defmodule OPCUA.Certificate do
         list when is_list(list) -> der in list or Enum.any?(list, &signed_by?(der, &1))
       end
   rescue
+    # A peer's certificate is whatever it sent, and :public_key raises on
+    # what it can't parse.
     _ -> false
   end
 
@@ -245,7 +247,7 @@ defmodule OPCUA.Certificate do
   end
 
   @doc "Writes a certificate as DER, or PEM if the path ends in `.pem`."
-  @spec write(Path.t(), t) :: :ok
+  @spec write(Path.t(), t) :: :ok | {:error, File.posix()}
   def write(path, der) do
     data =
       if Path.extname(path) == ".pem",
@@ -256,7 +258,7 @@ defmodule OPCUA.Certificate do
   end
 
   @doc "Writes a private key as PEM."
-  @spec write_key(Path.t(), private_key) :: :ok
+  @spec write_key(Path.t(), private_key) :: :ok | {:error, File.posix()}
   def write_key(path, key),
     do:
       File.write(

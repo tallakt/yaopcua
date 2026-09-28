@@ -4,6 +4,7 @@ defmodule OPCUA.NodeIdTest do
   alias OPCUA.{ExpandedNodeId, NodeId}
 
   doctest NodeId
+  doctest OPCUA.QualifiedName
 
   test "parses and prints every kind of identifier" do
     for text <- [

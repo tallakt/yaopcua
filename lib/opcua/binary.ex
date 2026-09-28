@@ -117,6 +117,31 @@ defmodule OPCUA.Binary do
   def type_id(type), do: Map.fetch!(@type_ids, type)
 
   @doc """
+  The value a built-in type has when none is given: 0, 0.0 or false for the
+  numbers, StatusCode and Boolean, and `nil`, which encodes as the null
+  value, for the rest.
+  """
+  @spec default(builtin) :: term
+  def default(type) when type in [:float, :double], do: 0.0
+  def default(:boolean), do: false
+
+  def default(type)
+      when type in [
+             :sbyte,
+             :byte,
+             :int16,
+             :uint16,
+             :int32,
+             :uint32,
+             :int64,
+             :uint64,
+             :status_code
+           ],
+      do: 0
+
+  def default(type) when type in @builtins, do: nil
+
+  @doc """
   Encodes `value` as `type`.
 
   Raises `ArgumentError` when the value doesn't fit, such as 300 as a `:byte`.
@@ -166,7 +191,9 @@ defmodule OPCUA.Binary do
         <<a::binary-8, ?-, b::binary-4, ?-, c::binary-4, ?-, d::binary-4, ?-, e::binary-12>>,
         :guid
       ),
-      do: <<hex(a)::little-32, hex(b)::little-16, hex(c)::little-16, hex(d)::16, hex(e)::48>>
+      do:
+        <<parse_hex(a)::little-32, parse_hex(b)::little-16, parse_hex(c)::little-16,
+          parse_hex(d)::16, parse_hex(e)::48>>
 
   def encode(nil, :node_id), do: <<0, 0>>
   def encode(%NodeId{ns: ns, id: id}, :node_id), do: node_id(ns, id, 0)
@@ -286,7 +313,7 @@ defmodule OPCUA.Binary do
   def encode(value, type),
     do: raise(ArgumentError, "cannot encode #{inspect(value)} as #{inspect(type)}")
 
-  defp hex(digits), do: String.to_integer(digits, 16)
+  defp parse_hex(digits), do: String.to_integer(digits, 16)
 
   defp node_id(0, id, flags) when id in 0..0xFF, do: <<flags, id>>
 
@@ -366,10 +393,10 @@ defmodule OPCUA.Binary do
 
   def take(<<ticks::little-signed-64, rest::binary>>, :date_time), do: {date_time(ticks), rest}
 
-  def take(<<a::little-32, b::little-16, c::little-16, d::16, e::48, rest::binary>>, :guid),
-    do:
-      {hex(a, 8) <> "-" <> hex(b, 4) <> "-" <> hex(c, 4) <> "-" <> hex(d, 4) <> "-" <> hex(e, 12),
-       rest}
+  def take(<<a::little-32, b::little-16, c::little-16, d::16, e::48, rest::binary>>, :guid) do
+    parts = [{a, 8}, {b, 4}, {c, 4}, {d, 4}, {e, 12}]
+    {Enum.map_join(parts, "-", fn {n, digits} -> format_hex(n, digits) end), rest}
+  end
 
   def take(<<_flags::2, type::6, rest::binary>>, :node_id) do
     case node_id_body(type, rest) do
@@ -454,7 +481,7 @@ defmodule OPCUA.Binary do
   defp date_time(ticks),
     do: DateTime.from_unix!(Integer.floor_div(ticks - @epoch, 10), :microsecond)
 
-  defp hex(n, digits), do: n |> Integer.to_string(16) |> String.pad_leading(digits, "0")
+  defp format_hex(n, digits), do: n |> Integer.to_string(16) |> String.pad_leading(digits, "0")
 
   defp node_id_body(0, <<id, rest::binary>>), do: {0, id, rest}
   defp node_id_body(1, <<ns, id::little-16, rest::binary>>), do: {ns, id, rest}

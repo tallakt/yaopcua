@@ -353,6 +353,14 @@ defmodule OPCUA.BinaryTest do
     assert OPCUA.Binary.decode(<<2, 1>>, :localized_text) == {:error, :bad_decoding_error}
   end
 
+  test "every built-in type's default encodes, as a scalar and in a variant" do
+    for type <- OPCUA.Binary.builtins() do
+      value = OPCUA.Binary.default(type)
+      assert {:ok, _, ""} = OPCUA.Binary.decode(encode(value, type), type), inspect(type)
+      assert encode(%Variant{type: type, value: value}, :variant)
+    end
+  end
+
   test "decoded strings don't hold on to the message they came from" do
     message = <<5, 0, 0, 0, "Speed">> <> :binary.copy(<<0>>, 100_000)
     {:ok, text, _} = OPCUA.Binary.decode(message, :string)

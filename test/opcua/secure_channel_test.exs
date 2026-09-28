@@ -178,6 +178,22 @@ defmodule OPCUA.SecureChannelTest do
     assert catch_throw(deliver(server, chunks(frames))) == {:error, :bad_encoding_limits_exceeded}
   end
 
+  test "holds no more than its message limit across unfinished messages" do
+    {client, server} = pair()
+    server = %{server | receive_max_message: 50_000}
+    {:ok, frames, _} = SecureChannel.encode(client, :message, 1, read(2000))
+    first = chunks(frames)
+    assert {_, {:message, 1, _}} = deliver(server, first)
+
+    # All but the last chunk of one, then all of another started alongside it.
+    unfinished = Enum.drop(first, -1)
+    client = %{client | send_sequence: length(unfinished)}
+    {:ok, frames, _} = SecureChannel.encode(client, :message, 2, read(2000))
+
+    assert catch_throw(deliver(server, unfinished ++ chunks(frames))) ==
+             {:error, :bad_encoding_limits_exceeded}
+  end
+
   test "refuses to send more than the other side's limits" do
     {client, _} = pair()
 

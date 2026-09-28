@@ -125,6 +125,57 @@ defmodule OPCUA.PubSubTest do
     for _ <- 1..5, do: assert(data({2, 1})["Name"] == "right")
   end
 
+  test "raw fields are read with the types of each publisher's own reader" do
+    url = url()
+    valve = [{"Flow", :double}, {"Open", :boolean}]
+    valve_values = %{"Flow" => 0.5, "Open" => true}
+
+    # The same writer id from two publishers, with different fields.
+    start_supervised!(
+      {Subscriber,
+       to: self(),
+       url: url,
+       readers: [
+         [publisher_id: 1, writer_id: 1, fields: @fields],
+         [publisher_id: 2, writer_id: 1, fields: valve]
+       ]}
+    )
+
+    for {publisher, fields, values} <- [{1, @fields, @values}, {2, valve, valve_values}] do
+      start_supervised!(
+        {Publisher,
+         url: url,
+         publisher_id: publisher,
+         interval: 20,
+         writers: [[id: 1, fields: fields, encoding: :raw, read: fn -> values end]]},
+        id: publisher
+      )
+    end
+
+    assert data({1, 1}) == @values
+    assert data({2, 1}) == valve_values
+  end
+
+  test "a raw dataset for a reader without field types is dropped" do
+    url = url()
+
+    subscriber =
+      start_supervised!(
+        {Subscriber, to: self(), url: url, readers: [[publisher_id: 1, writer_id: 1]]}
+      )
+
+    start_supervised!(
+      {Publisher,
+       url: url,
+       publisher_id: 1,
+       interval: 20,
+       writers: [[id: 1, fields: @fields, encoding: :raw, read: fn -> @values end]]}
+    )
+
+    refute_receive {OPCUA.PubSub, _, _}, 300
+    assert Process.alive?(subscriber)
+  end
+
   test "a dataset that stops arriving times out, once" do
     url = url()
 

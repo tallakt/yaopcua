@@ -19,6 +19,47 @@ defmodule OPCUA.Client.Connection do
     max_chunk_count: 0
   }
 
+  # The state of a client: what connect/4 and session/2 set up, then what
+  # the running OPCUA.Client adds.
+  defstruct [
+    :socket,
+    :url,
+    # ms a request may take
+    :timeout,
+    # ms a channel token is asked to last
+    :lifetime,
+    # The policy and mode, and for a secure policy the certificates and key.
+    :security,
+    # Our nonce for the channel keys, and the server's for signing the session.
+    :nonce,
+    :server_nonce,
+    :channel,
+    # The channel's ChannelSecurityToken.
+    :token,
+    # The session's authentication token.
+    :auth,
+    :session_timeout,
+    # Received and not yet split into chunks, and chunks not yet handled.
+    buffer: <<>>,
+    chunks: [],
+    # The last request handle.
+    handle: 0,
+    # By request id: {tag, timer}, the tag saying what to do with the response.
+    pending: %{},
+    # The types of nodes written with plain values.
+    types: %{},
+    # By subscription id.
+    subscriptions: %{},
+    # {subscription, {:value, node} | {:events, fields}} by client handle.
+    items: %{},
+    next_handle: 0,
+    # Publish requests at the server, and how many to keep there.
+    publishing: 0,
+    publish_target: 2,
+    # Notifications to acknowledge with the next Publish request.
+    acks: []
+  ]
+
   def receive_buffer, do: @receive_buffer
 
   @doc false
@@ -48,29 +89,12 @@ defmodule OPCUA.Client.Connection do
   end
 
   defp new(socket, url, timeout, lifetime, security) do
-    %{
+    %__MODULE__{
       socket: socket,
       url: url,
       timeout: timeout,
       lifetime: lifetime,
-      security: security,
-      nonce: nil,
-      server_nonce: nil,
-      buffer: <<>>,
-      chunks: [],
-      channel: nil,
-      token: nil,
-      auth: nil,
-      session_timeout: nil,
-      handle: 0,
-      pending: %{},
-      types: %{},
-      subscriptions: %{},
-      items: %{},
-      next_handle: 0,
-      publishing: 0,
-      publish_target: 2,
-      acks: []
+      security: security
     }
   end
 
@@ -212,14 +236,6 @@ defmodule OPCUA.Client.Connection do
     tokens = (endpoint && endpoint.user_identity_tokens) || []
     server_certificate = created.server_certificate || (endpoint && endpoint.server_certificate)
 
-    # A token policy without a security policy of its own uses the channel's.
-    token_policy = fn token ->
-      case token.security_policy_uri do
-        uri when uri in [nil, ""] -> state.security.policy
-        uri -> SecurityPolicy.from_uri(uri)
-      end
-    end
-
     case {user, Enum.find(tokens, &(&1.token_type == token_type(user)))} do
       {:anonymous, policy} ->
         {:ok,
@@ -230,46 +246,56 @@ defmodule OPCUA.Client.Connection do
       {_, nil} ->
         {:error, :bad_identity_token_rejected}
 
-      {{name, password}, policy} ->
-        case token_policy.(policy) do
-          nil ->
-            {:error, :bad_security_policy_rejected}
-
-          :none ->
-            {:ok,
-             %Types.UserNameIdentityToken{
-               policy_id: policy.policy_id,
-               user_name: name,
-               password: password
-             }, nil}
-
-          secure ->
-            key = Certificate.public_key(server_certificate)
-            password = SecurityPolicy.encrypt_secret(secure, password, state.server_nonce, key)
-            algorithm = SecurityPolicy.encryption_uri(secure)
-
-            {:ok,
-             %Types.UserNameIdentityToken{
-               policy_id: policy.policy_id,
-               user_name: name,
-               password: password,
-               encryption_algorithm: algorithm
-             }, nil}
+      {user, policy} ->
+        case token_policy(state, policy) do
+          nil -> {:error, :bad_security_policy_rejected}
+          security -> user_token(user, policy, security, server_certificate, state.server_nonce)
         end
-
-      {{:certificate, certificate, private_key}, policy} ->
-        secure = with(:none <- token_policy.(policy), do: :basic256sha256)
-        data = server_certificate <> state.server_nonce
-
-        signature = %Types.SignatureData{
-          algorithm: SecurityPolicy.signature_uri(secure),
-          signature: SecurityPolicy.sign(secure, data, private_key)
-        }
-
-        {:ok,
-         %Types.X509IdentityToken{policy_id: policy.policy_id, certificate_data: certificate},
-         signature}
     end
+  end
+
+  # A token policy without a security policy of its own uses the channel's.
+  defp token_policy(state, policy) do
+    case policy.security_policy_uri do
+      uri when uri in [nil, ""] -> state.security.policy
+      uri -> SecurityPolicy.from_uri(uri)
+    end
+  end
+
+  defp user_token({name, password}, policy, :none, _, _) do
+    {:ok,
+     %Types.UserNameIdentityToken{
+       policy_id: policy.policy_id,
+       user_name: name,
+       password: password
+     }, nil}
+  end
+
+  defp user_token({name, password}, policy, security, server_certificate, nonce) do
+    key = Certificate.public_key(server_certificate)
+
+    {:ok,
+     %Types.UserNameIdentityToken{
+       policy_id: policy.policy_id,
+       user_name: name,
+       password: SecurityPolicy.encrypt_secret(security, password, nonce, key),
+       encryption_algorithm: SecurityPolicy.encryption_uri(security)
+     }, nil}
+  end
+
+  # The user proves they hold the certificate's key by signing the server's
+  # certificate and nonce, with Basic256Sha256's algorithm when the token
+  # policy has none.
+  defp user_token({:certificate, certificate, key}, policy, security, server_certificate, nonce) do
+    security = if security == :none, do: :basic256sha256, else: security
+
+    signature = %Types.SignatureData{
+      algorithm: SecurityPolicy.signature_uri(security),
+      signature: SecurityPolicy.sign(security, server_certificate <> nonce, key)
+    }
+
+    {:ok, %Types.X509IdentityToken{policy_id: policy.policy_id, certificate_data: certificate},
+     signature}
   end
 
   defp token_type(:anonymous), do: :anonymous

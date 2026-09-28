@@ -14,6 +14,7 @@ defmodule OPCUA.Server.Subscriptions do
 
   alias OPCUA.{DataValue, StatusCode, Variant}
   alias OPCUA.Server.{AddressSpace, Conditions, Events, Node, Services}
+  alias OPCUA.Server.Session.{MonitoredItem, Subscription}
   alias OPCUA.Types
 
   @min_interval 10
@@ -22,31 +23,17 @@ defmodule OPCUA.Server.Subscriptions do
   @max_publishes 10
   @retransmit 10
 
-  @doc false
-  def new_session(session),
-    do: Map.merge(session, %{subscriptions: %{}, publishes: [], status_changes: [], outbox: []})
+  # DeadbandType (Part 4, 7.22.2). Percent deadbands, of an analog item's
+  # range, aren't supported.
+  @no_deadband 0
+  @absolute_deadband 1
 
   ## Subscriptions
 
   @doc false
   def handle(%Types.CreateSubscriptionRequest{} = request, session, state) do
-    id = :atomics.add_get(state.config.ids, 3, 1)
-
-    sub =
-      revise(
-        %{
-          id: id,
-          items: %{},
-          next_item: 0,
-          sequence: 1,
-          keep_alive_counter: 0,
-          lifetime_counter: 0,
-          late: false,
-          retransmit: %{}
-        },
-        request
-      )
-      |> Map.put(:publishing, request.publishing_enabled)
+    id = OPCUA.Server.next_id(state.config, :subscription)
+    sub = %{revise(%Subscription{id: id}, request) | publishing: request.publishing_enabled}
 
     schedule(session.auth, sub, :publish)
     schedule(session.auth, sub, :sample)
@@ -192,12 +179,9 @@ defmodule OPCUA.Server.Subscriptions do
                 {code(:bad_monitored_item_id_invalid), sub}
 
               item ->
-                {0,
-                 put_in(sub.items[id], %{
-                   item
-                   | mode: request.monitoring_mode,
-                     queue: if(request.monitoring_mode == :disabled, do: [], else: item.queue)
-                 })}
+                item = %{item | mode: request.monitoring_mode}
+                item = if item.mode == :disabled, do: clear(item), else: item
+                {0, put_in(sub.items[id], item)}
             end
           end)
 
@@ -430,28 +414,29 @@ defmodule OPCUA.Server.Subscriptions do
     }
 
   defp has_notifications?(sub),
-    do: Enum.any?(sub.items, fn {_, item} -> item.mode == :reporting and item.queue != [] end)
+    do: Enum.any?(sub.items, fn {_, item} -> item.mode == :reporting and item.queued > 0 end)
 
   defp take_notifications(%{publishing: false} = sub), do: {[], sub}
 
   # Value changes go in a DataChangeNotification, events in an
   # EventNotificationList; the queues are emptied.
   defp take_notifications(sub) do
-    reporting = for {id, %{mode: :reporting, queue: [_ | _]} = item} <- sub.items, do: {id, item}
+    reporting =
+      for {id, %{mode: :reporting} = item} <- sub.items, item.queued > 0, do: {id, item}
 
     changes =
       for {_, %{kind: :value} = item} <- reporting,
-          value <- Enum.reverse(item.queue),
+          value <- :queue.to_list(item.queue),
           do: %Types.MonitoredItemNotification{client_handle: item.handle, value: value}
 
     events =
       for {_, %{kind: :events} = item} <- reporting,
-          fields <- Enum.reverse(item.queue),
+          fields <- :queue.to_list(item.queue),
           do: fields
 
     items =
       Enum.reduce(reporting, sub.items, fn {id, item}, items ->
-        Map.put(items, id, %{item | queue: []})
+        Map.put(items, id, clear(item))
       end)
 
     data =
@@ -533,15 +518,16 @@ defmodule OPCUA.Server.Subscriptions do
 
   defp no_subscriptions(session) do
     outbox =
-      for publish <- session.publishes,
-          do:
-            cancel(publish) && {publish.id, Services.fault(publish.request, :bad_no_subscription)}
+      for publish <- session.publishes do
+        cancel(publish)
+        {publish.id, Services.fault(publish.request, :bad_no_subscription)}
+      end
 
     %{session | publishes: [], outbox: outbox ++ session.outbox}
   end
 
-  defp cancel(%{timer: nil}), do: true
-  defp cancel(%{timer: timer}), do: Process.cancel_timer(timer) || true
+  defp cancel(%{timer: nil}), do: :ok
+  defp cancel(%{timer: timer}), do: Process.cancel_timer(timer)
 
   ## Sampling
 
@@ -589,7 +575,7 @@ defmodule OPCUA.Server.Subscriptions do
   end
 
   defp value_changed?(%Variant{value: a}, %Variant{value: b}, %Types.DataChangeFilter{
-         deadband_type: 1,
+         deadband_type: @absolute_deadband,
          deadband_value: band
        }) do
     exceeds?(a, b, band)
@@ -604,16 +590,16 @@ defmodule OPCUA.Server.Subscriptions do
 
   defp exceeds?(a, b, _), do: a != b
 
-  defp enqueue(item, value) do
-    queue =
-      cond do
-        length(item.queue) < item.queue_size -> [value | item.queue]
-        item.discard_oldest -> [value | Enum.drop(item.queue, -1)]
-        true -> [value | tl(item.queue)]
-      end
+  # A full queue drops its oldest notification, or replaces its newest.
+  defp enqueue(%{queued: n} = item, value) when n < item.queue_size,
+    do: %{item | queue: :queue.in(value, item.queue), queued: n + 1}
 
-    %{item | queue: queue}
-  end
+  defp enqueue(%{discard_oldest: true} = item, value),
+    do: %{item | queue: :queue.in(value, :queue.drop(item.queue))}
+
+  defp enqueue(item, value), do: %{item | queue: :queue.in(value, :queue.drop_r(item.queue))}
+
+  defp clear(item), do: %{item | queue: :queue.new(), queued: 0}
 
   defp create_item(%Types.MonitoredItemCreateRequest{} = create, timestamps, sub, space) do
     read = create.item_to_monitor
@@ -628,17 +614,14 @@ defmodule OPCUA.Server.Subscriptions do
 
     with %Node{} = node <-
            AddressSpace.get(space, read.node_id) || {:error, :bad_node_id_unknown},
-         true <-
-           Bitwise.band(node.attributes[:event_notifier] || 0, 1) == 1 ||
-             {:error, :bad_attribute_id_invalid},
+         true <- AddressSpace.notifier?(node) || {:error, :bad_attribute_id_invalid},
          {:ok, filter_result, item} <-
            event_parameters(
-             %{
+             %MonitoredItem{
                id: sub.next_item + 1,
                kind: :events,
                read: read,
-               mode: create.monitoring_mode,
-               queue: []
+               mode: create.monitoring_mode
              },
              create.requested_parameters,
              space
@@ -663,7 +646,7 @@ defmodule OPCUA.Server.Subscriptions do
 
   defp modify(%{kind: :events} = item, parameters, _sub, space) do
     case event_parameters(item, parameters, space) do
-      {:ok, _, item} -> {:ok, Map.put(item, :sampling, 0)}
+      {:ok, _, item} -> {:ok, item}
       {:error, status, _} -> {:error, status}
     end
   end
@@ -675,12 +658,13 @@ defmodule OPCUA.Server.Subscriptions do
       queue = if p.queue_size in [0, 1], do: @max_queue, else: min(p.queue_size, @max_queue * 10)
 
       {:ok, result,
-       Map.merge(item, %{
-         handle: p.client_handle,
-         queue_size: queue,
-         discard_oldest: p.discard_oldest,
-         filter: p.filter
-       })}
+       %{
+         item
+         | handle: p.client_handle,
+           queue_size: queue,
+           discard_oldest: p.discard_oldest,
+           filter: p.filter
+       }}
     end
   end
 
@@ -690,15 +674,12 @@ defmodule OPCUA.Server.Subscriptions do
     with :ok <- monitorable(space, read),
          {:ok, item} <-
            parameters(
-             %{
+             %MonitoredItem{
                id: sub.next_item + 1,
                kind: :value,
                read: read,
                timestamps: timestamps,
-               mode: create.monitoring_mode,
-               last: nil,
-               queue: [],
-               due: 0
+               mode: create.monitoring_mode
              },
              create.requested_parameters,
              sub
@@ -735,10 +716,18 @@ defmodule OPCUA.Server.Subscriptions do
   defp parameters(item, %Types.MonitoringParameters{} = p, sub) do
     filter =
       case p.filter do
-        nil -> {:ok, nil}
-        %Types.DataChangeFilter{deadband_type: type} = filter when type in [0, 1] -> {:ok, filter}
-        %Types.DataChangeFilter{} -> {:error, :bad_monitored_item_filter_unsupported}
-        _ -> {:error, :bad_monitored_item_filter_unsupported}
+        nil ->
+          {:ok, nil}
+
+        %Types.DataChangeFilter{deadband_type: type} = filter
+        when type in [@no_deadband, @absolute_deadband] ->
+          {:ok, filter}
+
+        %Types.DataChangeFilter{} ->
+          {:error, :bad_monitored_item_filter_unsupported}
+
+        _ ->
+          {:error, :bad_monitored_item_filter_unsupported}
       end
 
     with {:ok, filter} <- filter do
@@ -748,13 +737,14 @@ defmodule OPCUA.Server.Subscriptions do
           else: p.sampling_interval |> max(@min_interval) |> min(@max_interval)
 
       {:ok,
-       Map.merge(item, %{
-         handle: p.client_handle,
-         sampling: trunc(sampling),
-         queue_size: p.queue_size |> max(1) |> min(@max_queue),
-         discard_oldest: p.discard_oldest,
-         filter: filter
-       })}
+       %{
+         item
+         | handle: p.client_handle,
+           sampling: trunc(sampling),
+           queue_size: p.queue_size |> max(1) |> min(@max_queue),
+           discard_oldest: p.discard_oldest,
+           filter: filter
+       }}
     end
   end
 
@@ -769,13 +759,14 @@ defmodule OPCUA.Server.Subscriptions do
 
     keep_alive = max(request.requested_max_keep_alive_count, 1)
 
-    Map.merge(sub, %{
-      interval: interval,
-      keep_alive_count: keep_alive,
-      lifetime_count: max(request.requested_lifetime_count, 3 * keep_alive),
-      max_notifications: request.max_notifications_per_publish,
-      priority: request.priority
-    })
+    %{
+      sub
+      | interval: interval,
+        keep_alive_count: keep_alive,
+        lifetime_count: max(request.requested_lifetime_count, 3 * keep_alive),
+        max_notifications: request.max_notifications_per_publish,
+        priority: request.priority
+    }
   end
 
   # Sampling runs at the fastest interval of the subscription's items.

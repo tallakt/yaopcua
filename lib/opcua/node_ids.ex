@@ -30,6 +30,13 @@ defmodule OPCUA.NodeIds do
     end
   end
 
+  @doc """
+  Like `id!/1`, as an `OPCUA.NodeId`: `node_id!("Server")` is `i=2253`. In a
+  module attribute it's looked up while compiling.
+  """
+  @spec node_id!(String.t()) :: OPCUA.NodeId.t()
+  def node_id!(name), do: %OPCUA.NodeId{id: id!(name)}
+
   @doc "The name of the namespace 0 node with this id, or `nil`."
   @spec name(non_neg_integer) :: String.t() | nil
   def name(id), do: Map.get(@names, id)

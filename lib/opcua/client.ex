@@ -67,18 +67,28 @@ defmodule OPCUA.Client do
 
   import OPCUA.Client.Connection, only: [with_header: 3, result: 1, status_name: 1]
 
-  alias OPCUA.{DataValue, NodeId, QualifiedName, SecureChannel, StatusCode, Transport, Variant}
+  alias OPCUA.{DataValue, NodeId, NodeIds, QualifiedName, SecureChannel, StatusCode}
+  alias OPCUA.{Transport, Variant}
   alias OPCUA.Client.Connection
   alias OPCUA.Types
 
-  # ServerStatus.State, read to keep the session alive
-  @keep_alive 2259
+  # Read to keep the session alive.
+  @server_state NodeIds.node_id!("Server_ServerStatus_State")
   @session_lost [:bad_session_id_invalid, :bad_session_closed, :bad_session_not_activated]
 
-  @base_event_type %NodeId{id: 2041}
-  @condition_type %NodeId{id: 2782}
-  @server_object "i=2253"
+  @server_object NodeIds.node_id!("Server")
+  @hierarchical NodeIds.node_id!("HierarchicalReferences")
+  @base_event_type NodeIds.node_id!("BaseEventType")
+  @condition_type NodeIds.node_id!("ConditionType")
+  @condition_refresh NodeIds.node_id!("ConditionType_ConditionRefresh")
+  @acknowledge NodeIds.node_id!("AcknowledgeableConditionType_Acknowledge")
   @event_fields ~w(EventId EventType SourceNode SourceName Time Message Severity)
+
+  # Every field of a ReferenceDescription (BrowseResultMask All).
+  @all_reference_fields 63
+
+  # DeadbandType (Part 4, 7.22.2).
+  @deadbands %{absolute: 1, percent: 2}
 
   @type client :: GenServer.server()
   @type node_ref :: NodeId.t() | String.t()
@@ -237,10 +247,10 @@ defmodule OPCUA.Client do
     description = %Types.BrowseDescription{
       node_id: node_id(node),
       browse_direction: Keyword.get(opts, :direction, :forward),
-      reference_type_id: node_id(Keyword.get(opts, :reference_type, "i=33")),
+      reference_type_id: node_id(Keyword.get(opts, :reference_type, @hierarchical)),
       include_subtypes: true,
       node_class_mask: 0,
-      result_mask: 63
+      result_mask: @all_reference_fields
     }
 
     request = %Types.BrowseRequest{
@@ -358,10 +368,10 @@ defmodule OPCUA.Client do
 
   defp deadband(nil), do: nil
 
-  defp deadband({type, value}) when type in [:absolute, :percent] do
+  defp deadband({type, value}) when is_map_key(@deadbands, type) do
     %Types.DataChangeFilter{
       trigger: :status_value,
-      deadband_type: if(type == :absolute, do: 1, else: 2),
+      deadband_type: Map.fetch!(@deadbands, type),
       deadband_value: value * 1.0
     }
   end
@@ -444,8 +454,7 @@ defmodule OPCUA.Client do
       %Variant{type: :localized_text, value: comment && %OPCUA.LocalizedText{text: comment}}
     ]
 
-    # AcknowledgeableConditionType.Acknowledge
-    with {:ok, _} <- call(client, condition, "i=9111", args), do: :ok
+    with {:ok, _} <- call(client, condition, @acknowledge, args), do: :ok
   end
 
   @doc """
@@ -455,10 +464,8 @@ defmodule OPCUA.Client do
   """
   @spec refresh(client, subscription) :: :ok | error
   def refresh(client, subscription) do
-    # ConditionType.ConditionRefresh
-    with {:ok, _} <-
-           call(client, "i=2782", "i=3875", [%Variant{type: :uint32, value: subscription}]),
-         do: :ok
+    args = [%Variant{type: :uint32, value: subscription}]
+    with {:ok, _} <- call(client, @condition_type, @condition_refresh, args), do: :ok
   end
 
   defp operand("ConditionId") do
@@ -473,16 +480,9 @@ defmodule OPCUA.Client do
   defp operand(path) do
     %Types.SimpleAttributeOperand{
       type_definition_id: @base_event_type,
-      browse_path: path |> String.split("/") |> Enum.map(&qualified_name/1),
+      browse_path: path |> String.split("/") |> Enum.map(&QualifiedName.parse/1),
       attribute_id: OPCUA.AttributeId.id(:value)
     }
-  end
-
-  defp qualified_name(name) do
-    case Integer.parse(name) do
-      {ns, ":" <> name} -> %QualifiedName{ns: ns, name: name}
-      _ -> %QualifiedName{ns: 0, name: name}
-    end
   end
 
   defp create(client, items, opts) do
@@ -673,16 +673,13 @@ defmodule OPCUA.Client do
   def handle_call({:request, request, timeout}, from, state) do
     timeout = timeout || state.timeout
 
-    try do
-      send_request(state, request, timeout, from, timeout)
-    rescue
-      exception in ArgumentError -> {:raise, exception}
-    end
-    |> case do
+    case send_request(state, request, timeout, {:call, from}, timeout) do
       {:ok, state} -> {:noreply, state}
-      {:raise, exception} -> {:reply, {:raise, exception}, state}
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
+  rescue
+    # A value that doesn't fit its type, raised again in the caller.
+    exception in ArgumentError -> {:reply, {:raise, exception}, state}
   end
 
   def handle_call({:type, node}, _from, state), do: {:reply, Map.get(state.types, node), state}
@@ -761,10 +758,7 @@ defmodule OPCUA.Client do
     do: {:noreply, respond(state, id, {:error, :bad_timeout})}
 
   def handle_info(:keep_alive, state) do
-    read = %Types.ReadValueId{
-      node_id: %NodeId{id: @keep_alive},
-      attribute_id: OPCUA.AttributeId.id(:value)
-    }
+    read = %Types.ReadValueId{node_id: @server_state, attribute_id: OPCUA.AttributeId.id(:value)}
 
     request = %Types.ReadRequest{nodes_to_read: [read]}
 
@@ -877,7 +871,7 @@ defmodule OPCUA.Client do
 
   defp handle_reply(state, tag, _) when tag in [:keep_alive, :ignore], do: state
 
-  defp handle_reply(state, from, reply) do
+  defp handle_reply(state, {:call, from}, reply) do
     GenServer.reply(from, reply)
     state
   end
@@ -970,7 +964,7 @@ defmodule OPCUA.Client do
   end
 
   # Sends a request and remembers what to do with its response: reply to a
-  # caller (`tag` is its `from`), or handle it here.
+  # caller (`tag` is `{:call, from}`), or handle it here.
   defp send_request(state, request, hint, tag, timeout) do
     {id, channel} = SecureChannel.next_request_id(state.channel)
     {request, state} = with_header(%{state | channel: channel}, request, hint)
@@ -1006,8 +1000,7 @@ defmodule OPCUA.Client do
 
   @impl true
   def terminate(reason, state) do
-    for {_, {from, _}} <- state.pending,
-        is_tuple(from),
+    for {_, {{:call, from}, _}} <- state.pending,
         do: GenServer.reply(from, {:error, :bad_connection_closed})
 
     # {:shutdown, reason} means the connection is already broken.

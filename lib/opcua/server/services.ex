@@ -6,8 +6,8 @@ defmodule OPCUA.Server.Services do
 
   require Logger
 
-  alias OPCUA.{Certificate, NodeId, SecurityPolicy, StatusCode, Variant}
-  alias OPCUA.Server.{AddressSpace, Conditions, Node, Subscriptions}
+  alias OPCUA.{Certificate, NodeId, NodeIds, SecurityPolicy, StatusCode, Variant}
+  alias OPCUA.Server.{AddressSpace, Conditions, Node, Session, Subscriptions}
   alias OPCUA.Types
 
   # How many operations one request may ask for, and references one browse
@@ -15,6 +15,17 @@ defmodule OPCUA.Server.Services do
   @max_operations 10_000
   @max_references 1000
   @max_continuation_points 16
+
+  @has_component NodeIds.node_id!("HasComponent")
+
+  # The methods of ConditionType and AcknowledgeableConditionType.
+  @condition_type NodeIds.node_id!("ConditionType")
+  @refresh NodeIds.node_id!("ConditionType_ConditionRefresh")
+  @refresh2 NodeIds.node_id!("ConditionType_ConditionRefresh2")
+  @acknowledge NodeIds.node_id!("AcknowledgeableConditionType_Acknowledge")
+  @add_comment NodeIds.node_id!("ConditionType_AddComment")
+  @enable NodeIds.node_id!("ConditionType_Enable")
+  @disable NodeIds.node_id!("ConditionType_Disable")
 
   @subscriptions [
     Types.CreateSubscriptionRequest,
@@ -100,18 +111,13 @@ defmodule OPCUA.Server.Services do
       auth = %NodeId{ns: 0, id: {:opaque, :crypto.strong_rand_bytes(32)}}
       nonce = :crypto.strong_rand_bytes(32)
 
-      session =
-        Subscriptions.new_session(%{
-          id: %NodeId{ns: 1, id: {:guid, guid()}},
-          auth: auth,
-          name: request.session_name,
-          timeout: timeout,
-          activated: false,
-          user: nil,
-          nonce: nonce,
-          continuation: %{},
-          last: nil
-        })
+      session = %Session{
+        id: %NodeId{ns: 1, id: {:guid, guid()}},
+        auth: auth,
+        name: request.session_name,
+        timeout: timeout,
+        nonce: nonce
+      }
 
       response = %Types.CreateSessionResponse{
         response_header: header(request, 0),
@@ -320,31 +326,16 @@ defmodule OPCUA.Server.Services do
           _ -> nil
         end
 
+      logins = [
+        {config.anonymous, "anonymous", :anonymous, nil},
+        {config.users, "username", :user_name, token_uri},
+        {config.user_certificates, "certificate", :certificate, token_uri}
+      ]
+
       tokens =
-        if(config.anonymous,
-          do: [%Types.UserTokenPolicy{policy_id: "anonymous", token_type: :anonymous}],
-          else: []
-        ) ++
-          if(config.users,
-            do: [
-              %Types.UserTokenPolicy{
-                policy_id: "username",
-                token_type: :user_name,
-                security_policy_uri: token_uri
-              }
-            ],
-            else: []
-          ) ++
-          if(config.user_certificates,
-            do: [
-              %Types.UserTokenPolicy{
-                policy_id: "certificate",
-                token_type: :certificate,
-                security_policy_uri: token_uri
-              }
-            ],
-            else: []
-          )
+        for {offered, id, type, uri} <- logins, offered do
+          %Types.UserTokenPolicy{policy_id: id, token_type: type, security_policy_uri: uri}
+        end
 
       %Types.EndpointDescription{
         endpoint_url: config.endpoint_url,
@@ -360,14 +351,7 @@ defmodule OPCUA.Server.Services do
     end
   end
 
-  defp guid do
-    <<a::32, b::16, c::16, d::16, e::48>> = :crypto.strong_rand_bytes(16)
-
-    [{a, 8}, {b, 4}, {c, 4}, {d, 4}, {e, 12}]
-    |> Enum.map_join("-", fn {n, w} ->
-      n |> Integer.to_string(16) |> String.pad_leading(w, "0")
-    end)
-  end
+  defp guid, do: :crypto.strong_rand_bytes(16) |> OPCUA.Binary.take(:guid) |> elem(0)
 
   # Each request restarts the session's timeout.
   defp touch(session) do
@@ -528,14 +512,6 @@ defmodule OPCUA.Server.Services do
     end
   end
 
-  @condition_type %NodeId{id: 2782}
-  @refresh %NodeId{id: 3875}
-  @refresh2 %NodeId{id: 12912}
-  @acknowledge %NodeId{id: 9111}
-  @add_comment %NodeId{id: 9029}
-  @enable %NodeId{id: 9027}
-  @disable %NodeId{id: 9028}
-
   # The methods of ConditionType and AcknowledgeableConditionType, called on
   # the type (ConditionRefresh) or on a condition (the rest).
   defp call_method(%{object_id: @condition_type, method_id: method} = call, session, state)
@@ -664,7 +640,7 @@ defmodule OPCUA.Server.Services do
          %Node{class: :method} = method <-
            AddressSpace.get(space, call.method_id) || {:error, :bad_method_invalid},
          true <-
-           Enum.member?(object.references, {%NodeId{id: 47}, method.node_id, true}) ||
+           Enum.member?(object.references, {@has_component, method.node_id, true}) ||
              {:error, :bad_method_invalid},
          %{call: fun, inputs: types, outputs: outputs} <- method.attributes,
          {:ok, args} <- arguments(call.input_arguments || [], types) do
@@ -694,10 +670,16 @@ defmodule OPCUA.Server.Services do
   defp arguments(args, types) when length(args) > length(types),
     do: {:error, :bad_too_many_arguments}
 
+  # Arguments are scalars of the method's types; a null variant or an array
+  # isn't one.
   defp arguments(args, types) do
     results =
-      for {%Variant{type: type}, wanted} <- Enum.zip(args, types),
-          do: if(type == wanted, do: 0, else: StatusCode.code(:bad_type_mismatch))
+      for {arg, wanted} <- Enum.zip(args, types) do
+        case arg do
+          %Variant{type: ^wanted, value: value} when not is_list(value) -> 0
+          _ -> StatusCode.code(:bad_type_mismatch)
+        end
+      end
 
     if Enum.all?(results, &(&1 == 0)),
       do: {:ok, Enum.map(args, & &1.value)},
