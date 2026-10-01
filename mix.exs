@@ -1,7 +1,7 @@
 defmodule OPCUA.MixProject do
   use Mix.Project
 
-  @version "0.1.1"
+  @version "0.2.0"
   @source_url "https://github.com/tallakt/yaopcua"
 
   def project do
@@ -28,14 +28,14 @@ defmodule OPCUA.MixProject do
     [
       licenses: ["Apache-2.0"],
       links: %{"GitHub" => @source_url},
-      files: ~w(lib schema mix.exs .formatter.exs README.md LICENSE NOTICE)
+      files: ~w(lib schema mix.exs .formatter.exs README.md CHANGELOG.md LICENSE NOTICE)
     ]
   end
 
   defp docs do
     [
       main: "readme",
-      extras: ["README.md", "LICENSE", "NOTICE"],
+      extras: ["README.md", "CHANGELOG.md", "LICENSE", "NOTICE"],
       source_ref: "v#{@version}",
       # Hundreds of generated structures and enumerations, kept apart.
       groups_for_modules: [

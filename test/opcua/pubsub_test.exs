@@ -50,6 +50,29 @@ defmodule OPCUA.PubSubTest do
     end
   end
 
+  test "with interval 0, a publisher sends when it's told to" do
+    url = url()
+
+    start_supervised!(
+      {Subscriber,
+       to: self(), url: url, readers: [[publisher_id: 5, writer_id: 1, fields: @fields]]}
+    )
+
+    publisher =
+      start_supervised!(
+        {Publisher,
+         url: url,
+         publisher_id: 5,
+         interval: 0,
+         writers: [[id: 1, fields: @fields, read: fn -> @values end]]}
+      )
+
+    refute_receive {OPCUA.PubSub, {5, 1}, _}, 200
+    :ok = Publisher.publish(publisher)
+    assert data({5, 1}) == @values
+    refute_receive {OPCUA.PubSub, {5, 1}, _}, 200
+  end
+
   test "values set by the application, with delta frames between key frames" do
     url = url()
 

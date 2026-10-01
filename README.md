@@ -95,13 +95,16 @@ it under a supervisor to reconnect.
 | Function | Does |
 |---|---|
 | `namespace/2` | the index of a namespace URI, adding it if new |
-| `add_folder/4`, `add_object/4` | adds a folder or an object, under the Objects folder by default |
-| `add_variable/4` | adds a variable with a stored value, or one read from a function each time; `:write` sees and may refuse each client write |
+| `add_folder/4`, `add_object/4` | adds a folder or an object, under the Objects folder by default; `event_notifier: true` for one clients subscribe to events of |
+| `add_variable/4` | adds a variable with a stored value, or one read from a function each time; `:write` sees and may refuse each client write; `:units` and `:range` make it an AnalogItem |
 | `add_method/4` | adds a method; the function gets the inputs as plain values |
+| `delete/2` | removes a node and what it holds |
 | `set/3`, `get/2` | sets and gets a value from the application; a value that doesn't fit raises |
 | `event/2` | sends an event to the clients that subscribe to events |
-| `add_condition/4`, `condition/3` | adds an alarm on a node, and changes it: active, acknowledged, enabled, severity, message |
+| `add_condition/4`, `condition/3` | adds an alarm on a node, and changes it: active, acknowledged, enabled, suppressed, severity, message |
 | `space/1` | the address space itself, for `set/3` without going through the server process |
+| `listen/1` | starts listening, for a server started with `listen: false` to build its address space first |
+| `info/1` | how many connections and sessions there are |
 
 The server starts with all 5,500 standard nodes of namespace 0, and answers
 GetEndpoints, FindServers, sessions (anonymous and username logins), Read,
@@ -133,7 +136,11 @@ application first:
 
 Event filters take select clauses by browse path (including ConditionId) and
 where clauses with OfType, And, Or, Not, the comparisons, Between, InList and
-IsNull. Enable, Disable and AddComment work too; Confirm and shelving don't.
+IsNull. AddComment works too, and so do Enable and Disable, which an
+`:enable` function hears of first and may refuse; a disabled alarm reports no
+events until it's enabled again. `condition(..., suppressed: true)` shows an
+alarm the application holds back as Suppressed. Confirm and shelving don't
+work.
 
 What the server doesn't do yet is listed under [What's missing](#whats-missing).
 
@@ -242,6 +249,7 @@ fields = [{"Speed", :int16}, {"Level", :double}, {"Running", :boolean}]
 | `encoding:` | `:variant` (typed, the default), `:raw` (smallest; both ends must agree on the types) or `:data_value` (with status and timestamps) |
 | `key_frames:` | every value each N-th cycle, and only the changed ones in between |
 | `read:` or `Publisher.set/3` | where the publisher's values come from |
+| `interval: 0` | a message only on each `Publisher.publish/1`, such as at the end of a PLC scan |
 
 Messages are UADP (Part 14), checked against asyncua in both directions. See
 [What's missing](#whats-missing) for what PubSub lacks.
@@ -373,14 +381,14 @@ out on purpose, this is what it doesn't do, by area.
 - Subscriptions ignore `max_notifications_per_publish` and priority, and
   don't set the queue overflow bit. Items are sampled on a timer that ticks
   at the subscription's fastest sampling interval, so a slower item may be up
-  to one tick late. Percent deadbands need an EURange, which isn't there.
+  to one tick late. Percent deadbands need an EURange, from `range:`.
 - A renewed secure channel token is used for sending at once, rather than
   after the client first uses it.
 - Events: the where-clause operators Like, Cast, InView, RelatedTo and the
   bitwise ones; AttributeOperand; index ranges in select clauses; overflow
   events for full queues. Events reach the Server object, their source and
   what's above the source by HasEventSource and HasNotifier.
-- Alarms: no Confirm, shelving, suppression, silencing, latching or branches;
+- Alarms: no Confirm, shelving, silencing, latching or branches;
   no fields of specific alarm types (such as limits); and no Acknowledge
   method node on each condition, so clients call the one on the type.
 - The address space isn't saved; the application builds it on each start.

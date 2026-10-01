@@ -10,7 +10,8 @@ defmodule OPCUA.PubSub.Publisher do
     * `:publisher_id` - an integer or a string that identifies this publisher
       on the network (required)
     * `:writer_group_id` - the group the writers belong to (default 1)
-    * `:interval` - ms between messages (default 1000)
+    * `:interval` - ms between messages (default 1000), or 0 for a message
+      each time `publish/1` is called, such as at the end of a PLC scan
     * `:writers` - the datasets to send, each a keyword list:
       * `:id` - the dataset writer id (required)
       * `:fields` - `{name, type}` for each field, in order (required)
@@ -38,6 +39,13 @@ defmodule OPCUA.PubSub.Publisher do
   @doc "Starts publishing. See the module doc for the options."
   @spec start_link(keyword) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
+
+  @doc """
+  Sends a message now, with the writers' current values. For a publisher
+  with `interval: 0`, which sends nothing otherwise.
+  """
+  @spec publish(GenServer.server()) :: :ok
+  def publish(publisher), do: GenServer.cast(publisher, :publish)
 
   @doc """
   Sets values of a writer without `:read`, by field name. They're sent from
@@ -83,10 +91,11 @@ defmodule OPCUA.PubSub.Publisher do
         interval: Keyword.get(opts, :interval, 1000),
         writers: writers,
         sequence: 0,
-        cycle: 0
+        cycle: 0,
+        failing: nil
       }
 
-      send(self(), :publish)
+      if state.interval > 0, do: send(self(), :publish)
       {:ok, state}
     end
   end
@@ -113,8 +122,15 @@ defmodule OPCUA.PubSub.Publisher do
   end
 
   @impl true
+  def handle_cast(:publish, state), do: {:noreply, send_message(state)}
+
+  @impl true
   def handle_info(:publish, state) do
     Process.send_after(self(), :publish, state.interval)
+    {:noreply, send_message(state)}
+  end
+
+  defp send_message(state) do
     now = DateTime.utc_now()
 
     {messages, writers} =
@@ -130,12 +146,27 @@ defmodule OPCUA.PubSub.Publisher do
       messages: messages
     }
 
-    case :gen_udp.send(state.socket, state.ip, state.port, UADP.encode(network)) do
-      :ok -> :ok
-      {:error, reason} -> Logger.warning("OPC UA PubSub send failed: #{inspect(reason)}")
-    end
+    # Said once when sending starts failing, and once when it works again,
+    # rather than every cycle.
+    failing =
+      case {:gen_udp.send(state.socket, state.ip, state.port, UADP.encode(network)),
+            state.failing} do
+        {:ok, nil} ->
+          nil
 
-    {:noreply, %{state | writers: writers, sequence: sequence, cycle: state.cycle + 1}}
+        {:ok, _reason} ->
+          Logger.info("OPC UA PubSub sends again")
+          nil
+
+        {{:error, reason}, reason} ->
+          reason
+
+        {{:error, reason}, _before} ->
+          Logger.warning("OPC UA PubSub send failed: #{inspect(reason)}")
+          reason
+      end
+
+    %{state | writers: writers, sequence: sequence, cycle: state.cycle + 1, failing: failing}
   end
 
   defp message(writer, cycle, now) do

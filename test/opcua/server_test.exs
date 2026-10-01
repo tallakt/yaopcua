@@ -327,6 +327,88 @@ defmodule OPCUA.ServerTest do
              {:error, :bad_parent_node_id_invalid}
   end
 
+  test "a server can build its address space first, and listen later" do
+    server = start_supervised!({Server, port: 0, listen: false}, id: :later)
+    assert Server.port(server) == nil
+    assert Server.endpoint_url(server) == nil
+    :ok = Server.add_variable(server, "ns=1;s=X", "X", type: :int16, value: 7)
+
+    :ok = Server.listen(server)
+    :ok = Server.listen(server)
+    port = Server.port(server)
+    url = "opc.tcp://127.0.0.1:#{port}"
+    assert Server.endpoint_url(server) =~ ":#{port}"
+
+    client = start_supervised!({Client, url: url}, id: :later_client)
+    assert Client.read(client, "ns=1;s=X") == {:ok, 7}
+    assert {:ok, [endpoint]} = Client.endpoints(url)
+    assert endpoint.endpoint_url == Server.endpoint_url(server)
+  end
+
+  test "delete removes a node and what it holds", %{server: server, client: client} do
+    :ok = Server.add_folder(server, "ns=2;s=Line", "Line")
+
+    :ok =
+      Server.add_variable(server, "ns=2;s=Line.Speed", "Speed",
+        parent: "ns=2;s=Line",
+        type: :double,
+        value: 1.0,
+        range: {0, 10}
+      )
+
+    :ok =
+      Server.add_method(server, "ns=2;s=Line.Start", "Start",
+        parent: "ns=2;s=Line",
+        inputs: [{"speed", :int32}],
+        call: fn _ -> {:ok, []} end
+      )
+
+    {:ok, sub} = Client.subscribe(client, ["ns=2;s=Line.Speed"], interval: 50)
+    assert_receive {Client, ^sub, {:value, _, %DataValue{value: %Variant{value: 1.0}}}}, 2000
+
+    :ok = Server.delete(server, "ns=2;s=Line")
+
+    for node <- ~w(Line Line.Speed Line.Speed.EURange Line.Start Line.Start.InputArguments) do
+      assert Client.read(client, "ns=2;s=#{node}", :browse_name) == {:error, :bad_node_id_unknown}
+    end
+
+    assert {:ok, refs} = Client.browse(client, "i=85")
+    refute Enum.any?(refs, &(&1.browse_name.name == "Line"))
+
+    # What monitored it hears that it's gone.
+    assert_receive {Client, ^sub, {:value, _, %DataValue{status: status}}}, 2000
+    assert OPCUA.StatusCode.name(status) == :bad_node_id_unknown
+
+    assert Server.delete(server, "ns=2;s=Line") == {:error, :bad_node_id_unknown}
+    assert Server.delete(server, "i=85") == {:error, :bad_no_delete_rights}
+    assert Server.add_folder(server, "ns=2;s=Line", "Line") == :ok
+  end
+
+  test "units and range make an analog item", %{server: server, client: client} do
+    :ok =
+      Server.add_variable(server, "ns=2;s=Temp", "Temp",
+        type: :double,
+        value: 20.0,
+        units: {"CEL", "°C"},
+        range: {-40, 120}
+      )
+
+    assert Client.read(client, "ns=2;s=Temp.EURange") ==
+             {:ok, %Types.Range{low: -40.0, high: 120.0}}
+
+    # The UNECE code CEL as Part 8 packs it.
+    assert {:ok, %Types.EUInformation{unit_id: 4_408_652, display_name: %{text: "°C"}}} =
+             Client.read(client, "ns=2;s=Temp.EngineeringUnits")
+
+    # HasTypeDefinition: AnalogItemType
+    assert {:ok, [%{node_id: %OPCUA.ExpandedNodeId{id: 2368}}]} =
+             Client.browse(client, "ns=2;s=Temp", reference_type: "i=40")
+  end
+
+  test "info counts the connections and their sessions", %{server: server} do
+    assert Server.info(server) == %{connections: 1, sessions: 1}
+  end
+
   test "the client keeps an idle session alive", %{url: url} do
     client = start_supervised!({Client, url: url, session_timeout: 1000}, id: :idle)
     assert :sys.get_state(client).session_timeout == 1000.0
@@ -459,10 +541,27 @@ defmodule OPCUA.ServerTest do
       :ok = Server.set(server, "ns=2;s=Level", 2.0)
       assert {:value, _, %DataValue{value: %Variant{value: 2.0}}} = next(sub)
 
-      # A percent deadband needs an EURange, which these variables don't have.
+      # A percent deadband needs an EURange, which this variable doesn't have.
       {:ok, percent} = Client.subscribe(client, ["ns=2;s=Level"], deadband: {:percent, 5.0})
       assert {:value, _, %DataValue{status: status}} = next(percent)
-      assert OPCUA.StatusCode.name(status) == :bad_monitored_item_filter_unsupported
+      assert OPCUA.StatusCode.name(status) == :bad_deadband_filter_invalid
+
+      # With one, 5% of 0..200 is 10.
+      :ok =
+        Server.add_variable(server, "ns=2;s=Tank", "Tank",
+          type: :double,
+          value: 0.0,
+          range: {0, 200}
+        )
+
+      {:ok, sub} =
+        Client.subscribe(client, ["ns=2;s=Tank"], interval: 50, deadband: {:percent, 5.0})
+
+      assert {:value, _, _} = next(sub)
+      :ok = Server.set(server, "ns=2;s=Tank", 8.0)
+      none(sub)
+      :ok = Server.set(server, "ns=2;s=Tank", 11.0)
+      assert {:value, _, %DataValue{value: %Variant{value: 11.0}}} = next(sub)
     end
 
     test "a node that can't be monitored gets one message with its status", %{client: client} do
@@ -894,6 +993,77 @@ defmodule OPCUA.ServerTest do
 
       refresh = [%Variant{type: :uint32, value: [1]}]
       assert Client.call(client, "i=2782", "i=3875", refresh) == {:error, :bad_invalid_argument}
+    end
+
+    test "the application can refuse Enable and Disable, and suppress a condition", %{
+      server: server,
+      client: client
+    } do
+      :ok =
+        Server.add_condition(server, "ns=2;s=Pump1.Stuck", "Stuck",
+          source: "ns=2;s=Pump1",
+          enable: fn
+            true -> :ok
+            false -> {:error, :bad_not_supported}
+          end
+        )
+
+      {:ok, sub} =
+        Client.subscribe_events(client,
+          fields: ["ConditionId", "EnabledState/Id", "SuppressedState/Id"],
+          interval: 50
+        )
+
+      assert Client.call(client, "ns=2;s=Pump1.Stuck", "i=9028", []) ==
+               {:error, :bad_not_supported}
+
+      :ok = Server.condition(server, "ns=2;s=Pump1.Stuck", suppressed: true)
+      assert %{"SuppressedState/Id" => true, "EnabledState/Id" => true} = event(sub)
+
+      assert Client.read(client, "ns=2;s=Pump1.Stuck.SuppressedState") ==
+               {:ok, %OPCUA.LocalizedText{locale: "en", text: "Suppressed"}}
+    end
+
+    test "a disabled condition is quiet until it's enabled again", %{
+      server: server,
+      client: client
+    } do
+      condition = "ns=2;s=Pump1.Overload"
+
+      {:ok, sub} =
+        Client.subscribe_events(client,
+          fields: ["ConditionId", "EnabledState/Id", "ActiveState/Id"],
+          interval: 50
+        )
+
+      assert Client.call(client, condition, "i=9028", []) == {:ok, []}
+      assert %{"EnabledState/Id" => false} = event(sub)
+
+      :ok = Server.condition(server, condition, active: true)
+      no_event(sub)
+
+      assert Client.call(client, condition, "i=9027", []) == {:ok, []}
+      assert %{"EnabledState/Id" => true, "ActiveState/Id" => true} = event(sub)
+    end
+
+    test "objects are event notifiers, one below another", %{server: server, client: client} do
+      :ok = Server.add_folder(server, "ns=2;s=Area", "Area", event_notifier: true)
+
+      :ok =
+        Server.add_object(server, "ns=2;s=Area.Line", "Line",
+          parent: "ns=2;s=Area",
+          reference: "i=48",
+          event_notifier: true
+        )
+
+      {:ok, sub} = Client.subscribe_events(client, source: "ns=2;s=Area", interval: 50)
+      :ok = Server.event(server, source: "ns=2;s=Area.Line", message: "From the line")
+      assert %{"Message" => %OPCUA.LocalizedText{text: "From the line"}} = event(sub)
+
+      # Not a notifier, not subscribable.
+      :ok = Server.add_folder(server, "ns=2;s=Plain", "Plain")
+      {:ok, plain} = Client.subscribe_events(client, source: "ns=2;s=Plain")
+      assert_receive {Client, ^plain, {:status, :bad_attribute_id_invalid}}, 1000
     end
 
     test "refuses conditions it doesn't have", %{server: server} do

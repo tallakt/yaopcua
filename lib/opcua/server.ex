@@ -62,6 +62,8 @@ defmodule OPCUA.Server do
   ## Options
 
     * `:port` - the TCP port (default 4840; 0 picks a free one, see `port/1`)
+    * `:listen` - false to start without listening, until `listen/1`
+      (default true): the address space is there to build meanwhile
     * `:ip` - the address to listen on (default all)
     * `:endpoint_url` - the URL the server gives clients (default
       `opc.tcp://<hostname>:<port>`)
@@ -102,8 +104,16 @@ defmodule OPCUA.Server do
   @base_event_type NodeIds.node_id!("BaseEventType")
   @namespace_array NodeIds.node_id!("Server_NamespaceArray")
 
+  @analog_item_type NodeIds.node_id!("AnalogItemType")
+  @eu_information NodeIds.node_id!("EUInformation")
+  @range NodeIds.node_id!("Range")
+
   @readable Types.AccessLevelType.mask([:current_read])
   @writable Types.AccessLevelType.mask([:current_read, :current_write])
+  @subscribe_to_events Types.EventNotifierType.mask([:subscribe_to_events])
+
+  # Where UNECE unit codes are defined (Part 8, 5.6.3).
+  @units_uri "http://www.opcfoundation.org/UA/units/un/cefact"
 
   # Ids unique across the server's connections, each counted in its own
   # slot of an :atomics array.
@@ -158,13 +168,39 @@ defmodule OPCUA.Server do
   def child_spec(opts),
     do: %{id: Keyword.get(opts, :name, __MODULE__), start: {__MODULE__, :start_link, [opts]}}
 
-  @doc "The port the server listens on."
-  @spec port(GenServer.server()) :: :inet.port_number()
+  @doc "The port the server listens on, or `nil` before it listens."
+  @spec port(GenServer.server()) :: :inet.port_number() | nil
   def port(server), do: GenServer.call(server, :port)
 
-  @doc "The endpoint URL clients connect to."
-  @spec endpoint_url(GenServer.server()) :: String.t()
+  @doc "The endpoint URL clients connect to, or `nil` before the server listens."
+  @spec endpoint_url(GenServer.server()) :: String.t() | nil
   def endpoint_url(server), do: GenServer.call(server, :endpoint_url)
+
+  @doc """
+  Starts listening, for a server started with `listen: false`. Does nothing
+  for one that listens already.
+  """
+  @spec listen(GenServer.server()) :: :ok | {:error, term}
+  def listen(server), do: GenServer.call(server, :listen)
+
+  @doc "How many clients are connected, and how many sessions they have."
+  @spec info(GenServer.server()) :: %{connections: non_neg_integer, sessions: non_neg_integer}
+  def info(server) do
+    connections = GenServer.call(server, :connections)
+
+    # Asked here rather than by the server, so a busy connection holds up
+    # only the caller.
+    sessions =
+      for pid <- connections do
+        try do
+          GenServer.call(pid, :sessions, 1000)
+        catch
+          :exit, _gone_or_busy -> 0
+        end
+      end
+
+    %{connections: length(connections), sessions: Enum.sum(sessions)}
+  end
 
   @doc """
   The index of a namespace, adding it if it's new. Index 0 is the OPC UA
@@ -175,12 +211,22 @@ defmodule OPCUA.Server do
 
   @doc """
   Adds a folder, organized under `:parent` (default the Objects folder).
+
+  ## Options
+
+    * `:parent` - the folder or object it's in
+    * `:reference` - the reference from the parent (default Organizes)
+    * `:event_notifier` - true for one that clients can subscribe to events
+      of: the events of its own, and of the nodes below it by HasNotifier or
+      HasEventSource. `reference: "i=48"` (HasNotifier) puts one notifier
+      below another.
+    * `:description` - text for clients
   """
   @spec add_folder(GenServer.server(), node_ref, String.t(), keyword) :: :ok | {:error, atom}
   def add_folder(server, node, name, opts \\ []) do
     add(server, node, name, opts,
       class: :object,
-      attributes: %{event_notifier: 0},
+      attributes: %{event_notifier: notifier(opts)},
       reference: @organizes,
       type_definition: @folder_type
     )
@@ -188,17 +234,20 @@ defmodule OPCUA.Server do
 
   @doc """
   Adds an object, organized under `:parent` (default the Objects folder).
-  `:type_definition` sets its object type (default BaseObjectType).
+  `:type_definition` sets its object type (default BaseObjectType); the
+  other options are `add_folder/4`'s.
   """
   @spec add_object(GenServer.server(), node_ref, String.t(), keyword) :: :ok | {:error, atom}
   def add_object(server, node, name, opts \\ []) do
     add(server, node, name, opts,
       class: :object,
-      attributes: %{event_notifier: 0},
+      attributes: %{event_notifier: notifier(opts)},
       reference: @organizes,
       type_definition: node_id(Keyword.get(opts, :type_definition, @base_object_type))
     )
   end
+
+  defp notifier(opts), do: if(opts[:event_notifier], do: @subscribe_to_events, else: 0)
 
   @doc """
   Adds a variable.
@@ -216,6 +265,12 @@ defmodule OPCUA.Server do
       it's stored; it returns `:ok`, or `{:error, status}` to refuse it
     * `:property` - add it as a property (HasProperty) instead of a component
     * `:description` - text for clients
+    * `:units` - `{code, symbol}`: its unit as a UNECE code and how it shows,
+      such as `{"CEL", "°C"}`, in an EngineeringUnits property
+    * `:range` - `{low, high}`: what its value normally is, in an EURange
+      property, which percent deadbands go by
+
+  A variable with `:units` or `:range` is an AnalogItem.
   """
   @spec add_variable(GenServer.server(), node_ref, String.t(), keyword) :: :ok | {:error, atom}
   def add_variable(server, node, name, opts) do
@@ -248,19 +303,47 @@ defmodule OPCUA.Server do
           {:read, fun, type}
       end
 
-    {reference, type_definition} =
-      if opts[:property],
-        do: {@has_property, @property_type},
-        else: {@has_component, @base_data_variable_type}
+    analog = opts[:units] != nil or opts[:range] != nil
 
-    add(server, node, name, opts,
-      class: :variable,
-      attributes: attributes,
-      value: value,
-      reference: reference,
-      type_definition: type_definition
-    )
+    {reference, type_definition} =
+      cond do
+        opts[:property] -> {@has_property, @property_type}
+        analog -> {@has_component, @analog_item_type}
+        true -> {@has_component, @base_data_variable_type}
+      end
+
+    variable = node_id(node)
+
+    with :ok <-
+           add(server, variable, name, opts,
+             class: :variable,
+             attributes: attributes,
+             value: value,
+             reference: reference,
+             type_definition: type_definition
+           ),
+         :ok <- units(server, variable, opts[:units]) do
+      range(server, variable, opts[:range])
+    end
   end
+
+  defp units(_server, _variable, nil), do: :ok
+
+  defp units(server, variable, {code, symbol}) when is_binary(code) and is_binary(symbol) do
+    units = %Types.EUInformation{
+      namespace_uri: @units_uri,
+      unit_id: code |> String.to_charlist() |> Enum.reduce(0, &(&2 * 256 + &1)),
+      display_name: %LocalizedText{text: symbol},
+      description: %LocalizedText{text: symbol}
+    }
+
+    property(server, variable, "EngineeringUnits", @eu_information, units)
+  end
+
+  defp range(_server, _variable, nil), do: :ok
+
+  defp range(server, variable, {low, high}) when is_number(low) and is_number(high),
+    do: property(server, variable, "EURange", @range, %Types.Range{low: low / 1, high: high / 1})
 
   @doc """
   Adds a method to an object.
@@ -305,8 +388,6 @@ defmodule OPCUA.Server do
   defp arguments(_, _, _, []), do: :ok
 
   defp arguments(server, method, name, arguments) do
-    id = if is_binary(method.id), do: method.id <> "." <> name, else: "#{method.id}.#{name}"
-
     value =
       for {arg, type} <- arguments do
         %Types.Argument{
@@ -316,10 +397,19 @@ defmodule OPCUA.Server do
         }
       end
 
+    property(server, method, name, @argument, value)
+  end
+
+  # A standard property of a node, such as a method's InputArguments: a
+  # structure, or a list of them, at `<node id>.<name>`.
+  defp property(server, parent, name, data_type, value) do
+    id = if is_binary(parent.id), do: parent.id <> "." <> name, else: "#{parent.id}.#{name}"
+    array = is_list(value)
+
     attributes = %{
-      data_type: @argument,
-      value_rank: 1,
-      array_dimensions: [length(value)],
+      data_type: data_type,
+      value_rank: if(array, do: 1, else: -1),
+      array_dimensions: if(array, do: [length(value)]),
       access_level: @readable,
       user_access_level: @readable,
       minimum_sampling_interval: 0.0,
@@ -328,9 +418,9 @@ defmodule OPCUA.Server do
 
     add(
       server,
-      %NodeId{ns: method.ns, id: id},
+      %NodeId{ns: parent.ns, id: id},
       %QualifiedName{ns: 0, name: name},
-      [parent: method],
+      [parent: parent],
       class: :variable,
       attributes: attributes,
       value: %DataValue{value: %Variant{type: :extension_object, value: value}},
@@ -338,6 +428,17 @@ defmodule OPCUA.Server do
       type_definition: @property_type
     )
   end
+
+  @doc """
+  Removes a node and what it holds: the nodes below it by hierarchical
+  references, such as a folder's contents, a variable's properties and a
+  method's arguments. The conditions of a source stay; remove them too.
+  Monitored items on a removed node read BadNodeIdUnknown. Nodes of
+  namespace 0 can't be removed.
+  """
+  @spec delete(GenServer.server(), node_ref) ::
+          :ok | {:error, :bad_node_id_unknown | :bad_no_delete_rights}
+  def delete(server, node), do: GenServer.call(server, {:delete, node_id(node)})
 
   # `opts` are the caller's, and `spec` what the kind of node brings: its
   # class, attributes, value, reference from its parent and type definition.
@@ -392,6 +493,12 @@ defmodule OPCUA.Server do
     * `:acknowledge` - a function called with the comment when a client
       acknowledges; it returns `:ok`, or `{:error, status}` to refuse. It runs
       in the process of the client's connection.
+    * `:enable` - a function called with `false` when a client disables the
+      condition, and `true` when it enables it, which returns `:ok`, or
+      `{:error, status}` to refuse, such as `:bad_not_supported`; also in
+      the client's connection. Without it clients may do either.
+
+  A disabled condition reports no events until it's enabled again.
   """
   @spec add_condition(GenServer.server(), node_ref, String.t(), keyword) :: :ok | {:error, atom}
   def add_condition(server, node, name, opts) do
@@ -407,9 +514,10 @@ defmodule OPCUA.Server do
   defp condition_type(type), do: node_id(type)
 
   @doc """
-  Changes an alarm: `active:`, `acked:`, `enabled:`, `severity:` or
-  `message:`. Clients get an event when anything changed. An alarm that
-  becomes active also becomes unacknowledged, unless `acked:` says otherwise.
+  Changes an alarm: `active:`, `acked:`, `enabled:`, `suppressed:`,
+  `severity:` or `message:`. Clients get an event when anything changed,
+  unless the alarm is disabled. An alarm that becomes active also becomes
+  unacknowledged, unless `acked:` says otherwise.
 
       :ok = OPCUA.Server.condition(server, "ns=2;s=Pump1.Overload", active: true)
   """
@@ -495,24 +603,11 @@ defmodule OPCUA.Server do
   @impl true
   def init(opts) do
     Process.flag(:trap_exit, true)
-    port = Keyword.get(opts, :port, 4840)
-    ip = Keyword.get(opts, :ip, {0, 0, 0, 0})
+    limits = Map.new(Keyword.merge(@limits, Keyword.get(opts, :limits, [])))
 
-    with {:ok, listen} <-
-           :gen_tcp.listen(port, [
-             :binary,
-             active: false,
-             reuseaddr: true,
-             ip: ip,
-             nodelay: true,
-             backlog: 128
-           ]),
-         {:ok, {_, port}} <- :inet.sockname(listen),
-         limits = Map.new(Keyword.merge(@limits, Keyword.get(opts, :limits, []))),
-         {:ok, connections} <-
+    with {:ok, connections} <-
            DynamicSupervisor.start_link(strategy: :one_for_one, max_children: limits.connections) do
       {:ok, host} = :inet.gethostname()
-      url = Keyword.get(opts, :endpoint_url, "opc.tcp://#{host}:#{port}")
       application_uri = Keyword.get(opts, :application_uri, "urn:yaopcua:server")
       space = AddressSpace.new()
       security = security(opts)
@@ -534,13 +629,14 @@ defmodule OPCUA.Server do
 
       config = %{
         space: space,
-        endpoint_url: url,
+        # Known once the server listens.
+        endpoint_url: nil,
         application: %Types.ApplicationDescription{
           application_uri: application_uri,
           product_uri: "urn:yaopcua",
           application_name: %LocalizedText{text: Keyword.get(opts, :product_name, "yaopcua")},
           application_type: :server,
-          discovery_urls: [url]
+          discovery_urls: []
         },
         anonymous: Keyword.get(opts, :anonymous, true),
         users: Keyword.get(opts, :users),
@@ -556,19 +652,50 @@ defmodule OPCUA.Server do
 
       namespaces = ["http://opcfoundation.org/UA/", application_uri]
       server_nodes(space, config, namespaces)
-      acceptor = spawn_link(fn -> accept(listen, connections, config) end)
 
-      {:ok,
-       %{
-         listen: listen,
-         port: port,
-         connections: connections,
-         acceptor: acceptor,
-         config: config,
-         namespaces: namespaces
-       }}
+      state = %{
+        listen: nil,
+        port: nil,
+        acceptor: nil,
+        connections: connections,
+        config: config,
+        namespaces: namespaces,
+        host: List.to_string(host),
+        socket: Keyword.take(opts, [:port, :ip, :endpoint_url])
+      }
+
+      if Keyword.get(opts, :listen, true) do
+        case open(state) do
+          {:ok, state} -> {:ok, state}
+          {:error, reason} -> {:stop, reason}
+        end
+      else
+        {:ok, state}
+      end
     else
       {:error, reason} -> {:stop, reason}
+    end
+  end
+
+  # The listening socket, and an acceptor handing each connection to a
+  # process of its own. The endpoint URL is known from here on.
+  defp open(state) do
+    port = Keyword.get(state.socket, :port, 4840)
+    ip = Keyword.get(state.socket, :ip, {0, 0, 0, 0})
+    options = [:binary, active: false, reuseaddr: true, ip: ip, nodelay: true, backlog: 128]
+
+    with {:ok, listen} <- :gen_tcp.listen(port, options),
+         {:ok, {_, port}} <- :inet.sockname(listen) do
+      url = Keyword.get(state.socket, :endpoint_url, "opc.tcp://#{state.host}:#{port}")
+
+      config = %{
+        state.config
+        | endpoint_url: url,
+          application: %{state.config.application | discovery_urls: [url]}
+      }
+
+      acceptor = spawn_link(fn -> accept(listen, state.connections, config) end)
+      {:ok, %{state | listen: listen, port: port, acceptor: acceptor, config: config}}
     end
   end
 
@@ -670,6 +797,27 @@ defmodule OPCUA.Server do
   end
 
   @impl true
+  def handle_call(:listen, _, %{listen: nil} = state) do
+    case open(state) do
+      {:ok, state} -> {:reply, :ok, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call(:listen, _, state), do: {:reply, :ok, state}
+
+  def handle_call(:connections, _, state) do
+    pids =
+      for {_, pid, _, _} <- DynamicSupervisor.which_children(state.connections),
+          is_pid(pid),
+          do: pid
+
+    {:reply, pids, state}
+  end
+
+  def handle_call({:delete, node}, _, state),
+    do: {:reply, AddressSpace.delete(state.config.space, node), state}
+
   def handle_call(:port, _, state), do: {:reply, state.port, state}
   def handle_call(:endpoint_url, _, state), do: {:reply, state.config.endpoint_url, state}
   def handle_call(:space, _, state), do: {:reply, state.config.space, state}
@@ -746,7 +894,7 @@ defmodule OPCUA.Server do
 
   @impl true
   def terminate(_, state) do
-    :gen_tcp.close(state.listen)
+    if state.listen, do: :gen_tcp.close(state.listen)
     Process.exit(state.connections, :shutdown)
   end
 end

@@ -23,10 +23,11 @@ defmodule OPCUA.Server.Subscriptions do
   @max_publishes 10
   @retransmit 10
 
-  # DeadbandType (Part 4, 7.22.2). Percent deadbands, of an analog item's
-  # range, aren't supported.
+  # DeadbandType (Part 4, 7.22.2). A percent deadband is of the range in
+  # the item's EURange, and needs one.
   @no_deadband 0
   @absolute_deadband 1
+  @percent_deadband 2
 
   ## Subscriptions
 
@@ -667,7 +668,7 @@ defmodule OPCUA.Server.Subscriptions do
     end
   end
 
-  defp modify(item, parameters, sub, _space), do: parameters(item, parameters, sub)
+  defp modify(item, parameters, sub, space), do: parameters(item, parameters, sub, space)
 
   defp event_parameters(item, %Types.MonitoringParameters{} = p, space) do
     with {:ok, result} <- Events.check(p.filter, space) do
@@ -698,7 +699,8 @@ defmodule OPCUA.Server.Subscriptions do
                mode: create.monitoring_mode
              },
              create.requested_parameters,
-             sub
+             sub,
+             space
            ) do
       item =
         if item.mode == :disabled,
@@ -729,7 +731,7 @@ defmodule OPCUA.Server.Subscriptions do
     end
   end
 
-  defp parameters(item, %Types.MonitoringParameters{} = p, sub) do
+  defp parameters(item, %Types.MonitoringParameters{} = p, sub, space) do
     filter =
       case p.filter do
         nil ->
@@ -739,8 +741,23 @@ defmodule OPCUA.Server.Subscriptions do
         when type in [@no_deadband, @absolute_deadband] ->
           {:ok, filter}
 
-        %Types.DataChangeFilter{} ->
-          {:error, :bad_monitored_item_filter_unsupported}
+        # The same as an absolute one of that share of the range.
+        %Types.DataChangeFilter{deadband_type: @percent_deadband, deadband_value: percent} =
+            filter ->
+          case AddressSpace.property(space, item.read.node_id, "EURange") do
+            %Types.Range{low: low, high: high}
+            when is_number(low) and is_number(high) and is_number(percent) and percent >= 0 and
+                   percent <= 100 ->
+              {:ok,
+               %{
+                 filter
+                 | deadband_type: @absolute_deadband,
+                   deadband_value: (high - low) * percent / 100
+               }}
+
+            _no_range ->
+              {:error, :bad_deadband_filter_invalid}
+          end
 
         _ ->
           {:error, :bad_monitored_item_filter_unsupported}

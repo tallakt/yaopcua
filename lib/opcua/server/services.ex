@@ -595,7 +595,7 @@ defmodule OPCUA.Server.Services do
            args,
          comment = comment && comment.text,
          {:ok, condition} <- check_event(method, condition, event_id, state.config.space),
-         :ok <- if(method == @acknowledge, do: acknowledged(condition, comment), else: :ok) do
+         :ok <- if(method == @acknowledge, do: ask(condition, :acknowledge, comment), else: :ok) do
       changes =
         if method == @acknowledge, do: [acked: true, comment: comment], else: [comment: comment]
 
@@ -609,14 +609,19 @@ defmodule OPCUA.Server.Services do
   defp condition_method(method, condition, [], _session, state) do
     enable = method == @enable
 
-    if condition.enabled == enable,
-      do: %Types.CallMethodResult{
-        status_code:
-          StatusCode.code(
-            if(enable, do: :bad_condition_already_enabled, else: :bad_condition_already_disabled)
-          )
-      },
-      else: update(condition, [enabled: enable], state)
+    cond do
+      condition.enabled == enable ->
+        already =
+          if enable, do: :bad_condition_already_enabled, else: :bad_condition_already_disabled
+
+        %Types.CallMethodResult{status_code: StatusCode.code(already)}
+
+      true ->
+        case ask(condition, :enable, enable) do
+          :ok -> update(condition, [enabled: enable], state)
+          {:error, status} -> %Types.CallMethodResult{status_code: StatusCode.code(status)}
+        end
+    end
   end
 
   defp condition_method(_, _, args, _, _), do: arguments_status(args, 0)
@@ -629,18 +634,23 @@ defmodule OPCUA.Server.Services do
 
   defp check_event(@add_comment, _, _, _), do: {:error, :bad_event_id_unknown}
 
-  # The application hears of an acknowledgement first, and may refuse it.
-  defp acknowledged(%{acknowledge: nil}, _), do: :ok
+  # The application hears of an acknowledgement, or an enable or disable,
+  # first, and may refuse it.
+  defp ask(condition, callback, argument) do
+    case Map.fetch!(condition, callback) do
+      nil ->
+        :ok
 
-  defp acknowledged(%{acknowledge: fun} = condition, comment) do
-    case fun.(comment) do
-      :ok -> :ok
-      {:error, status} when is_atom(status) -> {:error, status}
+      fun ->
+        case fun.(argument) do
+          :ok -> :ok
+          {:error, status} when is_atom(status) -> {:error, status}
+        end
     end
   rescue
     exception ->
       Logger.error(
-        "OPC UA acknowledge of #{condition.id} failed: " <>
+        "OPC UA #{callback} of #{condition.id} failed: " <>
           Exception.format(:error, exception, __STACKTRACE__)
       )
 

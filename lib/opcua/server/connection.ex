@@ -45,6 +45,9 @@ defmodule OPCUA.Server.Connection do
   end
 
   @impl true
+  def handle_call(:sessions, _from, state), do: {:reply, map_size(state.sessions), state}
+
+  @impl true
   # The acceptor hands the socket over, then says go.
   def handle_info(:go, state) do
     :ok = :inet.setopts(state.socket, active: :once)

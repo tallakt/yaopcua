@@ -19,6 +19,7 @@ defmodule OPCUA.Server.AddressSpace do
   @type t :: %__MODULE__{nodes: :ets.tid(), values: :ets.tid()}
 
   @has_subtype NodeIds.node_id!("HasSubtype")
+  @has_property NodeIds.node_id!("HasProperty")
   @has_type_definition NodeIds.node_id!("HasTypeDefinition")
   @hierarchical NodeIds.node_id!("HierarchicalReferences")
 
@@ -115,6 +116,75 @@ defmodule OPCUA.Server.AddressSpace do
 
   @doc false
   def put_value(space, node_id, value), do: :ets.insert(space.values, {node_id, value})
+
+  @doc false
+  # Removes a node and the nodes below it by hierarchical references, with
+  # their values and the references other nodes have to them.
+  def delete(_space, %NodeId{ns: 0}), do: {:error, :bad_no_delete_rights}
+
+  def delete(space, node_id) do
+    case get(space, node_id) do
+      nil ->
+        {:error, :bad_node_id_unknown}
+
+      node ->
+        space |> held(node, MapSet.new([node_id])) |> Enum.each(&remove(space, &1))
+        :ok
+    end
+  end
+
+  # The node and what it holds, outside namespace 0.
+  defp held(space, node, seen) do
+    Enum.reduce(node.references, seen, fn {type, target, forward}, seen ->
+      with true <- forward and target.ns != 0 and not MapSet.member?(seen, target),
+           true <- subtype?(space, type, @hierarchical),
+           %Node{} = child <- get(space, target) do
+        held(space, child, MapSet.put(seen, target))
+      else
+        _ -> seen
+      end
+    end)
+  end
+
+  defp remove(space, node_id) do
+    with %Node{references: references} <- get(space, node_id) do
+      for {type, target, forward} <- references,
+          %Node{references: theirs} <- [get(space, target)],
+          {type, node_id, not forward} in theirs,
+          do:
+            update(
+              space,
+              target,
+              &%{&1 | references: List.delete(&1.references, {type, node_id, not forward})}
+            )
+
+      :ets.delete(space.nodes, node_id)
+      :ets.delete(space.values, node_id)
+      :ets.delete(space.values, {:condition, node_id})
+    end
+  end
+
+  @doc false
+  # The value of a node's property, such as a variable's EURange, or nil.
+  def property(space, node_id, name) do
+    with %Node{references: references} <- get(space, node_id),
+         %Node{} = property <-
+           Enum.find_value(references, fn
+             {@has_property, target, true} ->
+               case get(space, target) do
+                 %Node{browse_name: %QualifiedName{name: ^name}} = property -> property
+                 _other -> nil
+               end
+
+             _other ->
+               nil
+           end),
+         %DataValue{value: %Variant{value: value}} <- value(space, property.node_id) do
+      value
+    else
+      _ -> nil
+    end
+  end
 
   @doc false
   # The current value of a variable, reading its function if it has one.

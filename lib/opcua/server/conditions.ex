@@ -7,11 +7,16 @@ defmodule OPCUA.Server.Conditions do
   # clients mostly look at.
   #
   # A condition is retained, and reported by ConditionRefresh, while it's
-  # enabled and either active or not yet acknowledged.
+  # enabled and either active or not yet acknowledged. A disabled one
+  # reports no events, but the one saying it's disabled, until it's enabled
+  # again (Part 9, 4.4).
   #
-  # Not supported: Confirm, shelving, suppression, silencing, latching,
-  # branches, the fields of specific alarm types (such as limits), and
-  # Acknowledge method nodes on each condition; clients call the type's.
+  # Suppression is the application's: it sets `suppressed:`, which
+  # SuppressedState and SuppressedOrShelved show.
+  #
+  # Not supported: Confirm, shelving, silencing, latching, branches, the
+  # fields of specific alarm types (such as limits), and Acknowledge method
+  # nodes on each condition; clients call the type's.
 
   alias OPCUA.{LocalizedText, NodeId, NodeIds, QualifiedName, Variant}
   alias OPCUA.Server.{AddressSpace, Events, Node}
@@ -38,7 +43,8 @@ defmodule OPCUA.Server.Conditions do
   @two_states [
     {"EnabledState", :enabled, "Enabled", "Disabled"},
     {"ActiveState", :active, "Active", "Inactive"},
-    {"AckedState", :acked, "Acknowledged", "Unacknowledged"}
+    {"AckedState", :acked, "Acknowledged", "Unacknowledged"},
+    {"SuppressedState", :suppressed, "Suppressed", "Unsuppressed"}
   ]
 
   @doc false
@@ -65,13 +71,15 @@ defmodule OPCUA.Server.Conditions do
       enabled: true,
       active: false,
       acked: true,
+      suppressed: false,
       severity: severity,
       last_severity: severity,
       message: Keyword.get(opts, :message, name),
       comment: nil,
       user: nil,
       event_id: nil,
-      acknowledge: Keyword.get(opts, :acknowledge)
+      acknowledge: Keyword.get(opts, :acknowledge),
+      enable: Keyword.get(opts, :enable)
     }
 
     with %Node{} = source_node <-
@@ -177,20 +185,23 @@ defmodule OPCUA.Server.Conditions do
             do: Map.put_new(changes, :acked, false),
             else: changes
 
-        new =
-          Map.merge(
-            old,
-            Map.take(changes, [:enabled, :active, :acked, :severity, :message, :comment, :user])
-          )
-
+        changed = [:enabled, :active, :acked, :suppressed, :severity, :message, :comment, :user]
+        new = Map.merge(old, Map.take(changes, changed))
         new = if new.severity != old.severity, do: %{new | last_severity: old.severity}, else: new
 
-        if new == old do
-          :unchanged
-        else
-          event = event(space, new)
-          put(space, %{new | event_id: Events.id(event)})
-          {:ok, event}
+        cond do
+          new == old ->
+            :unchanged
+
+          # Kept quietly, and reported when the condition is enabled again.
+          not old.enabled and not new.enabled ->
+            put(space, new)
+            :unchanged
+
+          true ->
+            event = event(space, new)
+            put(space, %{new | event_id: Events.id(event)})
+            {:ok, event}
         end
     end
   end
@@ -234,7 +245,7 @@ defmodule OPCUA.Server.Conditions do
            value: state.comment && %LocalizedText{text: state.comment}
          }},
         {"ClientUserId", %Variant{type: :string, value: state.user}},
-        {"SuppressedOrShelved", %Variant{type: :boolean, value: false}}
+        {"SuppressedOrShelved", %Variant{type: :boolean, value: state.suppressed}}
       ] ++ two_states
 
     event = Events.new(space, state.type, state.source, state.message, state.severity, fields)
