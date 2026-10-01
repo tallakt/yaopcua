@@ -27,20 +27,13 @@ defmodule OPCUA.CertificateTest do
     refute Certificate.trusted?(cert, [])
     assert Certificate.trusted?(cert, :any)
 
-    %{cert: ca, key: ca_key} = :public_key.pkix_test_root_cert("Plant CA", [])
-    {signed, _} = signed_by(ca, ca_key)
-    assert Certificate.trusted?(signed, [ca])
-    refute Certificate.trusted?(signed, [other])
-  end
-
-  defp signed_by(ca, ca_key) do
-    {cert, key} = Certificate.self_signed("urn:signed")
-    # Re-sign the same certificate with the CA as issuer.
-    otp = :public_key.pkix_decode_cert(cert, :otp)
-    tbs = elem(otp, 1)
-    issuer = :public_key.pkix_decode_cert(ca, :otp) |> elem(1) |> elem(6)
-    tbs = tbs |> put_elem(4, issuer)
-    {:public_key.pkix_sign(tbs, ca_key), key}
+    # A CA and a certificate it signed, made by :public_key so that the
+    # chain is one every OTP release validates.
+    rsa = [key: {:rsa, 2048, 65_537}, digest: :sha256]
+    chain = :public_key.pkix_test_data(%{root: rsa, peer: rsa})
+    [ca | _] = chain[:cacerts]
+    assert Certificate.trusted?(chain[:cert], [ca])
+    refute Certificate.trusted?(chain[:cert], [other])
   end
 
   test "an expired certificate isn't trusted" do

@@ -20,6 +20,7 @@
 - Limits on what clients can take (`:limits` of `OPCUA.Server`): connections,
   message size, memory per connection, sessions, subscriptions and
   monitored items, and timeouts for opening a channel and a session.
+- Runs on Elixir 1.15 and later (0.1.0 needed 1.18), checked by CI.
 
 ### Security
 
@@ -48,10 +49,6 @@
 - A null or array method argument is a type mismatch, and so is an array
   where Acknowledge, AddComment or ConditionRefresh take one value.
 - `add_condition/4` takes a condition type as a node id string.
-
-## 0.1.1
-
-- Runs on Elixir 1.15 and later, checked by CI.
 
 ## 0.1.0
 
