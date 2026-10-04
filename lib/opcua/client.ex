@@ -235,7 +235,7 @@ defmodule OPCUA.Client do
   # mismatch rather than the caller's mistake to raise for.
   defp typed(type, value) do
     variant = %Variant{type: type, value: value}
-    OPCUA.Binary.encode(variant, :variant)
+    _ = OPCUA.Binary.encode(variant, :variant)
     {:ok, variant}
   rescue
     ArgumentError -> {:error, :bad_type_mismatch}
@@ -531,19 +531,24 @@ defmodule OPCUA.Client do
 
       case request(client, monitored) do
         {:ok, %{results: results}} ->
-          failed =
-            for {handle, %{status_code: status}} <- Enum.zip(handles, results || []),
-                StatusCode.bad?(status),
-                do: {handle, status}
-
-          if failed != [], do: GenServer.cast(client, {:failed, sub, failed})
+          report_failed(client, sub, handles, results)
           {:ok, sub}
 
         error ->
-          unsubscribe(client, sub)
+          _ = unsubscribe(client, sub)
           error
       end
     end
+  end
+
+  # The items the server wouldn't create are reported to the subscriber.
+  defp report_failed(client, sub, handles, results) do
+    failed =
+      for {handle, %{status_code: status}} <- Enum.zip(handles, results || []),
+          StatusCode.bad?(status),
+          do: {handle, status}
+
+    if failed != [], do: GenServer.cast(client, {:failed, sub, failed})
   end
 
   @doc "Deletes a subscription. The subscriber gets no more messages from it."
@@ -564,7 +569,7 @@ defmodule OPCUA.Client do
   A response whose service result is Bad, or a ServiceFault, is
   `{:error, status}`.
   """
-  @spec request(client, struct, timeout) :: {:ok, struct} | error
+  @spec request(client, struct, timeout | nil) :: {:ok, struct} | error
   def request(client, request, timeout \\ nil) do
     unless is_map_key(request, :request_header) do
       raise ArgumentError, "not a service request: #{inspect(request)}"
@@ -652,10 +657,11 @@ defmodule OPCUA.Client do
         with {:ok, endpoints} <- endpoints(url, timeout: timeout),
              %{server_certificate: certificate} <-
                Enum.find(endpoints, &(&1.security_policy_uri == uri and &1.security_mode == mode)) ||
-                 {:error, :bad_security_policy_rejected} do
-          if OPCUA.Certificate.trusted?(certificate, Keyword.fetch!(opts, :trust)),
-            do: {:ok, certificate},
-            else: {:error, :bad_certificate_untrusted}
+                 {:error, :bad_security_policy_rejected},
+             true <-
+               OPCUA.Certificate.trusted?(certificate, Keyword.fetch!(opts, :trust)) ||
+                 {:error, :bad_certificate_untrusted} do
+          {:ok, certificate}
         end
 
       certificate ->
@@ -737,22 +743,7 @@ defmodule OPCUA.Client do
   def handle_cast({:failed, sub, failed}, state) do
     case state.subscriptions do
       %{^sub => %{pid: pid}} ->
-        items =
-          Enum.reduce(failed, state.items, fn {handle, status}, items ->
-            case Map.pop(items, handle) do
-              {{^sub, {:value, node}}, items} ->
-                send(pid, {__MODULE__, sub, {:value, node, %DataValue{status: status}}})
-                items
-
-              {{^sub, {:events, _}}, items} ->
-                send(pid, {__MODULE__, sub, {:status, status_name(status)}})
-                items
-
-              {_, items} ->
-                items
-            end
-          end)
-
+        items = Enum.reduce(failed, state.items, &fail_item(&1, &2, sub, pid))
         {:noreply, %{state | items: items}}
 
       _ ->
@@ -827,6 +818,22 @@ defmodule OPCUA.Client do
   def handle_info({:session_lost, status}, state), do: {:stop, {:shutdown, status}, state}
   def handle_info({:EXIT, _, reason}, state), do: {:stop, reason, state}
 
+  # An item the server wouldn't create: the subscriber hears of it, with its status.
+  defp fail_item({handle, status}, items, sub, pid) do
+    case Map.pop(items, handle) do
+      {{^sub, {:value, node}}, items} ->
+        send(pid, {__MODULE__, sub, {:value, node, %DataValue{status: status}}})
+        items
+
+      {{^sub, {:events, _}}, items} ->
+        send(pid, {__MODULE__, sub, {:status, status_name(status)}})
+        items
+
+      {_, items} ->
+        items
+    end
+  end
+
   defp chunks(chunks, state), do: Enum.reduce_while(chunks, {:noreply, state}, &chunk/2)
 
   defp chunk({:error, _, body}, {:noreply, state}) do
@@ -857,7 +864,7 @@ defmodule OPCUA.Client do
         state
 
       {{{tag, type}, timer}, pending} ->
-        if timer, do: Process.cancel_timer(timer)
+        _ = if timer, do: Process.cancel_timer(timer)
         reply = with {:ok, response} <- reply, do: result(response, type)
 
         handle_reply(%{state | pending: pending}, tag, reply)
@@ -1037,7 +1044,7 @@ defmodule OPCUA.Client do
         do: GenServer.reply(from, {:error, :bad_connection_closed})
 
     # {:shutdown, reason} means the connection is already broken.
-    if reason in [:normal, :shutdown], do: close_session(state)
+    _ = if reason in [:normal, :shutdown], do: close_session(state)
 
     :gen_tcp.close(state.socket)
   end

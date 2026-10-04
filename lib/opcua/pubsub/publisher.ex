@@ -108,7 +108,7 @@ defmodule OPCUA.PubSub.Publisher do
 
       writer ->
         try do
-          check(writer, values)
+          _ = check(writer, values)
 
           writers =
             for w <- state.writers,
@@ -198,7 +198,7 @@ defmodule OPCUA.PubSub.Publisher do
     }
 
     try do
-      check(writer, values)
+      _ = check(writer, values)
       {message, %{writer | sent: values, sequence: sequence}}
     rescue
       # A value from :read that doesn't fit its type: this writer's message

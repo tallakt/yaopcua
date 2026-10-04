@@ -19,7 +19,24 @@ defmodule OPCUA.MixProject do
           "without C in the BEAM.",
       package: package(),
       source_url: @source_url,
-      docs: docs()
+      docs: docs(),
+      # Schema and NodeSet run while compiling, where coverage can't see them; HostileServer and
+      # Fuzz are the tests' own.
+      test_coverage: [
+        summary: [threshold: 80],
+        ignore_modules: [OPCUA.Schema, OPCUA.Server.NodeSet, OPCUA.HostileServer, OPCUA.Fuzz]
+      ],
+      dialyzer: [
+        # Kept between runs, and between CI jobs by its cache.
+        plt_core_path: "priv/plts",
+        plt_local_path: "priv/plts",
+        # The schema is read while compiling, with Mix and xmerl; see .dialyzer_ignore.exs.
+        plt_add_apps: [:mix],
+        ignore_warnings: ".dialyzer_ignore.exs",
+        # Not :extra_return: some specs say iodata where the function happens to return a list
+        # or a binary today.
+        flags: [:error_handling, :unmatched_returns]
+      ]
     ]
   end
 
@@ -71,7 +88,9 @@ defmodule OPCUA.MixProject do
     [
       # Only for the fuzz and property tests.
       {:stream_data, "~> 1.1", only: :test},
-      {:ex_doc, "~> 0.40", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.40", only: :dev, runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
   end
 

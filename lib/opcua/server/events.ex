@@ -122,29 +122,35 @@ defmodule OPCUA.Server.Events do
     elements = (filter.where_clause && filter.where_clause.elements) || []
 
     wheres =
-      for {element, index} <- Enum.with_index(elements) do
-        operands = element.filter_operands || []
-
-        code =
-          cond do
-            element.filter_operator not in @operators ->
-              StatusCode.code(:bad_filter_operator_unsupported)
-
-            not Enum.all?(operands, &operand?(&1, index, length(elements))) ->
-              StatusCode.code(:bad_filter_operand_invalid)
-
-            true ->
-              0
-          end
-
-        %Types.ContentFilterElementResult{status_code: code}
-      end
+      for {element, index} <- Enum.with_index(elements),
+          do: %Types.ContentFilterElementResult{
+            status_code: element_status(element, index, length(elements))
+          }
 
     result = %Types.EventFilterResult{
       select_clause_results: selects,
       where_clause_result: %Types.ContentFilterResult{element_results: wheres}
     }
 
+    checked(selects, wheres, result)
+  end
+
+  def check(_, _), do: {:error, :bad_event_filter_invalid, nil}
+
+  defp element_status(element, index, count) do
+    cond do
+      element.filter_operator not in @operators ->
+        StatusCode.code(:bad_filter_operator_unsupported)
+
+      not Enum.all?(element.filter_operands || [], &operand?(&1, index, count)) ->
+        StatusCode.code(:bad_filter_operand_invalid)
+
+      true ->
+        0
+    end
+  end
+
+  defp checked(selects, wheres, result) do
     cond do
       selects == [] ->
         {:error, :bad_event_filter_invalid, result}
@@ -159,8 +165,6 @@ defmodule OPCUA.Server.Events do
         {:ok, result}
     end
   end
-
-  def check(_, _), do: {:error, :bad_event_filter_invalid, nil}
 
   defp operand?(%Types.ElementOperand{index: target}, index, count),
     do: target > index and target < count
@@ -220,51 +224,35 @@ defmodule OPCUA.Server.Events do
 
   defp evaluate(%Types.ContentFilterElement{} = element, results, event, space) do
     value = &operand(&1, results, event, space)
-    operator = element.filter_operator
-    operands = element.filter_operands || []
-
-    case {operator, operands} do
-      {:of_type, [%Types.LiteralOperand{value: %Variant{value: type}}]} ->
-        AddressSpace.subtype?(space, event.type, type)
-
-      {:is_null, [a]} ->
-        value.(a) == nil
-
-      {:not, [a]} ->
-        value.(a) == false
-
-      {:and, [a, b]} ->
-        value.(a) == true and value.(b) == true
-
-      {:or, [a, b]} ->
-        value.(a) == true or value.(b) == true
-
-      {:equals, [a, b]} ->
-        equal?(value.(a), value.(b))
-
-      {:greater_than, [a, b]} ->
-        compare(value.(a), value.(b)) == :gt
-
-      {:less_than, [a, b]} ->
-        compare(value.(a), value.(b)) == :lt
-
-      {:greater_than_or_equal, [a, b]} ->
-        compare(value.(a), value.(b)) in [:gt, :eq]
-
-      {:less_than_or_equal, [a, b]} ->
-        compare(value.(a), value.(b)) in [:lt, :eq]
-
-      {:between, [a, low, high]} ->
-        compare(value.(a), value.(low)) in [:gt, :eq] and
-          compare(value.(a), value.(high)) in [:lt, :eq]
-
-      {:in_list, [a | list]} ->
-        Enum.any?(list, &equal?(value.(a), value.(&1)))
-
-      _ ->
-        false
-    end
+    evaluate(element.filter_operator, element.filter_operands || [], value, event, space)
   end
+
+  defp evaluate(:of_type, [%Types.LiteralOperand{value: %Variant{value: type}}], _, event, space),
+    do: AddressSpace.subtype?(space, event.type, type)
+
+  defp evaluate(:is_null, [a], value, _, _), do: value.(a) == nil
+  defp evaluate(:not, [a], value, _, _), do: value.(a) == false
+  defp evaluate(:and, [a, b], value, _, _), do: value.(a) == true and value.(b) == true
+  defp evaluate(:or, [a, b], value, _, _), do: value.(a) == true or value.(b) == true
+  defp evaluate(:equals, [a, b], value, _, _), do: equal?(value.(a), value.(b))
+  defp evaluate(:greater_than, [a, b], value, _, _), do: compare(value.(a), value.(b)) == :gt
+  defp evaluate(:less_than, [a, b], value, _, _), do: compare(value.(a), value.(b)) == :lt
+
+  defp evaluate(:greater_than_or_equal, [a, b], value, _, _),
+    do: compare(value.(a), value.(b)) in [:gt, :eq]
+
+  defp evaluate(:less_than_or_equal, [a, b], value, _, _),
+    do: compare(value.(a), value.(b)) in [:lt, :eq]
+
+  defp evaluate(:between, [a, low, high], value, _, _) do
+    compare(value.(a), value.(low)) in [:gt, :eq] and
+      compare(value.(a), value.(high)) in [:lt, :eq]
+  end
+
+  defp evaluate(:in_list, [a | list], value, _, _),
+    do: Enum.any?(list, &equal?(value.(a), value.(&1)))
+
+  defp evaluate(_operator, _operands, _value, _event, _space), do: false
 
   defp operand(%Types.LiteralOperand{value: variant}, _, _, _), do: unwrap(variant)
 

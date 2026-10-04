@@ -20,11 +20,12 @@ defmodule OPCUA.Server.Connection do
   def init({config, socket}) do
     # Whatever a client makes it do, this process takes no more than its
     # share of memory; the VM would rather close the connection.
-    Process.flag(:max_heap_size, %{
-      size: div(config.limits.connection_memory, :erlang.system_info(:wordsize)),
-      kill: true,
-      error_logger: true
-    })
+    _ =
+      Process.flag(:max_heap_size, %{
+        size: div(config.limits.connection_memory, :erlang.system_info(:wordsize)),
+        kill: true,
+        error_logger: true
+      })
 
     # It must open its secure channel in time, and then have a session.
     Process.send_after(self(), :open_timeout, config.limits.open_timeout)
@@ -203,67 +204,82 @@ defmodule OPCUA.Server.Connection do
 
   defp open(state, id, request) do
     renew = request.request_type == :renew
-    policy = state.channel.policy
-    offered = policy == :none or {policy, request.security_mode} in state.config.security
+
+    case refusal(state, request, renew) do
+      nil -> grant(state, id, request, renew)
+      status -> {:halt, {:close, send_error(state, status)}}
+    end
+  end
+
+  # Why an OpenSecureChannel request can't be granted, or nil.
+  defp refusal(state, request, renew) do
+    nonce_length = OPCUA.SecurityPolicy.nonce_length(state.channel.policy)
 
     cond do
-      renew != (state.phase == :running) ->
-        {:halt, {:close, send_error(state, :bad_request_type_invalid)}}
-
-      not offered or (policy == :none and request.security_mode != :none) ->
-        {:halt, {:close, send_error(state, :bad_security_mode_rejected)}}
-
-      renew and request.security_mode != state.channel.mode ->
-        {:halt, {:close, send_error(state, :bad_security_mode_rejected)}}
-
-      byte_size(request.client_nonce || "") != OPCUA.SecurityPolicy.nonce_length(policy) ->
-        {:halt, {:close, send_error(state, :bad_nonce_invalid)}}
-
-      true ->
-        channel_id =
-          if renew,
-            do: state.channel.channel_id,
-            else: OPCUA.Server.next_id(state.config, :channel)
-
-        lifetime = request.requested_lifetime |> max(1000) |> min(3_600_000)
-
-        token = %Types.ChannelSecurityToken{
-          channel_id: channel_id,
-          token_id: OPCUA.Server.next_id(state.config, :token),
-          created_at: DateTime.utc_now(),
-          revised_lifetime: lifetime
-        }
-
-        nonce = :crypto.strong_rand_bytes(OPCUA.SecurityPolicy.nonce_length(policy))
-
-        response = %Types.OpenSecureChannelResponse{
-          response_header: Services.header(request, 0),
-          server_protocol_version: 0,
-          security_token: token,
-          server_nonce: nonce
-        }
-
-        # The new token is used for sending at once. The spec has the server
-        # wait until the client first uses it; clients accept either, as the
-        # response that brings the token arrives before anything sent with it.
-        channel = %{
-          SecureChannel.token(state.channel, token, nonce, request.client_nonce)
-          | mode: request.security_mode
-        }
-
-        # The client should renew at 75% of the lifetime; give it until 125%.
-        # A renewal replaces the timer, so renewing often leaves none behind.
-        if state.token_timer, do: Process.cancel_timer(state.token_timer)
-
-        timer =
-          Process.send_after(self(), {:token_expired, token.token_id}, trunc(lifetime * 1.25))
-
-        unless renew,
-          do: Process.send_after(self(), :session_wait, state.config.limits.session_wait)
-
-        state = %{state | channel: channel, phase: :running, token_timer: timer}
-        {:cont, {:ok, send_response(state, :open, id, response)}}
+      renew != (state.phase == :running) -> :bad_request_type_invalid
+      not mode_allowed?(state, request, renew) -> :bad_security_mode_rejected
+      byte_size(request.client_nonce || "") != nonce_length -> :bad_nonce_invalid
+      true -> nil
     end
+  end
+
+  # A mode the server offers with the channel's policy, and on a renewal the same as before.
+  defp mode_allowed?(state, request, renew) do
+    policy = state.channel.policy
+    mode = request.security_mode
+    offered = policy == :none or {policy, mode} in state.config.security
+
+    offered and not (policy == :none and mode != :none) and
+      not (renew and mode != state.channel.mode)
+  end
+
+  defp grant(state, id, request, renew) do
+    policy = state.channel.policy
+
+    channel_id =
+      if renew,
+        do: state.channel.channel_id,
+        else: OPCUA.Server.next_id(state.config, :channel)
+
+    lifetime = request.requested_lifetime |> max(1000) |> min(3_600_000)
+
+    token = %Types.ChannelSecurityToken{
+      channel_id: channel_id,
+      token_id: OPCUA.Server.next_id(state.config, :token),
+      created_at: DateTime.utc_now(),
+      revised_lifetime: lifetime
+    }
+
+    nonce = :crypto.strong_rand_bytes(OPCUA.SecurityPolicy.nonce_length(policy))
+
+    response = %Types.OpenSecureChannelResponse{
+      response_header: Services.header(request, 0),
+      server_protocol_version: 0,
+      security_token: token,
+      server_nonce: nonce
+    }
+
+    # The new token is used for sending at once. The spec has the server
+    # wait until the client first uses it; clients accept either, as the
+    # response that brings the token arrives before anything sent with it.
+    channel = %{
+      SecureChannel.token(state.channel, token, nonce, request.client_nonce)
+      | mode: request.security_mode
+    }
+
+    # The client should renew at 75% of the lifetime; give it until 125%.
+    # A renewal replaces the timer, so renewing often leaves none behind.
+    _ = if state.token_timer, do: Process.cancel_timer(state.token_timer)
+
+    timer =
+      Process.send_after(self(), {:token_expired, token.token_id}, trunc(lifetime * 1.25))
+
+    _ =
+      unless renew,
+        do: Process.send_after(self(), :session_wait, state.config.limits.session_wait)
+
+    state = %{state | channel: channel, phase: :running, token_timer: timer}
+    {:cont, {:ok, send_response(state, :open, id, response)}}
   end
 
   defp respond(state, id, request) do
@@ -307,7 +323,7 @@ defmodule OPCUA.Server.Connection do
   defp send_response(state, kind, id, response) do
     case safe_encode(state.channel, kind, id, response) do
       {:ok, frames, channel} ->
-        :gen_tcp.send(state.socket, frames)
+        _ = :gen_tcp.send(state.socket, frames)
         %{state | channel: channel}
 
       {:error, status} ->
@@ -319,7 +335,7 @@ defmodule OPCUA.Server.Connection do
           )
 
         {:ok, frames, channel} = SecureChannel.encode(state.channel, kind, id, fault)
-        :gen_tcp.send(state.socket, frames)
+        _ = :gen_tcp.send(state.socket, frames)
         %{state | channel: channel}
     end
   end
@@ -340,10 +356,11 @@ defmodule OPCUA.Server.Connection do
   defp send_error(state, status) do
     code = StatusCode.code(status)
 
-    :gen_tcp.send(
-      state.socket,
-      Transport.frame(:error, :final, Transport.error(code, to_string(status)))
-    )
+    _ =
+      :gen_tcp.send(
+        state.socket,
+        Transport.frame(:error, :final, Transport.error(code, to_string(status)))
+      )
 
     state
   end

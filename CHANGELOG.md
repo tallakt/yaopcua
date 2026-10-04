@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The spec of `OPCUA.Client.request/3` allows its default timeout of `nil`;
+  Dialyzer took every client function that calls it to never return.
+
+### Changed
+
+- CI runs Credo and Dialyzer, and fails below 80% test coverage. Functions
+  Credo found too complex or too deeply nested are split up, with no change
+  in what they do.
+
 ## 0.2.0
 
 ### Added

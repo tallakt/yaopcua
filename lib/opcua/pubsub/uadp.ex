@@ -69,56 +69,54 @@ defmodule OPCUA.PubSub.UADP do
   @doc "Encodes a network message."
   @spec encode(t) :: iodata
   def encode(%__MODULE__{} = m) do
-    {publisher_type, publisher} =
-      case m.publisher_id do
-        nil -> {nil, nil}
-        {type, value} -> {type, value}
-      end
-
-    group = m.writer_group_id || m.group_version || m.network_message_number || m.sequence_number
-
-    extended =
-      publisher_type not in [nil, :byte] or m.dataset_class_id != nil or m.timestamp != nil or
-        m.picoseconds != nil
-
+    {publisher_type, publisher} = m.publisher_id || {nil, nil}
+    group = group?(m)
+    extended = extended?(m, publisher_type)
     payload_header = m.payload_header and m.messages != []
 
     flags =
       1 ||| bit(publisher_type, 0x10) ||| bit(group, 0x20) ||| bit(payload_header, 0x40) |||
         bit(extended, 0x80)
 
-    extended_flags =
-      if extended do
-        index = Enum.find_index(@publisher_types, &(&1 == (publisher_type || :byte)))
-
-        <<index ||| bit(m.dataset_class_id, 0x08) ||| bit(m.timestamp, 0x20) |||
-            bit(m.picoseconds, 0x40)>>
-      else
-        <<>>
-      end
-
     messages = Enum.map(m.messages, &encode_message/1)
 
     [
       <<flags>>,
-      extended_flags,
-      if(publisher_type, do: Binary.encode(publisher, publisher_type), else: []),
-      if(m.dataset_class_id, do: Binary.encode(m.dataset_class_id, :guid), else: []),
-      if(group, do: group_header(m), else: []),
-      if(payload_header,
-        do: [<<length(m.messages)>> | Enum.map(m.messages, &<<&1.writer_id::little-16>>)],
-        else: []
-      ),
-      if(m.timestamp, do: Binary.encode(m.timestamp, :date_time), else: []),
-      if(m.picoseconds, do: <<m.picoseconds::little-16>>, else: []),
+      optional(extended, fn -> extended_flags(m, publisher_type) end),
+      optional(publisher_type, fn -> Binary.encode(publisher, publisher_type) end),
+      optional(m.dataset_class_id, fn -> Binary.encode(m.dataset_class_id, :guid) end),
+      optional(group, fn -> group_header(m) end),
+      optional(payload_header, fn ->
+        [<<length(m.messages)>> | Enum.map(m.messages, &<<&1.writer_id::little-16>>)]
+      end),
+      optional(m.timestamp, fn -> Binary.encode(m.timestamp, :date_time) end),
+      optional(m.picoseconds, fn -> <<m.picoseconds::little-16>> end),
       # With more than one message, their sizes come first.
-      if(payload_header and length(messages) > 1,
-        do: Enum.map(messages, &<<IO.iodata_length(&1)::little-16>>),
-        else: []
-      ),
+      optional(payload_header and length(messages) > 1, fn ->
+        Enum.map(messages, &<<IO.iodata_length(&1)::little-16>>)
+      end),
       messages
     ]
   end
+
+  defp group?(m),
+    do: m.writer_group_id || m.group_version || m.network_message_number || m.sequence_number
+
+  defp extended?(m, publisher_type) do
+    publisher_type not in [nil, :byte] or m.dataset_class_id != nil or m.timestamp != nil or
+      m.picoseconds != nil
+  end
+
+  defp extended_flags(m, publisher_type) do
+    index = Enum.find_index(@publisher_types, &(&1 == (publisher_type || :byte)))
+
+    <<index ||| bit(m.dataset_class_id, 0x08) ||| bit(m.timestamp, 0x20) |||
+        bit(m.picoseconds, 0x40)>>
+  end
+
+  # A field that's there only when `present` is.
+  defp optional(present, _field) when present in [nil, false], do: []
+  defp optional(_present, field), do: field.()
 
   defp bit(nil, _), do: 0
   defp bit(false, _), do: 0

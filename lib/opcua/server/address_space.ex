@@ -168,23 +168,22 @@ defmodule OPCUA.Server.AddressSpace do
   # The value of a node's property, such as a variable's EURange, or nil.
   def property(space, node_id, name) do
     with %Node{references: references} <- get(space, node_id),
-         %Node{} = property <-
-           Enum.find_value(references, fn
-             {@has_property, target, true} ->
-               case get(space, target) do
-                 %Node{browse_name: %QualifiedName{name: ^name}} = property -> property
-                 _other -> nil
-               end
-
-             _other ->
-               nil
-           end),
+         %Node{} = property <- Enum.find_value(references, &named_property(space, &1, name)),
          %DataValue{value: %Variant{value: value}} <- value(space, property.node_id) do
       value
     else
       _ -> nil
     end
   end
+
+  defp named_property(space, {@has_property, target, true}, name) do
+    case get(space, target) do
+      %Node{browse_name: %QualifiedName{name: ^name}} = property -> property
+      _other -> nil
+    end
+  end
+
+  defp named_property(_space, _reference, _name), do: nil
 
   @doc false
   # The current value of a variable, reading its function if it has one.
@@ -202,7 +201,7 @@ defmodule OPCUA.Server.AddressSpace do
             end
 
           # A value that can't be encoded would break the whole response.
-          Binary.encode(variant, :variant)
+          _ = Binary.encode(variant, :variant)
           %DataValue{value: variant, source_timestamp: DateTime.utc_now()}
         rescue
           exception ->
@@ -252,36 +251,33 @@ defmodule OPCUA.Server.AddressSpace do
   defp encoding(%QualifiedName{ns: 0, name: "Default Binary"}), do: :ok
   defp encoding(_), do: {:error, :bad_data_encoding_unsupported}
 
-  defp attribute(space, node, id) do
-    case {OPCUA.AttributeId.name(id), node.class} do
-      {:node_id, _} ->
-        {:ok, %Variant{type: :node_id, value: node.node_id}}
+  defp attribute(space, node, id),
+    do: attribute(space, node, OPCUA.AttributeId.name(id), node.class)
 
-      {:node_class, class} ->
-        {:ok, %Variant{type: :int32, value: @classes[class]}}
+  # The attributes every node has, and the value; the rest are in the node's attributes.
+  defp attribute(_space, node, :node_id, _class),
+    do: {:ok, %Variant{type: :node_id, value: node.node_id}}
 
-      {:browse_name, _} ->
-        {:ok, %Variant{type: :qualified_name, value: node.browse_name}}
+  defp attribute(_space, _node, :node_class, class),
+    do: {:ok, %Variant{type: :int32, value: @classes[class]}}
 
-      {:display_name, _} ->
-        {:ok, %Variant{type: :localized_text, value: node.display_name}}
+  defp attribute(_space, node, :browse_name, _class),
+    do: {:ok, %Variant{type: :qualified_name, value: node.browse_name}}
 
-      {:description, _} ->
-        {:ok, %Variant{type: :localized_text, value: node.description}}
+  defp attribute(_space, node, :display_name, _class),
+    do: {:ok, %Variant{type: :localized_text, value: node.display_name}}
 
-      {mask, _} when mask in [:write_mask, :user_write_mask] ->
-        {:ok, %Variant{type: :uint32, value: 0}}
+  defp attribute(_space, node, :description, _class),
+    do: {:ok, %Variant{type: :localized_text, value: node.description}}
 
-      {:value, :variable} ->
-        readable(space, node)
+  defp attribute(_space, _node, mask, _class) when mask in [:write_mask, :user_write_mask],
+    do: {:ok, %Variant{type: :uint32, value: 0}}
 
-      {:value, :variable_type} ->
-        {:ok, value(space, node.node_id)}
+  defp attribute(space, node, :value, :variable), do: readable(space, node)
 
-      {name, _} ->
-        attribute(node, name)
-    end
-  end
+  defp attribute(space, node, :value, :variable_type), do: {:ok, value(space, node.node_id)}
+
+  defp attribute(_space, node, name, _class), do: attribute(node, name)
 
   defp readable(space, node) do
     if Bitwise.band(node.attributes.user_access_level, @current_read) != 0,
@@ -435,27 +431,23 @@ defmodule OPCUA.Server.AddressSpace do
   @doc false
   # Checks that a variant fits a variable's data type and value rank.
   def check(space, node, %Variant{type: type, value: value}) do
-    rank = node.attributes.value_rank
+    fits = fits?(builtin(space, node.attributes.data_type), type)
 
-    fits =
-      case builtin(space, node.attributes.data_type) do
-        :variant -> true
-        :number -> type in @numbers
-        :integer -> type in [:sbyte, :int16, :int32, :int64]
-        :unsigned -> type in [:byte, :uint16, :uint32, :uint64]
-        builtin -> type == builtin
-      end
-
-    shape =
-      cond do
-        rank == -2 -> true
-        rank == -1 -> not is_list(value)
-        rank == -3 -> true
-        true -> is_list(value)
-      end
-
-    if fits and shape, do: :ok, else: {:error, :bad_type_mismatch}
+    if fits and shape?(node.attributes.value_rank, value),
+      do: :ok,
+      else: {:error, :bad_type_mismatch}
   end
+
+  defp fits?(:variant, _type), do: true
+  defp fits?(:number, type), do: type in @numbers
+  defp fits?(:integer, type), do: type in [:sbyte, :int16, :int32, :int64]
+  defp fits?(:unsigned, type), do: type in [:byte, :uint16, :uint32, :uint64]
+  defp fits?(builtin, type), do: type == builtin
+
+  # A value rank of -2 or -3 takes a scalar or an array, -1 a scalar, and 0 and up an array.
+  defp shape?(rank, _value) when rank in [-2, -3], do: true
+  defp shape?(-1, value), do: not is_list(value)
+  defp shape?(_rank, value), do: is_list(value)
 
   # The built-in type a data type is encoded as, following HasSubtype up
   # from types like Duration (a Double) or NodeClass (an enumeration).
@@ -468,15 +460,15 @@ defmodule OPCUA.Server.AddressSpace do
   defp builtin(space, type) do
     case get(space, type) do
       %Node{references: refs} ->
-        case for({@has_subtype, super, false} <- refs, do: super) do
-          [super | _] -> builtin(space, super)
-          [] -> :variant
-        end
+        supertype(space, for({@has_subtype, super, false} <- refs, do: super))
 
       nil ->
         :variant
     end
   end
+
+  defp supertype(space, [super | _]), do: builtin(space, super)
+  defp supertype(_space, []), do: :variant
 
   ## Browse
 

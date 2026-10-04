@@ -225,19 +225,7 @@ defmodule OPCUA.Client.Connection do
 
   # The user token, and its signature for a certificate login.
   defp identity(state, created, user) do
-    policy_uri = SecurityPolicy.uri(state.security.policy)
-
-    endpoint =
-      Enum.find(
-        created.server_endpoints || [],
-        &(&1.security_policy_uri == policy_uri and &1.security_mode == state.security.mode)
-      )
-
-    tokens = (endpoint && endpoint.user_identity_tokens) || []
-
-    server_certificate =
-      created.server_certificate || state.security[:server_certificate] ||
-        (endpoint && endpoint.server_certificate)
+    {tokens, server_certificate} = endpoint(state, created)
 
     case {user, Enum.find(tokens, &(&1.token_type == token_type(user)))} do
       {:anonymous, policy} ->
@@ -250,23 +238,40 @@ defmodule OPCUA.Client.Connection do
         {:error, :bad_identity_token_rejected}
 
       {user, policy} ->
-        security = token_policy(state, policy)
-
-        cond do
-          security == nil ->
-            {:error, :bad_security_policy_rejected}
-
-          # A secret to encrypt, or a signature to make, for a server that
-          # hasn't said what its certificate is.
-          (security != :none or match?({:certificate, _, _}, user)) and
-              not is_binary(server_certificate) ->
-            {:error, :bad_certificate_invalid}
-
-          true ->
-            user_token(user, policy, security, server_certificate, state.server_nonce)
-        end
+        token(user, policy, token_policy(state, policy), server_certificate, state.server_nonce)
     end
   end
+
+  # The user token policies of the endpoint the channel was opened to, and the server's
+  # certificate, from the session, the options or that endpoint.
+  defp endpoint(state, created) do
+    policy_uri = SecurityPolicy.uri(state.security.policy)
+
+    endpoint =
+      Enum.find(
+        created.server_endpoints || [],
+        &(&1.security_policy_uri == policy_uri and &1.security_mode == state.security.mode)
+      ) || %{user_identity_tokens: nil, server_certificate: nil}
+
+    server_certificate =
+      created.server_certificate || state.security[:server_certificate] ||
+        endpoint.server_certificate
+
+    {endpoint.user_identity_tokens || [], server_certificate}
+  end
+
+  defp token(_user, _policy, nil, _server_certificate, _nonce),
+    do: {:error, :bad_security_policy_rejected}
+
+  # A secret to encrypt, or a signature to make, for a server that hasn't said what its
+  # certificate is.
+  defp token(user, _policy, security, server_certificate, _nonce)
+       when (security != :none or elem(user, 0) == :certificate) and
+              not is_binary(server_certificate),
+       do: {:error, :bad_certificate_invalid}
+
+  defp token(user, policy, security, server_certificate, nonce),
+    do: user_token(user, policy, security, server_certificate, nonce)
 
   # A token policy without a security policy of its own uses the channel's.
   defp token_policy(state, policy) do
@@ -333,22 +338,21 @@ defmodule OPCUA.Client.Connection do
   defp await(state, id) do
     with {:ok, chunk, state} <- receive_chunk(state) do
       case chunk do
-        {:error, _, body} ->
-          remote_error(body)
-
-        {kind, _, _} = chunk when kind in [:open, :message] ->
-          case SecureChannel.receive(state.channel, chunk) do
-            {:ok, channel} -> await(%{state | channel: channel}, id)
-            {:ok, {_, ^id, response}, channel} -> {:ok, response, %{state | channel: channel}}
-            {:ok, _other, channel} -> await(%{state | channel: channel}, id)
-            {:abort, ^id, status, _, _} -> {:error, status_name(status)}
-            {:abort, _, _, _, channel} -> await(%{state | channel: channel}, id)
-            {:error, _} = error -> error
-          end
-
-        _ ->
-          {:error, :bad_tcp_message_type_invalid}
+        {:error, _, body} -> remote_error(body)
+        {kind, _, _} when kind in [:open, :message] -> received(state, id, chunk)
+        _ -> {:error, :bad_tcp_message_type_invalid}
       end
+    end
+  end
+
+  defp received(state, id, chunk) do
+    case SecureChannel.receive(state.channel, chunk) do
+      {:ok, channel} -> await(%{state | channel: channel}, id)
+      {:ok, {_, ^id, response}, channel} -> {:ok, response, %{state | channel: channel}}
+      {:ok, _other, channel} -> await(%{state | channel: channel}, id)
+      {:abort, ^id, status, _, _} -> {:error, status_name(status)}
+      {:abort, _, _, _, channel} -> await(%{state | channel: channel}, id)
+      {:error, _} = error -> error
     end
   end
 
@@ -356,18 +360,17 @@ defmodule OPCUA.Client.Connection do
 
   defp receive_chunk(state) do
     case Transport.split(state.buffer, @receive_buffer) do
-      {:ok, [], rest} ->
-        case :gen_tcp.recv(state.socket, 0, state.timeout) do
-          {:ok, data} -> receive_chunk(%{state | buffer: rest <> data})
-          {:error, :timeout} -> {:error, :bad_timeout}
-          {:error, _} -> {:error, :bad_connection_closed}
-        end
+      {:ok, [], rest} -> receive_more(state, rest)
+      {:ok, chunks, rest} -> receive_chunk(%{state | chunks: chunks, buffer: rest})
+      error -> error
+    end
+  end
 
-      {:ok, chunks, rest} ->
-        receive_chunk(%{state | chunks: chunks, buffer: rest})
-
-      error ->
-        error
+  defp receive_more(state, buffer) do
+    case :gen_tcp.recv(state.socket, 0, state.timeout) do
+      {:ok, data} -> receive_chunk(%{state | buffer: buffer <> data})
+      {:error, :timeout} -> {:error, :bad_timeout}
+      {:error, _} -> {:error, :bad_connection_closed}
     end
   end
 
@@ -385,9 +388,10 @@ defmodule OPCUA.Client.Connection do
     {id, channel} = SecureChannel.next_request_id(state.channel)
     close = %Types.CloseSecureChannelRequest{request_header: header(state, 0)}
 
-    with {:ok, frames, _} <- SecureChannel.encode(channel, :close, id, close) do
-      :gen_tcp.send(state.socket, frames)
-    end
+    _ =
+      with {:ok, frames, _} <- SecureChannel.encode(channel, :close, id, close) do
+        :gen_tcp.send(state.socket, frames)
+      end
 
     :gen_tcp.close(state.socket)
   end

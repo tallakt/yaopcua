@@ -157,7 +157,7 @@ defmodule OPCUA.PubSub.Subscriber do
   defp newer?(last, sequence), do: rem(sequence - last + 0x10000, 0x10000) in 1..0x7FFF
 
   defp receive_dataset(reader, dataset, index, to) do
-    if reader.timer, do: Process.cancel_timer(reader.timer)
+    _ = if reader.timer, do: Process.cancel_timer(reader.timer)
     timer = Process.send_after(self(), {:timeout, index}, reader.timeout)
 
     reader = %{

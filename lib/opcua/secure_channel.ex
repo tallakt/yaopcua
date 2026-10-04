@@ -430,6 +430,15 @@ defmodule OPCUA.SecureChannel do
       policy == :none ->
         {:ok, %{channel | policy: :none}}
 
+      true ->
+        accept_certificate(channel, policy, certificate)
+    end
+  end
+
+  # The other side's certificate, for a policy with security: the same as before on a renewal, a
+  # key the policy allows, and trusted.
+  defp accept_certificate(channel, policy, certificate) do
+    cond do
       certificate in [nil, ""] ->
         {:error, :bad_certificate_invalid}
 
@@ -475,23 +484,25 @@ defmodule OPCUA.SecureChannel do
     signature_size = SecurityPolicy.symmetric_signature_size()
     encrypted = channel.mode == :sign_and_encrypt
 
-    with {:ok, plain} <-
-           if(encrypted,
-             do: SecurityPolicy.decrypt_symmetric(channel.policy, keys, rest),
-             else: {:ok, rest}
-           ),
+    with {:ok, plain} <- decrypted(channel, keys, rest, encrypted),
          true <- byte_size(plain) > signature_size || {:error, :bad_security_checks_failed},
          data = binary_part(plain, 0, byte_size(plain) - signature_size),
          signature = binary_part(plain, byte_size(data), signature_size),
          true <-
            :crypto.hash_equals(SecurityPolicy.mac(keys, prefix <> data), signature) ||
-             {:error, :bad_security_checks_failed} do
-      if encrypted,
-        do:
-          with({:ok, data} <- unpad(data, SecurityPolicy.block_size()), do: {:ok, channel, data}),
-        else: {:ok, channel, data}
+             {:error, :bad_security_checks_failed},
+         {:ok, data} <- unpadded(data, encrypted) do
+      {:ok, channel, data}
     end
   end
+
+  defp decrypted(channel, keys, rest, true),
+    do: SecurityPolicy.decrypt_symmetric(channel.policy, keys, rest)
+
+  defp decrypted(_channel, _keys, rest, false), do: {:ok, rest}
+
+  defp unpadded(data, true), do: unpad(data, SecurityPolicy.block_size())
+  defp unpadded(data, false), do: {:ok, data}
 
   defp check_sequence(%{receive_sequence: nil}, _), do: :ok
 

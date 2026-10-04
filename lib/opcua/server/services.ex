@@ -237,42 +237,10 @@ defmodule OPCUA.Server.Services do
          channel: channel,
          config: config
        }) do
-    password =
-      case token.encryption_algorithm do
-        # In plain text only where the endpoint doesn't ask for encryption,
-        # or the channel encrypts everything anyway.
-        algorithm when algorithm in [nil, ""] ->
-          if channel.mode == :sign_and_encrypt or token_policy(config, channel) == :none,
-            do: {:ok, token.password},
-            else: {:error, :bad_identity_token_invalid}
-
-        algorithm ->
-          case Enum.find(
-                 SecurityPolicy.all() -- [:none],
-                 &(SecurityPolicy.encryption_uri(&1) == algorithm)
-               ) do
-            nil ->
-              {:error, :bad_identity_token_invalid}
-
-            policy ->
-              SecurityPolicy.decrypt_secret(
-                policy,
-                token.password || "",
-                session.nonce,
-                config.private_key
-              )
-          end
-      end
-
-    with {:ok, password} <- password do
-      valid =
-        case config.users do
-          nil -> false
-          users when is_map(users) -> same?(Map.get(users, token.user_name), password)
-          fun when is_function(fun, 2) -> fun.(token.user_name, password) == true
-        end
-
-      if valid, do: {:ok, token.user_name}, else: {:error, :bad_user_access_denied}
+    with {:ok, password} <- password(token, session, config, channel) do
+      if user?(config.users, token.user_name, password),
+        do: {:ok, token.user_name},
+        else: {:error, :bad_user_access_denied}
     end
   end
 
@@ -281,24 +249,77 @@ defmodule OPCUA.Server.Services do
   defp login(%Types.X509IdentityToken{certificate_data: certificate}, signature, session, %{
          config: config
        }) do
+    with :ok <- user_certificate(config, certificate),
+         {:ok, policy} <- user_signature_policy(signature),
+         :ok <- user_signature(policy, config, session, certificate, signature) do
+      {:ok,
+       Certificate.application_uri(certificate) ||
+         Base.encode16(Certificate.thumbprint(certificate))}
+    end
+  end
+
+  defp login(_, _, _, _), do: {:error, :bad_identity_token_invalid}
+
+  # The password of a UserNameIdentityToken: in plain text only where the endpoint doesn't ask for
+  # encryption, or the channel encrypts everything anyway.
+  defp password(token, session, config, channel) do
+    case token.encryption_algorithm do
+      algorithm when algorithm in [nil, ""] ->
+        if channel.mode == :sign_and_encrypt or token_policy(config, channel) == :none,
+          do: {:ok, token.password},
+          else: {:error, :bad_identity_token_invalid}
+
+      algorithm ->
+        decrypt_password(token, session, config, algorithm)
+    end
+  end
+
+  defp decrypt_password(token, session, config, algorithm) do
+    case Enum.find(
+           SecurityPolicy.all() -- [:none],
+           &(SecurityPolicy.encryption_uri(&1) == algorithm)
+         ) do
+      nil ->
+        {:error, :bad_identity_token_invalid}
+
+      policy ->
+        SecurityPolicy.decrypt_secret(
+          policy,
+          token.password || "",
+          session.nonce,
+          config.private_key
+        )
+    end
+  end
+
+  defp user?(nil, _name, _password), do: false
+  defp user?(users, name, password) when is_map(users), do: same?(Map.get(users, name), password)
+  defp user?(fun, name, password) when is_function(fun, 2), do: fun.(name, password) == true
+
+  # A user certificate the server trusts.
+  defp user_certificate(config, certificate) do
+    if config.user_certificates != nil and is_binary(certificate) and
+         Certificate.trusted?(certificate, config.user_certificates),
+       do: :ok,
+       else: {:error, :bad_identity_token_rejected}
+  end
+
+  defp user_signature_policy(signature) do
     policy =
       Enum.find(
         SecurityPolicy.all() -- [:none],
         &(signature && SecurityPolicy.signature_uri(&1) == signature.algorithm)
       )
 
+    if policy != nil and is_binary(signature.signature),
+      do: {:ok, policy},
+      else: {:error, :bad_user_signature_invalid}
+  end
+
+  # An RSA key of the size the policies allow (`:any` trusts whatever certificate comes), and a
+  # signature of the server's certificate and nonce by it.
+  defp user_signature(policy, config, session, certificate, signature) do
     cond do
-      config.user_certificates == nil or not is_binary(certificate) ->
-        {:error, :bad_identity_token_rejected}
-
-      not Certificate.trusted?(certificate, config.user_certificates) ->
-        {:error, :bad_identity_token_rejected}
-
-      policy == nil or not is_binary(signature.signature) ->
-        {:error, :bad_user_signature_invalid}
-
-      # An RSA key of the size the policies allow; `:any` trusts whatever
-      # certificate comes.
       not SecurityPolicy.key_bits?(policy, Certificate.key_bits(certificate)) ->
         {:error, :bad_identity_token_rejected}
 
@@ -311,13 +332,16 @@ defmodule OPCUA.Server.Services do
         {:error, :bad_user_signature_invalid}
 
       true ->
-        {:ok,
-         Certificate.application_uri(certificate) ||
-           Base.encode16(Certificate.thumbprint(certificate))}
+        :ok
     end
   end
 
-  defp login(_, _, _, _), do: {:error, :bad_identity_token_invalid}
+  defp browse(description, session, space, max) do
+    case AddressSpace.browse(space, description) do
+      {:ok, refs} -> page(session, refs, max)
+      {:error, status} -> {%Types.BrowseResult{status_code: StatusCode.code(status)}, session}
+    end
+  end
 
   # In the same time whatever the password, so that timing gives away
   # nothing about it.
@@ -374,7 +398,7 @@ defmodule OPCUA.Server.Services do
   # Each request restarts the session's timeout, with one timer per session
   # however many requests come.
   defp touch(session) do
-    if session.timer, do: Process.cancel_timer(session.timer)
+    _ = if session.timer, do: Process.cancel_timer(session.timer)
     last = System.monotonic_time()
     message = {:session_timeout, session.auth, last}
     %{session | last: last, timer: Process.send_after(self(), message, trunc(session.timeout))}
@@ -450,15 +474,11 @@ defmodule OPCUA.Server.Services do
       max = if max in [0, nil], do: @max_references, else: min(max, @max_references)
 
       {results, session} =
-        Enum.map_reduce(request.nodes_to_browse, session, fn description, session ->
-          case AddressSpace.browse(state.config.space, description) do
-            {:ok, refs} ->
-              page(session, refs, max)
-
-            {:error, status} ->
-              {%Types.BrowseResult{status_code: StatusCode.code(status)}, session}
-          end
-        end)
+        Enum.map_reduce(
+          request.nodes_to_browse,
+          session,
+          &browse(&1, &2, state.config.space, max)
+        )
 
       {%Types.BrowseResponse{response_header: header(request, 0), results: results}, session}
     end
@@ -609,18 +629,16 @@ defmodule OPCUA.Server.Services do
   defp condition_method(method, condition, [], _session, state) do
     enable = method == @enable
 
-    cond do
-      condition.enabled == enable ->
-        already =
-          if enable, do: :bad_condition_already_enabled, else: :bad_condition_already_disabled
+    if condition.enabled == enable do
+      already =
+        if enable, do: :bad_condition_already_enabled, else: :bad_condition_already_disabled
 
-        %Types.CallMethodResult{status_code: StatusCode.code(already)}
-
-      true ->
-        case ask(condition, :enable, enable) do
-          :ok -> update(condition, [enabled: enable], state)
-          {:error, status} -> %Types.CallMethodResult{status_code: StatusCode.code(status)}
-        end
+      %Types.CallMethodResult{status_code: StatusCode.code(already)}
+    else
+      case ask(condition, :enable, enable) do
+        :ok -> update(condition, [enabled: enable], state)
+        {:error, status} -> %Types.CallMethodResult{status_code: StatusCode.code(status)}
+      end
     end
   end
 

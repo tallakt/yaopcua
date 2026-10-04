@@ -85,59 +85,7 @@ defmodule OPCUA.Server.NodeSet do
   end
 
   defp node(class, attrs, kids, aliases, structs) do
-    id = fn name, default -> if text = attrs[name], do: node_id(text, aliases), else: default end
-
-    int = fn name, default ->
-      if text = attrs[name], do: String.to_integer(text), else: default
-    end
-
-    bool = fn name, default -> if text = attrs[name], do: text == "true", else: default end
-
-    attributes =
-      case class do
-        :variable ->
-          access = int.("AccessLevel", 1)
-
-          %{
-            data_type: id.("DataType", %NodeId{id: 24}),
-            value_rank: int.("ValueRank", -1),
-            array_dimensions: dimensions(attrs["ArrayDimensions"]),
-            access_level: access,
-            user_access_level: int.("UserAccessLevel", access),
-            minimum_sampling_interval: float(attrs["MinimumSamplingInterval"] || "0"),
-            historizing: bool.("Historizing", false)
-          }
-
-        :variable_type ->
-          %{
-            data_type: id.("DataType", %NodeId{id: 24}),
-            value_rank: int.("ValueRank", -1),
-            array_dimensions: dimensions(attrs["ArrayDimensions"]),
-            is_abstract: bool.("IsAbstract", false)
-          }
-
-        :object ->
-          %{event_notifier: int.("EventNotifier", 0)}
-
-        :view ->
-          %{
-            event_notifier: int.("EventNotifier", 0),
-            contains_no_loops: bool.("ContainsNoLoops", false)
-          }
-
-        :method ->
-          %{executable: bool.("Executable", true), user_executable: bool.("UserExecutable", true)}
-
-        :reference_type ->
-          %{
-            is_abstract: bool.("IsAbstract", false),
-            symmetric: bool.("Symmetric", false),
-            inverse_name: text(kids, "InverseName")
-          }
-
-        type when type in [:object_type, :data_type] ->
-          %{is_abstract: bool.("IsAbstract", false)}
-      end
+    attributes = attributes(class, attrs, kids, aliases)
 
     refs =
       for {"References", _, list, _} <- kids, {"Reference", ref, _, target} <- list do
@@ -246,20 +194,79 @@ defmodule OPCUA.Server.NodeSet do
     structure(name, fields, structs, aliases)
   end
 
+  # The attributes of a node of each class, from its XML attributes, with the spec's defaults.
+  defp attributes(:variable, attrs, _kids, aliases) do
+    access = int(attrs, "AccessLevel", 1)
+
+    %{
+      data_type: id(attrs, "DataType", %NodeId{id: 24}, aliases),
+      value_rank: int(attrs, "ValueRank", -1),
+      array_dimensions: dimensions(attrs["ArrayDimensions"]),
+      access_level: access,
+      user_access_level: int(attrs, "UserAccessLevel", access),
+      minimum_sampling_interval: float(attrs["MinimumSamplingInterval"] || "0"),
+      historizing: bool(attrs, "Historizing", false)
+    }
+  end
+
+  defp attributes(:variable_type, attrs, _kids, aliases) do
+    %{
+      data_type: id(attrs, "DataType", %NodeId{id: 24}, aliases),
+      value_rank: int(attrs, "ValueRank", -1),
+      array_dimensions: dimensions(attrs["ArrayDimensions"]),
+      is_abstract: bool(attrs, "IsAbstract", false)
+    }
+  end
+
+  defp attributes(:object, attrs, _kids, _aliases),
+    do: %{event_notifier: int(attrs, "EventNotifier", 0)}
+
+  defp attributes(:view, attrs, _kids, _aliases) do
+    %{
+      event_notifier: int(attrs, "EventNotifier", 0),
+      contains_no_loops: bool(attrs, "ContainsNoLoops", false)
+    }
+  end
+
+  defp attributes(:method, attrs, _kids, _aliases) do
+    %{
+      executable: bool(attrs, "Executable", true),
+      user_executable: bool(attrs, "UserExecutable", true)
+    }
+  end
+
+  defp attributes(:reference_type, attrs, kids, _aliases) do
+    %{
+      is_abstract: bool(attrs, "IsAbstract", false),
+      symmetric: bool(attrs, "Symmetric", false),
+      inverse_name: text(kids, "InverseName")
+    }
+  end
+
+  defp attributes(type, attrs, _kids, _aliases) when type in [:object_type, :data_type],
+    do: %{is_abstract: bool(attrs, "IsAbstract", false)}
+
+  defp id(attrs, name, default, aliases),
+    do: if(text = attrs[name], do: node_id(text, aliases), else: default)
+
+  defp int(attrs, name, default),
+    do: if(text = attrs[name], do: String.to_integer(text), else: default)
+
+  defp bool(attrs, name, default), do: if(text = attrs[name], do: text == "true", else: default)
+
   defp structure(name, kids, structs, aliases) do
     {:struct, %{module: module, fields: fields}} = Map.fetch!(structs, name)
+    struct!(module, for(field <- fields, do: field(field, kids, structs, aliases)))
+  end
 
-    values =
-      for field <- fields do
-        xml = field.name |> Atom.to_string() |> Macro.camelize()
+  # A field of a structure, or its default when the XML leaves it out.
+  defp field(field, kids, structs, aliases) do
+    xml = field.name |> Atom.to_string() |> Macro.camelize()
 
-        case for({^xml, _, _, _} = element <- kids, do: element) do
-          [element] -> {field.name, field_value(field.type, element, structs, aliases)}
-          [] -> {field.name, field.default}
-        end
-      end
-
-    struct!(module, values)
+    case for({^xml, _, _, _} = element <- kids, do: element) do
+      [element] -> {field.name, field_value(field.type, element, structs, aliases)}
+      [] -> {field.name, field.default}
+    end
   end
 
   defp field_value({:array, type}, {_, _, items, _}, structs, aliases),

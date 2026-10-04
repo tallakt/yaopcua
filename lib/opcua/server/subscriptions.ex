@@ -147,29 +147,11 @@ defmodule OPCUA.Server.Subscriptions do
 
       sub ->
         {results, sub} =
-          Enum.map_reduce(request.items_to_modify || [], sub, fn modify, sub ->
-            case sub.items[modify.monitored_item_id] do
-              nil ->
-                {%Types.MonitoredItemModifyResult{
-                   status_code: code(:bad_monitored_item_id_invalid)
-                 }, sub}
-
-              item ->
-                case modify(item, modify.requested_parameters, sub, state.config.space) do
-                  {:ok, item} ->
-                    result = %Types.MonitoredItemModifyResult{
-                      status_code: 0,
-                      revised_sampling_interval: item.sampling * 1.0,
-                      revised_queue_size: item.queue_size
-                    }
-
-                    {result, put_in(sub.items[item.id], item)}
-
-                  {:error, status} ->
-                    {%Types.MonitoredItemModifyResult{status_code: code(status)}, sub}
-                end
-            end
-          end)
+          Enum.map_reduce(
+            request.items_to_modify || [],
+            sub,
+            &modify_item(&1, &2, state.config.space)
+          )
 
         response = %Types.ModifyMonitoredItemsResponse{
           response_header: Services.header(request, 0),
@@ -187,17 +169,11 @@ defmodule OPCUA.Server.Subscriptions do
 
       sub ->
         {results, sub} =
-          Enum.map_reduce(request.monitored_item_ids || [], sub, fn id, sub ->
-            case sub.items[id] do
-              nil ->
-                {code(:bad_monitored_item_id_invalid), sub}
-
-              item ->
-                item = %{item | mode: request.monitoring_mode}
-                item = if item.mode == :disabled, do: clear(item), else: item
-                {0, put_in(sub.items[id], item)}
-            end
-          end)
+          Enum.map_reduce(
+            request.monitored_item_ids || [],
+            sub,
+            &set_mode(&1, &2, request.monitoring_mode)
+          )
 
         {%Types.SetMonitoringModeResponse{
            response_header: Services.header(request, 0),
@@ -212,12 +188,7 @@ defmodule OPCUA.Server.Subscriptions do
         {Services.fault(request, :bad_subscription_id_invalid), session}
 
       sub ->
-        {results, sub} =
-          Enum.map_reduce(request.monitored_item_ids || [], sub, fn id, sub ->
-            if Map.has_key?(sub.items, id),
-              do: {0, %{sub | items: Map.delete(sub.items, id)}},
-              else: {code(:bad_monitored_item_id_invalid), sub}
-          end)
+        {results, sub} = Enum.map_reduce(request.monitored_item_ids || [], sub, &delete_item/2)
 
         {%Types.DeleteMonitoredItemsResponse{
            response_header: Services.header(request, 0),
@@ -281,7 +252,7 @@ defmodule OPCUA.Server.Subscriptions do
 
     if length(publishes) > @max_publishes do
       [oldest | publishes] = publishes
-      cancel(oldest)
+      _ = cancel(oldest)
 
       %{
         session
@@ -312,61 +283,105 @@ defmodule OPCUA.Server.Subscriptions do
     end
   end
 
-  defp acknowledge(acks, session) do
-    Enum.map_reduce(acks, session, fn ack, session ->
-      case session.subscriptions[ack.subscription_id] do
-        nil ->
-          {code(:bad_subscription_id_invalid), session}
+  defp modify_item(modify, sub, space) do
+    case sub.items[modify.monitored_item_id] do
+      nil ->
+        {%Types.MonitoredItemModifyResult{status_code: code(:bad_monitored_item_id_invalid)}, sub}
 
-        sub ->
-          if Map.has_key?(sub.retransmit, ack.sequence_number),
-            do:
-              {0,
-               put_in(
-                 session.subscriptions[sub.id].retransmit,
-                 Map.delete(sub.retransmit, ack.sequence_number)
-               )},
-            else: {code(:bad_sequence_number_unknown), session}
-      end
-    end)
+      item ->
+        modified(modify(item, modify.requested_parameters, sub, space), sub)
+    end
+  end
+
+  defp modified({:ok, item}, sub) do
+    result = %Types.MonitoredItemModifyResult{
+      status_code: 0,
+      revised_sampling_interval: item.sampling * 1.0,
+      revised_queue_size: item.queue_size
+    }
+
+    {result, put_in(sub.items[item.id], item)}
+  end
+
+  defp modified({:error, status}, sub),
+    do: {%Types.MonitoredItemModifyResult{status_code: code(status)}, sub}
+
+  defp set_mode(id, sub, mode) do
+    case sub.items[id] do
+      nil ->
+        {code(:bad_monitored_item_id_invalid), sub}
+
+      item ->
+        item = %{item | mode: mode}
+        item = if item.mode == :disabled, do: clear(item), else: item
+        {0, put_in(sub.items[id], item)}
+    end
+  end
+
+  defp delete_item(id, sub) do
+    if Map.has_key?(sub.items, id),
+      do: {0, %{sub | items: Map.delete(sub.items, id)}},
+      else: {code(:bad_monitored_item_id_invalid), sub}
+  end
+
+  defp acknowledge(acks, session), do: Enum.map_reduce(acks, session, &acknowledge_one/2)
+
+  defp acknowledge_one(ack, session) do
+    case session.subscriptions[ack.subscription_id] do
+      nil -> {code(:bad_subscription_id_invalid), session}
+      sub -> forget(session, sub, ack.sequence_number)
+    end
+  end
+
+  # An acknowledged notification message is no longer kept for Republish.
+  defp forget(session, sub, sequence) do
+    if Map.has_key?(sub.retransmit, sequence),
+      do:
+        {0,
+         put_in(session.subscriptions[sub.id].retransmit, Map.delete(sub.retransmit, sequence))},
+      else: {code(:bad_sequence_number_unknown), session}
   end
 
   @doc false
   # A publishing cycle of one subscription.
   def publish_cycle(session, sub_id) do
     case session.subscriptions[sub_id] do
-      nil ->
-        session
-
-      sub ->
-        schedule(session.auth, sub, :publish)
-        notifications = sub.publishing and has_notifications?(sub)
-        keep_alive = not notifications and sub.keep_alive_counter + 1 >= sub.keep_alive_count
-
-        cond do
-          (notifications or keep_alive) and session.publishes != [] ->
-            [publish | rest] = session.publishes
-            cancel(publish)
-            {sub, response} = send_cycle(sub, publish)
-
-            %{session | publishes: rest, outbox: [{publish.id, response} | session.outbox]}
-            |> put_sub(sub)
-
-          notifications or keep_alive ->
-            # Nothing to send it with; the next Publish request gets it.
-            lifetime(session, %{sub | late: true, lifetime_counter: sub.lifetime_counter + 1})
-
-          true ->
-            counter =
-              if session.publishes == [], do: sub.lifetime_counter + 1, else: sub.lifetime_counter
-
-            lifetime(session, %{
-              sub
-              | keep_alive_counter: sub.keep_alive_counter + 1,
-                lifetime_counter: counter
-            })
-        end
+      nil -> session
+      sub -> publish_cycle(session, sub, schedule(session.auth, sub, :publish))
     end
+  end
+
+  defp publish_cycle(session, sub, _timer) do
+    notifications = sub.publishing and has_notifications?(sub)
+    keep_alive = not notifications and sub.keep_alive_counter + 1 >= sub.keep_alive_count
+
+    cond do
+      (notifications or keep_alive) and session.publishes != [] ->
+        [publish | rest] = session.publishes
+        _ = cancel(publish)
+        {sub, response} = send_cycle(sub, publish)
+
+        %{session | publishes: rest, outbox: [{publish.id, response} | session.outbox]}
+        |> put_sub(sub)
+
+      notifications or keep_alive ->
+        # Nothing to send it with; the next Publish request gets it.
+        lifetime(session, %{sub | late: true, lifetime_counter: sub.lifetime_counter + 1})
+
+      true ->
+        quiet_cycle(session, sub)
+    end
+  end
+
+  # Nothing to send, and no keep-alive due yet.
+  defp quiet_cycle(session, sub) do
+    counter = if session.publishes == [], do: sub.lifetime_counter + 1, else: sub.lifetime_counter
+
+    lifetime(session, %{
+      sub
+      | keep_alive_counter: sub.keep_alive_counter + 1,
+        lifetime_counter: counter
+    })
   end
 
   # A subscription nobody has asked to publish for, for its whole lifetime, ends.
@@ -512,18 +527,16 @@ defmodule OPCUA.Server.Subscriptions do
         if targets == [] and item_id != nil do
           {:error, :bad_monitored_item_id_invalid}
         else
-          items =
-            Enum.reduce(targets, sub.items, fn {id, item}, items ->
-              # The markers get through whatever the where clause says.
-              item =
-                Enum.reduce(events, item, &queue_event(&2, &1, space, not Conditions.marker?(&1)))
-
-              Map.put(items, id, item)
-            end)
-
+          items = Enum.reduce(targets, sub.items, &refresh_item(&1, &2, events, space))
           {:ok, put_sub(session, %{sub | items: items})}
         end
     end
+  end
+
+  # The markers get through whatever the where clause says.
+  defp refresh_item({id, item}, items, events, space) do
+    item = Enum.reduce(events, item, &queue_event(&2, &1, space, not Conditions.marker?(&1)))
+    Map.put(items, id, item)
   end
 
   # When the last subscription goes, waiting Publish requests have nothing to wait for.
@@ -533,7 +546,7 @@ defmodule OPCUA.Server.Subscriptions do
   defp no_subscriptions(session) do
     outbox =
       for publish <- session.publishes do
-        cancel(publish)
+        _ = cancel(publish)
         {publish.id, Services.fault(publish.request, :bad_no_subscription)}
       end
 
@@ -556,17 +569,18 @@ defmodule OPCUA.Server.Subscriptions do
       sub ->
         now = System.monotonic_time(:millisecond)
 
-        items =
-          Map.new(sub.items, fn {id, item} ->
-            if item.kind == :value and item.mode != :disabled and now >= item.due,
-              do: {id, sample_item(%{item | due: now + item.sampling}, space)},
-              else: {id, item}
-          end)
+        items = Map.new(sub.items, fn {id, item} -> {id, sample_due(item, now, space)} end)
 
         sub = %{sub | items: items}
         schedule(session.auth, sub, :sample)
         put_sub(session, sub)
     end
+  end
+
+  defp sample_due(item, now, space) do
+    if item.kind == :value and item.mode != :disabled and now >= item.due,
+      do: sample_item(%{item | due: now + item.sampling}, space),
+      else: item
   end
 
   defp sample_item(item, space) do
@@ -732,38 +746,7 @@ defmodule OPCUA.Server.Subscriptions do
   end
 
   defp parameters(item, %Types.MonitoringParameters{} = p, sub, space) do
-    filter =
-      case p.filter do
-        nil ->
-          {:ok, nil}
-
-        %Types.DataChangeFilter{deadband_type: type} = filter
-        when type in [@no_deadband, @absolute_deadband] ->
-          {:ok, filter}
-
-        # The same as an absolute one of that share of the range.
-        %Types.DataChangeFilter{deadband_type: @percent_deadband, deadband_value: percent} =
-            filter ->
-          case AddressSpace.property(space, item.read.node_id, "EURange") do
-            %Types.Range{low: low, high: high}
-            when is_number(low) and is_number(high) and is_number(percent) and percent >= 0 and
-                   percent <= 100 ->
-              {:ok,
-               %{
-                 filter
-                 | deadband_type: @absolute_deadband,
-                   deadband_value: (high - low) * percent / 100
-               }}
-
-            _no_range ->
-              {:error, :bad_deadband_filter_invalid}
-          end
-
-        _ ->
-          {:error, :bad_monitored_item_filter_unsupported}
-      end
-
-    with {:ok, filter} <- filter do
+    with {:ok, filter} <- filter(p.filter, item, space) do
       sampling =
         if p.sampling_interval < 0,
           do: sub.interval,
@@ -780,6 +763,34 @@ defmodule OPCUA.Server.Subscriptions do
        }}
     end
   end
+
+  defp filter(nil, _item, _space), do: {:ok, nil}
+
+  defp filter(%Types.DataChangeFilter{deadband_type: type} = filter, _item, _space)
+       when type in [@no_deadband, @absolute_deadband],
+       do: {:ok, filter}
+
+  # The same as an absolute one of that share of the range.
+  defp filter(%Types.DataChangeFilter{deadband_type: @percent_deadband} = filter, item, space) do
+    percent = filter.deadband_value
+
+    case AddressSpace.property(space, item.read.node_id, "EURange") do
+      %Types.Range{low: low, high: high}
+      when is_number(low) and is_number(high) and is_number(percent) and percent >= 0 and
+             percent <= 100 ->
+        {:ok,
+         %{
+           filter
+           | deadband_type: @absolute_deadband,
+             deadband_value: (high - low) * percent / 100
+         }}
+
+      _no_range ->
+        {:error, :bad_deadband_filter_invalid}
+    end
+  end
+
+  defp filter(_other, _item, _space), do: {:error, :bad_monitored_item_filter_unsupported}
 
   ## Helpers
 

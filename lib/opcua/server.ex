@@ -276,20 +276,9 @@ defmodule OPCUA.Server do
   def add_variable(server, node, name, opts) do
     type = Keyword.fetch!(opts, :type)
     initial = Keyword.get_lazy(opts, :value, fn -> OPCUA.Binary.default(type) end)
-    array = is_list(initial) or Keyword.get(opts, :array, false)
-    access = if Keyword.get(opts, :writable, false), do: @writable, else: @readable
-
-    attributes = %{
-      data_type: %NodeId{id: OPCUA.Binary.type_id(type)},
-      value_rank: if(array, do: 1, else: -1),
-      array_dimensions: if(array, do: [0]),
-      access_level: access,
-      user_access_level: access,
-      minimum_sampling_interval: 0.0,
-      historizing: false
-    }
-
-    attributes = if write = opts[:write], do: Map.put(attributes, :write, write), else: attributes
+    attributes = variable_attributes(opts, type, initial)
+    {reference, type_definition} = variable_kind(opts)
+    variable = node_id(node)
 
     value =
       case opts[:read] do
@@ -303,17 +292,6 @@ defmodule OPCUA.Server do
           {:read, fun, type}
       end
 
-    analog = opts[:units] != nil or opts[:range] != nil
-
-    {reference, type_definition} =
-      cond do
-        opts[:property] -> {@has_property, @property_type}
-        analog -> {@has_component, @analog_item_type}
-        true -> {@has_component, @base_data_variable_type}
-      end
-
-    variable = node_id(node)
-
     with :ok <-
            add(server, variable, name, opts,
              class: :variable,
@@ -324,6 +302,32 @@ defmodule OPCUA.Server do
            ),
          :ok <- units(server, variable, opts[:units]) do
       range(server, variable, opts[:range])
+    end
+  end
+
+  defp variable_attributes(opts, type, initial) do
+    array = is_list(initial) or Keyword.get(opts, :array, false)
+    access = if Keyword.get(opts, :writable, false), do: @writable, else: @readable
+
+    attributes = %{
+      data_type: %NodeId{id: OPCUA.Binary.type_id(type)},
+      value_rank: if(array, do: 1, else: -1),
+      array_dimensions: if(array, do: [0]),
+      access_level: access,
+      user_access_level: access,
+      minimum_sampling_interval: 0.0,
+      historizing: false
+    }
+
+    if write = opts[:write], do: Map.put(attributes, :write, write), else: attributes
+  end
+
+  # A property, an AnalogItem (one with units or a range), or a plain variable.
+  defp variable_kind(opts) do
+    cond do
+      opts[:property] -> {@has_property, @property_type}
+      opts[:units] != nil or opts[:range] != nil -> {@has_component, @analog_item_type}
+      true -> {@has_component, @base_data_variable_type}
     end
   end
 
@@ -379,9 +383,8 @@ defmodule OPCUA.Server do
              attributes: attributes,
              reference: @has_component
            ),
-         :ok <- arguments(server, method, "InputArguments", inputs),
-         :ok <- arguments(server, method, "OutputArguments", outputs) do
-      :ok
+         :ok <- arguments(server, method, "InputArguments", inputs) do
+      arguments(server, method, "OutputArguments", outputs)
     end
   end
 
@@ -550,20 +553,21 @@ defmodule OPCUA.Server do
 
     # Checked here, so a bad value raises in the caller rather than
     # breaking the responses of clients that read it.
-    case AddressSpace.get(space, node) do
-      %Node{class: :variable} = variable when value.value != nil ->
-        if AddressSpace.check(space, variable, value.value) != :ok,
-          do: raise(ArgumentError, "#{inspect(value.value)} doesn't fit variable #{node}")
+    _ =
+      case AddressSpace.get(space, node) do
+        %Node{class: :variable} = variable when value.value != nil ->
+          if AddressSpace.check(space, variable, value.value) != :ok,
+            do: raise(ArgumentError, "#{inspect(value.value)} doesn't fit variable #{node}")
 
-        # This raises for a value outside its type, such as 300 as a Byte.
-        OPCUA.Binary.encode(value.value, :variant)
+          # This raises for a value outside its type, such as 300 as a Byte.
+          OPCUA.Binary.encode(value.value, :variant)
 
-      %Node{class: :variable} ->
-        :ok
+        %Node{class: :variable} ->
+          :ok
 
-      _ ->
-        raise ArgumentError, "no variable #{node}"
-    end
+        _ ->
+          raise ArgumentError, "no variable #{node}"
+      end
 
     AddressSpace.put_value(space, node, value)
     :ok
@@ -605,75 +609,76 @@ defmodule OPCUA.Server do
     Process.flag(:trap_exit, true)
     limits = Map.new(Keyword.merge(@limits, Keyword.get(opts, :limits, [])))
 
-    with {:ok, connections} <-
-           DynamicSupervisor.start_link(strategy: :one_for_one, max_children: limits.connections) do
-      {:ok, host} = :inet.gethostname()
-      application_uri = Keyword.get(opts, :application_uri, "urn:yaopcua:server")
-      space = AddressSpace.new()
-      security = security(opts)
-
-      {certificate, private_key} =
-        case {opts[:certificate], opts[:private_key]} do
-          {nil, _} ->
-            # Only made when something needs it: making an RSA key takes a moment.
-            if Enum.any?(security, &(&1 != {:none, :none})) or opts[:user_certificates],
-              do:
-                OPCUA.Certificate.self_signed(application_uri,
-                  hostnames: [List.to_string(host), "localhost"]
-                ),
-              else: {nil, nil}
-
-          pair ->
-            pair
-        end
-
-      config = %{
-        space: space,
-        # Known once the server listens.
-        endpoint_url: nil,
-        application: %Types.ApplicationDescription{
-          application_uri: application_uri,
-          product_uri: "urn:yaopcua",
-          application_name: %LocalizedText{text: Keyword.get(opts, :product_name, "yaopcua")},
-          application_type: :server,
-          discovery_urls: []
-        },
-        anonymous: Keyword.get(opts, :anonymous, true),
-        users: Keyword.get(opts, :users),
-        security: security,
-        certificate: certificate,
-        private_key: private_key,
-        trust: Keyword.get(opts, :trust, []),
-        user_certificates: opts[:user_certificates],
-        ids: :atomics.new(map_size(@ids), signed: false),
-        limits: limits,
-        server: self()
-      }
-
-      namespaces = ["http://opcfoundation.org/UA/", application_uri]
-      server_nodes(space, config, namespaces)
-
-      state = %{
-        listen: nil,
-        port: nil,
-        acceptor: nil,
-        connections: connections,
-        config: config,
-        namespaces: namespaces,
-        host: List.to_string(host),
-        socket: Keyword.take(opts, [:port, :ip, :endpoint_url])
-      }
-
-      if Keyword.get(opts, :listen, true) do
-        case open(state) do
-          {:ok, state} -> {:ok, state}
-          {:error, reason} -> {:stop, reason}
-        end
-      else
-        {:ok, state}
-      end
-    else
+    case DynamicSupervisor.start_link(strategy: :one_for_one, max_children: limits.connections) do
+      {:ok, connections} -> init(opts, limits, connections)
       {:error, reason} -> {:stop, reason}
+    end
+  end
+
+  defp init(opts, limits, connections) do
+    {:ok, host} = :inet.gethostname()
+    application_uri = Keyword.get(opts, :application_uri, "urn:yaopcua:server")
+    space = AddressSpace.new()
+    security = security(opts)
+    {certificate, private_key} = own_certificate(opts, security, application_uri, host)
+
+    config = %{
+      space: space,
+      # Known once the server listens.
+      endpoint_url: nil,
+      application: %Types.ApplicationDescription{
+        application_uri: application_uri,
+        product_uri: "urn:yaopcua",
+        application_name: %LocalizedText{text: Keyword.get(opts, :product_name, "yaopcua")},
+        application_type: :server,
+        discovery_urls: []
+      },
+      anonymous: Keyword.get(opts, :anonymous, true),
+      users: Keyword.get(opts, :users),
+      security: security,
+      certificate: certificate,
+      private_key: private_key,
+      trust: Keyword.get(opts, :trust, []),
+      user_certificates: opts[:user_certificates],
+      ids: :atomics.new(map_size(@ids), signed: false),
+      limits: limits,
+      server: self()
+    }
+
+    namespaces = ["http://opcfoundation.org/UA/", application_uri]
+    server_nodes(space, config, namespaces)
+
+    state = %{
+      listen: nil,
+      port: nil,
+      acceptor: nil,
+      connections: connections,
+      config: config,
+      namespaces: namespaces,
+      host: List.to_string(host),
+      socket: Keyword.take(opts, [:port, :ip, :endpoint_url])
+    }
+
+    if Keyword.get(opts, :listen, true), do: started(open(state)), else: {:ok, state}
+  end
+
+  defp started({:ok, state}), do: {:ok, state}
+  defp started({:error, reason}), do: {:stop, reason}
+
+  # The server's certificate and key, given or, only when something needs them, made: making an
+  # RSA key takes a moment.
+  defp own_certificate(opts, security, application_uri, host) do
+    case {opts[:certificate], opts[:private_key]} do
+      {nil, _} ->
+        if Enum.any?(security, &(&1 != {:none, :none})) or opts[:user_certificates],
+          do:
+            OPCUA.Certificate.self_signed(application_uri,
+              hostnames: [List.to_string(host), "localhost"]
+            ),
+          else: {nil, nil}
+
+      pair ->
+        pair
     end
   end
 
@@ -775,7 +780,7 @@ defmodule OPCUA.Server do
 
           {:error, :max_children} ->
             error = Transport.error(:bad_max_connections_reached, "too many connections")
-            :gen_tcp.send(socket, Transport.frame(:error, :final, error))
+            _ = :gen_tcp.send(socket, Transport.frame(:error, :final, error))
             :gen_tcp.close(socket)
 
           _ ->
@@ -855,7 +860,7 @@ defmodule OPCUA.Server do
         Keyword.get(opts, :fields, [])
       )
 
-    broadcast(state, event)
+    _ = broadcast(state, event)
     {:reply, :ok, state}
   end
 
@@ -866,7 +871,7 @@ defmodule OPCUA.Server do
   def handle_call({:condition, node, changes}, _, state) do
     case Conditions.update(state.config.space, node, changes) do
       {:ok, event} ->
-        broadcast(state, event)
+        _ = broadcast(state, event)
         {:reply, :ok, state}
 
       :unchanged ->

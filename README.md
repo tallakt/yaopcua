@@ -456,6 +456,10 @@ FUZZ_RUNS=10000 mix test test/opcua/fuzz_test.exs   # cases per property
 FUZZ_SECONDS=600 mix test test/opcua/fuzz_test.exs  # or seconds per property
 ```
 
+CI also runs [Credo](https://github.com/rrrene/credo) and
+[Dialyzer](https://github.com/jeremyjh/dialyxir), and on the newest Elixir
+`mix test --cover` fails below 80% of the code covered (about 88% is).
+
 `test/opcua/hardening_test.exs` has a test for each attack under
 [Hostile clients and networks](#hostile-clients-and-networks).
 

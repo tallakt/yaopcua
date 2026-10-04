@@ -89,7 +89,7 @@ defmodule OPCUA.Server.Conditions do
       if source_node.class == :object, do: AddressSpace.notify_events(space, source)
 
       put(space, state)
-      children(space, id)
+      _ = children(space, id)
       :ok
     end
   end
@@ -99,7 +99,7 @@ defmodule OPCUA.Server.Conditions do
   defp children(space, id) do
     for {name, key, yes, no} <- @two_states do
       node = child(space, id, id, {name, :two_state, :localized_text, &text(&1[key], yes, no)})
-      child(space, id, node, {"Id", :property, :boolean, & &1[key]})
+      _ = child(space, id, node, {"Id", :property, :boolean, & &1[key]})
     end
 
     properties = [
@@ -178,16 +178,7 @@ defmodule OPCUA.Server.Conditions do
         {:error, :bad_node_id_unknown}
 
       old ->
-        changes = Map.new(changes)
-        # A condition that becomes active needs acknowledging, unless told otherwise.
-        changes =
-          if changes[:active] == true and not old.active,
-            do: Map.put_new(changes, :acked, false),
-            else: changes
-
-        changed = [:enabled, :active, :acked, :suppressed, :severity, :message, :comment, :user]
-        new = Map.merge(old, Map.take(changes, changed))
-        new = if new.severity != old.severity, do: %{new | last_severity: old.severity}, else: new
+        new = changed(old, Map.new(changes))
 
         cond do
           new == old ->
@@ -204,6 +195,18 @@ defmodule OPCUA.Server.Conditions do
             {:ok, event}
         end
     end
+  end
+
+  # A condition that becomes active needs acknowledging, unless told otherwise.
+  defp changed(old, changes) do
+    changes =
+      if changes[:active] == true and not old.active,
+        do: Map.put_new(changes, :acked, false),
+        else: changes
+
+    changed = [:enabled, :active, :acked, :suppressed, :severity, :message, :comment, :user]
+    new = Map.merge(old, Map.take(changes, changed))
+    if new.severity != old.severity, do: %{new | last_severity: old.severity}, else: new
   end
 
   @doc false

@@ -46,6 +46,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-
 
+      - name: Restore dialyzer PLT cache
+        if: matrix.elixir == '1.19'
+        uses: actions/cache@v4
+        with:
+          path: priv/plts
+          key: ${{ runner.os }}-plt-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-plt-${{ matrix.elixir }}-${{ matrix.otp }}-
+
       - name: Install dependencies
         run: mix deps.get
 
@@ -55,5 +64,20 @@ jobs:
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
 
+      - name: Credo
+        if: matrix.elixir == '1.19'
+        run: mix credo
+
+      - name: Dialyzer
+        if: matrix.elixir == '1.19'
+        run: mkdir -p priv/plts && mix dialyzer --format github
+
+      # Coverage is counted differently from one Elixir version to the next, so its threshold is
+      # held on the newest.
       - name: Run tests
+        if: matrix.elixir != '1.19'
         run: mix test
+
+      - name: Run tests, with coverage
+        if: matrix.elixir == '1.19'
+        run: mix test --cover
