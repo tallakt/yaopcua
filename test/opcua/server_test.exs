@@ -257,8 +257,14 @@ defmodule OPCUA.ServerTest do
     assert Client.call(client, "ns=2;s=Pump1", "ns=2;s=Pump1.Multiply", [6, 7, 8]) ==
              {:error, :bad_too_many_arguments}
 
+    # The client sends plain values as the method's types, and refuses one that doesn't fit.
     assert Client.call(client, "ns=2;s=Pump1", "ns=2;s=Pump1.Multiply", [6, 7.0]) ==
-             {:error, :bad_invalid_argument}
+             {:error, :bad_type_mismatch}
+
+    assert Client.call(client, "ns=2;s=Pump1", "ns=2;s=Pump1.Multiply", [
+             6,
+             %Variant{type: :double, value: 7.0}
+           ]) == {:error, :bad_invalid_argument}
 
     assert Client.call(client, "ns=2;s=Pump1", "ns=2;s=Pump1.Multiply", [6, 0]) ==
              {:error, :bad_out_of_range}
@@ -273,6 +279,51 @@ defmodule OPCUA.ServerTest do
 
     assert {:ok, [%Types.Argument{name: "a"}, %Types.Argument{name: "b"}]} =
              Client.read(client, "ns=2;s=Pump1.Multiply.InputArguments")
+  end
+
+  test "plain arguments go as the types the method declares", %{server: server, client: client} do
+    :ok =
+      Server.add_method(server, "ns=2;s=Pump1.Configure", "Configure",
+        parent: "ns=2;s=Pump1",
+        inputs: [{"severity", :uint16}, {"ratio", :float}, {"mode", :byte}, {"name", :string}],
+        outputs: [{"seen", :string}],
+        call: fn args -> {:ok, [inspect(args)]} end
+      )
+
+    configure = &Client.call(client, "ns=2;s=Pump1", "ns=2;s=Pump1.Configure", &1)
+    assert configure.([700, 0.5, 3, "P1"]) == {:ok, [~s([700, 0.5, 3, "P1"])]}
+
+    # Read once, then remembered.
+    method = NodeId.parse!("ns=2;s=Pump1.Configure")
+    assert :sys.get_state(client).types[{:arguments, method}] == [:uint16, :float, :byte, :string]
+
+    assert configure.([70_000, 0.5, 3, "P1"]) == {:error, :bad_type_mismatch}
+    assert configure.([700, 0.5, "3", "P1"]) == {:error, :bad_type_mismatch}
+
+    # Variants go as they are, among plain values or alone.
+    assert configure.([%Variant{type: :uint16, value: 1}, 0.25, 4, "P2"]) ==
+             {:ok, [~s([1, 0.25, 4, "P2"])]}
+
+    assert configure.([%Variant{type: :int32, value: 1}, 0.25, 4, "P2"]) ==
+             {:error, :bad_invalid_argument}
+  end
+
+  test "a method without input arguments gets plain values as they look", %{
+    server: server,
+    client: client
+  } do
+    :ok =
+      Server.add_method(server, "ns=2;s=Pump1.Stop", "Stop",
+        parent: "ns=2;s=Pump1",
+        call: fn [] -> {:ok, []} end
+      )
+
+    assert Client.call(client, "ns=2;s=Pump1", "ns=2;s=Pump1.Stop", []) == {:ok, []}
+
+    assert Client.call(client, "ns=2;s=Pump1", "ns=2;s=Pump1.Stop", [1]) ==
+             {:error, :bad_too_many_arguments}
+
+    assert :sys.get_state(client).types[{:arguments, NodeId.parse!("ns=2;s=Pump1.Stop")}] == []
   end
 
   test "a null or array argument is a type mismatch", %{client: client} do

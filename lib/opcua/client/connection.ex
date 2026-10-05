@@ -175,6 +175,7 @@ defmodule OPCUA.Client.Connection do
     }
 
     with {:ok, created, state} <- exchange(state, create),
+         :ok <- session_certificate(state.security, created.server_certificate),
          :ok <- server_signature(state, created, nonce),
          state = %{
            state
@@ -194,6 +195,28 @@ defmodule OPCUA.Client.Connection do
       {:ok, %{state | server_nonce: activated.server_nonce}}
     end
   end
+
+  @doc false
+  # The certificate a server answers CreateSession with must be the one the
+  # secure channel was opened to; either may be followed by its chain.
+  def session_certificate(%{policy: :none}, _), do: :ok
+  def session_certificate(_security, empty) when empty in [nil, ""], do: :ok
+
+  def session_certificate(security, certificate) do
+    if leaf(certificate) == leaf(security.server_certificate),
+      do: :ok,
+      else: {:error, :bad_certificate_invalid}
+  end
+
+  # The first certificate of a chain, certificates one after another in DER
+  # (Part 6, 6.2.3).
+  defp leaf(<<0x30, 0x82, length::16, _::binary>> = der) when byte_size(der) >= length + 4,
+    do: binary_part(der, 0, length + 4)
+
+  defp leaf(<<0x30, 0x83, length::24, _::binary>> = der) when byte_size(der) >= length + 5,
+    do: binary_part(der, 0, length + 5)
+
+  defp leaf(der), do: der
 
   # The server proves it holds its certificate's key by signing ours and our nonce.
   defp server_signature(%{security: %{policy: :none}}, _, _), do: :ok
@@ -223,11 +246,14 @@ defmodule OPCUA.Client.Connection do
     }
   end
 
-  # The user token, and its signature for a certificate login.
+  # The user token, and its signature for a certificate login. Of the server's
+  # token policies for the kind of login, the first whose security policy the
+  # client has: servers often list Basic256 before Basic256Sha256.
   defp identity(state, created, user) do
     {tokens, server_certificate} = endpoint(state, created)
+    tokens = Enum.filter(tokens, &(&1.token_type == token_type(user)))
 
-    case {user, Enum.find(tokens, &(&1.token_type == token_type(user)))} do
+    case {user, Enum.find(tokens, &token_policy(state, &1)) || List.first(tokens)} do
       {:anonymous, policy} ->
         {:ok,
          %Types.AnonymousIdentityToken{
@@ -243,7 +269,8 @@ defmodule OPCUA.Client.Connection do
   end
 
   # The user token policies of the endpoint the channel was opened to, and the server's
-  # certificate, from the session, the options or that endpoint.
+  # certificate: the one the channel was opened to, or over None the one the session or
+  # the endpoint gives.
   defp endpoint(state, created) do
     policy_uri = SecurityPolicy.uri(state.security.policy)
 
@@ -254,7 +281,7 @@ defmodule OPCUA.Client.Connection do
       ) || %{user_identity_tokens: nil, server_certificate: nil}
 
     server_certificate =
-      created.server_certificate || state.security[:server_certificate] ||
+      state.security[:server_certificate] || created.server_certificate ||
         endpoint.server_certificate
 
     {endpoint.user_identity_tokens || [], server_certificate}

@@ -3,6 +3,8 @@ defmodule OPCUA.CertificateTest do
 
   alias OPCUA.Certificate
 
+  doctest Certificate
+
   @moduletag :tmp_dir
 
   test "a self-signed certificate carries the application URI and host names" do

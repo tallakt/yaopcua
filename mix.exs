@@ -20,11 +20,18 @@ defmodule OPCUA.MixProject do
       package: package(),
       source_url: @source_url,
       docs: docs(),
-      # Schema and NodeSet run while compiling, where coverage can't see them; HostileServer and
-      # Fuzz are the tests' own.
+      # Schema and NodeSet run while compiling, where coverage can't see them; HostileServer,
+      # Fuzz, Plant and Open62541 are the tests' own.
       test_coverage: [
         summary: [threshold: 80],
-        ignore_modules: [OPCUA.Schema, OPCUA.Server.NodeSet, OPCUA.HostileServer, OPCUA.Fuzz]
+        ignore_modules: [
+          OPCUA.Schema,
+          OPCUA.Server.NodeSet,
+          OPCUA.HostileServer,
+          OPCUA.Fuzz,
+          OPCUA.Plant,
+          OPCUA.Open62541
+        ]
       ],
       dialyzer: [
         # Kept between runs, and between CI jobs by its cache.

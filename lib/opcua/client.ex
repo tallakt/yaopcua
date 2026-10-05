@@ -38,8 +38,20 @@ defmodule OPCUA.Client do
   in `:sign_and_encrypt` mode encrypts, everything it exchanges with the
   server. It needs the server's certificate, given as `:server_certificate`
   or fetched from the server's endpoints and checked against `:trust`, and a
-  certificate of its own for the server to trust. Passwords are encrypted
-  for the server whenever it asks, even over a None channel.
+  certificate of its own for the server to trust.
+
+  A fetched certificate must also name the application URI the server
+  presents (`{:error, :bad_certificate_uri_invalid}`), and, when the server
+  is trusted through a CA rather than by its own certificate, the host in
+  the URL (`{:error, :bad_certificate_host_name_invalid}`). A CA vouches for
+  every device it signed, so the host name, or `:server_uri`, is what tells
+  plc1 from plc2. `:verify` turns either check on or off, for devices whose
+  certificates don't name what they should.
+
+  Passwords are encrypted for the server whenever it asks, even over a None
+  channel. There the client takes the server's certificate on its word,
+  which keeps the password from eavesdroppers but not from a machine in the
+  middle; use a secure policy where that matters.
 
   ## Options
 
@@ -50,6 +62,10 @@ defmodule OPCUA.Client do
       `:basic256sha256` (with `:sign_and_encrypt`), or `{policy, mode}`
     * `:trust` - the server certificates to trust, or `:any`
     * `:server_certificate` - the server's certificate, instead of fetching it
+    * `:server_uri` - the application URI the server's certificate must name
+    * `:verify` - the certificate checks beyond trust: `uri:` (default true)
+      and `host_name:` (default true for a server trusted through a CA,
+      false for a certificate trusted by itself or under `trust: :any`)
     * `:certificate`, `:private_key` - the client's own; a self-signed one is
       made for the connection if not given
     * `:timeout` - how long a request may take, in ms (default 5000)
@@ -69,7 +85,7 @@ defmodule OPCUA.Client do
 
   alias OPCUA.{DataValue, NodeId, NodeIds, QualifiedName, SecureChannel, StatusCode}
   alias OPCUA.{Transport, Variant}
-  alias OPCUA.Client.Connection
+  alias OPCUA.Client.{Arguments, Connection}
   alias OPCUA.Types
 
   # Read to keep the session alive.
@@ -113,6 +129,17 @@ defmodule OPCUA.Client do
          not Keyword.has_key?(opts, :trust) do
       raise ArgumentError,
             "a secure connection needs :server_certificate, or :trust (a list of certificates, or :any)"
+    end
+
+    verify = Keyword.get(opts, :verify, [])
+
+    unless Keyword.keyword?(verify) and
+             Enum.all?(
+               verify,
+               &match?({key, bool} when key in [:uri, :host_name] and is_boolean(bool), &1)
+             ) do
+      raise ArgumentError,
+            ":verify takes uri: and host_name:, each true or false, got: #{inspect(verify)}"
     end
 
     opts
@@ -297,23 +324,95 @@ defmodule OPCUA.Client do
   @doc """
   Calls a method on an object, returning its output arguments.
 
-  Arguments are `OPCUA.Variant`s, or plain values: integers go as Int32,
-  floats as Double, and strings, booleans and `DateTime`s as themselves. Use a
-  variant when the method wants another type.
+  Arguments are `OPCUA.Variant`s, sent as they are, or plain values. For
+  plain values the client reads the method's InputArguments once to learn the
+  types it declares, and remembers them for later calls: 700 goes as a UInt16
+  to a method that wants one, and a value that doesn't fit its type is
+  `{:error, :bad_type_mismatch}`. Where the method leaves a type open
+  (BaseDataType, Number, a structure, or a type of another namespace than 0),
+  integers go as Int32, floats as Double, and strings, booleans and
+  `DateTime`s as themselves.
   """
   @spec call(client, node_ref, node_ref, [term]) :: {:ok, [term]} | error
   def call(client, object, method, args \\ []) do
-    call = %Types.CallMethodRequest{
-      object_id: node_id(object),
-      method_id: node_id(method),
-      input_arguments: Enum.map(args, &infer/1)
-    }
+    method = node_id(method)
 
-    with {:ok, %{results: [result]}} <-
+    with {:ok, input_arguments} <- arguments(client, method, args),
+         call = %Types.CallMethodRequest{
+           object_id: node_id(object),
+           method_id: method,
+           input_arguments: input_arguments
+         },
+         {:ok, %{results: [result]}} <-
            request(client, %Types.CallRequest{methods_to_call: [call]}) do
       if StatusCode.bad?(result.status_code),
         do: {:error, status_name(result.status_code)},
         else: {:ok, Enum.map(result.output_arguments || [], &unwrap/1)}
+    end
+  end
+
+  defp arguments(client, method, args) do
+    if Enum.all?(args, &match?(%Variant{}, &1)),
+      do: {:ok, args},
+      else: typed_arguments(args, argument_types(client, method))
+  end
+
+  defp typed_arguments(args, types) do
+    types = types ++ List.duplicate(nil, max(length(args) - length(types), 0))
+
+    args
+    |> Enum.zip(types)
+    |> Enum.reduce_while({:ok, []}, fn {arg, type}, {:ok, acc} ->
+      case argument(arg, type) do
+        {:ok, variant} -> {:cont, {:ok, [variant | acc]}}
+        error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, acc} -> {:ok, Enum.reverse(acc)}
+      error -> error
+    end
+  end
+
+  # Variants as they are, plain values as the declared type, or where the
+  # method leaves it open, as they look.
+  defp argument(%Variant{} = variant, _type), do: {:ok, variant}
+  defp argument(value, nil), do: {:ok, infer(value)}
+  defp argument(value, type), do: typed(type, value)
+
+  # A method's argument types, read once and remembered with the nodes'. A
+  # method without InputArguments has none; a failed read is tried again on
+  # the next call.
+  defp argument_types(client, method) do
+    case GenServer.call(client, {:type, {:arguments, method}}) do
+      nil ->
+        case read_argument_types(client, method) do
+          {:ok, types} ->
+            GenServer.cast(client, {:type, {:arguments, method}, types})
+            types
+
+          :error ->
+            []
+        end
+
+      types ->
+        types
+    end
+  end
+
+  defp read_argument_types(client, method) do
+    case request(client, Arguments.find(method)) do
+      {:ok, %{results: [%{status_code: 0, targets: [%{target_id: target} | _]}]}} ->
+        case read(client, %NodeId{ns: target.ns, id: target.id}) do
+          {:ok, arguments} -> {:ok, Arguments.types(arguments)}
+          _ -> :error
+        end
+
+      {:ok, %{results: [_]}} ->
+        {:ok, []}
+
+      _ ->
+        :error
     end
   end
 
@@ -653,21 +752,55 @@ defmodule OPCUA.Client do
     case opts[:server_certificate] do
       nil ->
         uri = OPCUA.SecurityPolicy.uri(policy)
+        trust = Keyword.fetch!(opts, :trust)
 
         with {:ok, endpoints} <- endpoints(url, timeout: timeout),
-             %{server_certificate: certificate} <-
+             %{server_certificate: certificate} = endpoint <-
                Enum.find(endpoints, &(&1.security_policy_uri == uri and &1.security_mode == mode)) ||
                  {:error, :bad_security_policy_rejected},
              true <-
-               OPCUA.Certificate.trusted?(certificate, Keyword.fetch!(opts, :trust)) ||
-                 {:error, :bad_certificate_untrusted} do
+               OPCUA.Certificate.trusted?(certificate, trust) ||
+                 {:error, :bad_certificate_untrusted},
+             :ok <- server_uri(certificate, endpoint.server, opts),
+             :ok <- host_name(certificate, url, trust == :any or certificate in trust, opts) do
           {:ok, certificate}
         end
 
       certificate ->
-        {:ok, certificate}
+        with :ok <- server_uri(certificate, nil, opts),
+             :ok <- host_name(certificate, url, true, opts),
+             do: {:ok, certificate}
     end
   end
+
+  # The certificate must name the application URI the server presents in its
+  # endpoints, and the one in :server_uri if given.
+  defp server_uri(certificate, description, opts) do
+    named = OPCUA.Certificate.application_uri(certificate)
+    presented = description && description.application_uri
+    expected = opts[:server_uri]
+
+    cond do
+      expected != nil and named != expected -> {:error, :bad_certificate_uri_invalid}
+      description == nil or not verify?(opts, :uri, true) -> :ok
+      named != nil and named == presented -> :ok
+      true -> {:error, :bad_certificate_uri_invalid}
+    end
+  end
+
+  # The certificate must name the host in the URL. Checked by default when
+  # the server is trusted through a CA: a certificate trusted by itself, or
+  # under trust: :any, says who the server is already.
+  defp host_name(certificate, url, pinned, opts) do
+    {:ok, {host, _port}} = Transport.endpoint(url)
+
+    if not verify?(opts, :host_name, not pinned) or
+         OPCUA.Certificate.names_host?(certificate, host),
+       do: :ok,
+       else: {:error, :bad_certificate_host_name_invalid}
+  end
+
+  defp verify?(opts, check, default), do: Keyword.get(opts[:verify] || [], check, default)
 
   @impl true
   def init(opts) do

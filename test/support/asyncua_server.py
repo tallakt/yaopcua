@@ -4,6 +4,8 @@
 # arguments, it offers the secure policies as well as None.
 import asyncio, sys
 from asyncua import Server, ua, uamethod
+from asyncua.crypto import uacrypto
+from cryptography import x509
 from asyncua.server.user_managers import UserManager
 from asyncua.crypto.permission_rules import User, UserRole
 
@@ -31,6 +33,10 @@ async def main(port, certificate=None, key=None):
     if certificate:
         await server.load_certificate(certificate)
         await server.load_private_key(key)
+        # Clients check that the certificate names the URI the server presents.
+        cert = await uacrypto.load_certificate(certificate)
+        names = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        await server.set_application_uri(names.get_values_for_type(x509.UniformResourceIdentifier)[0])
         server.set_security_policy([ua.SecurityPolicyType.NoSecurity] + [p for p in ua.SecurityPolicyType if p.name.startswith(("Basic256Sha256", "Aes"))])
     else:
         server.set_security_policy([ua.SecurityPolicyType.NoSecurity])

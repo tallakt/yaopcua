@@ -2,7 +2,37 @@
 
 ## Unreleased
 
+### Changed
+
+- `OPCUA.Client.call/4` sends plain arguments as the types the method
+  declares, read once from its InputArguments and remembered, the way
+  `write/3` sends values as the node's type. Strict servers such as
+  open62541 refused a plain 700 for a UInt16 argument, sent as Int32. A
+  value that doesn't fit is `{:error, :bad_type_mismatch}`; variants go as
+  given, and where a method leaves a type open, plain values go as before.
+- The client checks that a server's certificate names the application URI
+  the server presents (`:bad_certificate_uri_invalid`), and, when it's
+  trusted through a CA, the host in the URL
+  (`:bad_certificate_host_name_invalid`). `verify: [uri: false]` or
+  `verify: [host_name: true | false]` changes that; `:server_uri` names the
+  URI to expect. The certificate a server answers CreateSession with must be
+  the channel's.
+- `OPCUA.Server` presents its certificate's application URI unless
+  `:application_uri` is given, and refuses to start with one the
+  certificate doesn't name.
+
+### Added
+
+- `OPCUA.Certificate.names_host?/2`.
+- Interop tests against open62541, with and without security, and against the
+  Prosys OPC UA Simulation Server (`mix test --only prosys`).
+
 ### Fixed
+
+- A username or certificate login used the first token policy the server
+  listed for it, and failed with `:bad_security_policy_rejected` when that
+  was one the client doesn't have; servers such as Prosys's list Basic256
+  before Basic256Sha256. It now uses the first the client has.
 
 - The spec of `OPCUA.Client.request/3` allows its default timeout of `nil`;
   Dialyzer took every client function that calls it to never return.

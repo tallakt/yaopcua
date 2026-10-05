@@ -67,7 +67,9 @@ defmodule OPCUA.Server do
     * `:ip` - the address to listen on (default all)
     * `:endpoint_url` - the URL the server gives clients (default
       `opc.tcp://<hostname>:<port>`)
-    * `:application_uri`, `:product_name` - how the server presents itself
+    * `:application_uri`, `:product_name` - how the server presents itself;
+      the application URI is the certificate's by default, or
+      `"urn:yaopcua:server"`, and must be the one the certificate names
     * `:anonymous` - whether clients may log in without a user (default true)
     * `:users` - a map of usernames to passwords, or a function of username
       and password returning true for a valid login
@@ -148,6 +150,15 @@ defmodule OPCUA.Server do
     if secure and not Keyword.has_key?(opts, :trust) do
       raise ArgumentError,
             "a secure server needs :trust, the client certificates to trust (a list, or :any)"
+    end
+
+    # Clients check that the certificate names the URI the server presents.
+    with cert when is_binary(cert) <- opts[:certificate],
+         uri when is_binary(uri) <- opts[:application_uri],
+         named when is_binary(named) and named != uri <- OPCUA.Certificate.application_uri(cert) do
+      raise ArgumentError,
+            "the certificate names the application URI #{inspect(named)}, " <>
+              "but :application_uri is #{inspect(uri)}"
     end
 
     opts
@@ -617,7 +628,12 @@ defmodule OPCUA.Server do
 
   defp init(opts, limits, connections) do
     {:ok, host} = :inet.gethostname()
-    application_uri = Keyword.get(opts, :application_uri, "urn:yaopcua:server")
+
+    application_uri =
+      opts[:application_uri] ||
+        (opts[:certificate] && OPCUA.Certificate.application_uri(opts[:certificate])) ||
+        "urn:yaopcua:server"
+
     space = AddressSpace.new()
     security = security(opts)
     {certificate, private_key} = own_certificate(opts, security, application_uri, host)

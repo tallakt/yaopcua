@@ -168,6 +168,35 @@ defmodule OPCUA.Certificate do
     _ -> nil
   end
 
+  @doc """
+  Whether the certificate names a host, a DNS name or an IP address, in its
+  subject alternative name, as a client connecting to that host expects of a
+  server's (RFC 6125, with wildcards such as `*.plant.local`).
+
+      iex> {cert, _} = OPCUA.Certificate.self_signed("urn:plc1", hostnames: ["plc1", "10.0.0.5"])
+      iex> OPCUA.Certificate.names_host?(cert, "plc1")
+      true
+      iex> OPCUA.Certificate.names_host?(cert, "10.0.0.5")
+      true
+      iex> OPCUA.Certificate.names_host?(cert, "plc2")
+      false
+  """
+  @spec names_host?(t, String.t() | charlist) :: boolean
+  def names_host?(der, host) do
+    host = to_charlist(host)
+
+    reference =
+      case :inet.parse_strict_address(host) do
+        {:ok, ip} -> [ip: ip]
+        {:error, _} -> [dns_id: host]
+      end
+
+    :public_key.pkix_verify_hostname(der, reference)
+  rescue
+    # A peer's certificate is whatever it sent.
+    _ -> false
+  end
+
   @doc "The application URI in the certificate's subject alternative name, or nil."
   @spec application_uri(t) :: String.t() | nil
   def application_uri(der) do

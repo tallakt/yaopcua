@@ -58,7 +58,7 @@ end
 | `read_many/3` | reads several nodes, with status and timestamps (`OPCUA.DataValue`) |
 | `write/3`, `write_many/2` | writes plain values in the node's own type (the client reads the node once to learn it), or `OPCUA.Variant`s as given |
 | `browse/3` | lists a node's references, following continuation points |
-| `call/4` | calls a method and returns its outputs |
+| `call/4` | calls a method and returns its outputs; plain arguments go as the types the method declares (read once from its InputArguments), `OPCUA.Variant`s as given |
 | `subscribe/3` | sends the subscriber each change of some values, optionally with a deadband |
 | `subscribe_events/2` | sends the subscriber the events a node reports, with the fields asked for, optionally only of one type |
 | `acknowledge/4`, `refresh/2` | acknowledges an alarm; asks for the standing alarms again (ConditionRefresh) |
@@ -177,13 +177,15 @@ OPCUA.Certificate.write_key("server.pem", key)
 
 | | Client | Server |
 |---|---|---|
-| Channels | the policy and mode asked for; the server's certificate must be in `:trust` | an endpoint per policy and mode in `:security`; the client's certificate must be in `:trust` |
-| Sessions | checks the server's signature, signs its own | checks the client's signature and application URI, signs its own |
-| Passwords | encrypted for the server whenever it asks, even over None | decrypted; over None it asks for its strongest policy |
+| Channels | the policy and mode asked for; the server's certificate must be in `:trust`, name the application URI the server presents (and `:server_uri` if given), and, when trusted through a CA, the host in the URL | an endpoint per policy and mode in `:security`; the client's certificate must be in `:trust` |
+| Sessions | checks the server's signature, and that its certificate is the channel's; signs its own | checks the client's signature and application URI, signs its own |
+| Passwords | encrypted for the server whenever it asks, even over None, where the server's certificate is taken on its word | decrypted; over None it asks for its strongest policy |
 | User certificates | signs with the user's key | accepts those in `:user_certificates` |
 
 A secure client or server won't start without being told what to trust
-(`:trust`, a list of certificates or `:any`). See
+(`:trust`, a list of certificates or `:any`). The client's `verify:` option
+turns the URI and host name checks on or off, for devices whose certificates
+don't name what they should. See
 [What's missing](#whats-missing) for the policies and certificate handling
 that aren't there.
 
@@ -347,8 +349,6 @@ out on purpose, this is what it doesn't do, by area.
   certificate.
 - Revocation lists, a rejected-certificate folder, and certificate management
   from a Global Discovery Server.
-- The client trusts the server's certificate by the trust list alone; it
-  doesn't compare the certificate's host names or URI with the endpoint.
 - RSA-OAEP goes through functions OTP 27 deprecates (see `OPCUA.SecurityPolicy`).
 
 **Client**
@@ -405,16 +405,18 @@ out on purpose, this is what it doesn't do, by area.
 - Event datasets: decoded, but not published or passed on.
 
 **Quality**
-- Tested against asyncua only, not against open62541, the OPC Foundation's
-  .NET stack, real PLCs, or the Compliance Test Tool.
+- Tested against asyncua, open62541 and Prosys, not against the OPC
+  Foundation's .NET stack, real PLCs, or the Compliance Test Tool.
 - Fuzzed in runs of hours, not continuously the way OSS-Fuzz fuzzes
   open62541, and without coverage guidance.
 - Performance hasn't been measured.
 
 ## Tests
 
-yaopcua is tested against [asyncua](https://github.com/FreeOpcUa/opcua-asyncio),
-a Python OPC UA stack written independently of this one, in two ways:
+yaopcua is tested against two OPC UA stacks written independently of this one:
+[asyncua](https://github.com/FreeOpcUa/opcua-asyncio), in Python, and
+[open62541](https://github.com/open62541/open62541), in C. Against asyncua, in
+two ways:
 
 * `test/vectors/asyncua.txt` holds about 1,200 structures encoded by asyncua.
   yaopcua must decode each one and encode it back to the same bytes. These run
@@ -429,7 +431,42 @@ a Python OPC UA stack written independently of this one, in two ways:
   ASYNCUA_PYTHON=~/.venvs/asyncua/bin/python mix test
   ```
 
-Python only ever runs in tests, never inside yaopcua.
+The open62541 tests do the same against a peer in
+`test/support/open62541_peer.c`, built when the tests start. They run where
+open62541's library is found, through pkg-config, in the usual places, or
+under `OPEN62541_PREFIX`. Homebrew's is built without encryption, so it runs
+them over None only; for the secure ones, build open62541 with OpenSSL:
+
+```
+brew install open62541 && mix test     # without security
+
+git clone --depth 1 --branch v1.5.9 --recurse-submodules https://github.com/open62541/open62541
+cmake -S open62541 -B build -DBUILD_SHARED_LIBS=ON \
+  -DUA_ENABLE_ENCRYPTION=OPENSSL -DUA_ENABLE_SUBSCRIPTIONS_EVENTS=ON \
+  -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) -DCMAKE_INSTALL_PREFIX=$HOME/.local/open62541
+cmake --build build && cmake --install build
+OPEN62541_PREFIX=$HOME/.local/open62541 mix test
+```
+
+Python and C only ever run in tests, in processes of their own, never inside
+yaopcua.
+
+`test/opcua/prosys_test.exs` runs against the
+[Prosys OPC UA Simulation Server](https://www.prosysopc.com/products/opc-ua-simulation-server/),
+a commercial Java stack, with its address space as it comes: every built-in
+type, structures, arrays, methods, the simulation's changing values, and
+every policy and mode. It needs the server running, so it runs only when
+asked:
+
+```
+mix test --only prosys
+```
+
+`PROSYS_URL` points it at another endpoint. The secure tests use a client
+certificate kept in `_build/test/prosys`, which Prosys rejects the first
+time: trust it on Prosys's Certificates tab and run again, or leave them out
+with `--exclude prosys_secure`. `PROSYS_USER=name:password`, for a user added
+on Prosys's Users tab, adds username logins.
 
 `test/opcua/fuzz_test.exs` fuzzes with
 [StreamData](https://github.com/whatyouhide/stream_data), in the spirit of
