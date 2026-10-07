@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 ### Changed
 
@@ -24,6 +24,9 @@
 ### Added
 
 - `OPCUA.Certificate.names_host?/2`.
+- `OPCUA.Server.put/3` stores a data value as it is, without the checks of
+  `set/3`, for an application that has checked its values and sets many of
+  them often.
 - Interop tests against open62541, with and without security, and against the
   Prosys OPC UA Simulation Server (`mix test --only prosys`).
 

@@ -187,6 +187,25 @@ defmodule OPCUA.ServerTest do
     assert_raise ArgumentError, fn -> Server.set(server, "ns=2;s=Nope", 1) end
   end
 
+  test "the application puts a value it has checked itself, as it is", %{
+    server: server,
+    client: client
+  } do
+    space = Server.space(server)
+    %OPCUA.DataValue{value: variant} = value = Server.get(server, "ns=2;s=Pump1.Speed")
+
+    assert Server.put(space, "ns=2;s=Pump1.Speed", %{value | value: %{variant | value: 1900}}) ==
+             :ok
+
+    assert Client.read(client, "ns=2;s=Pump1.Speed") == {:ok, 1900}
+
+    assert Server.put(server, "ns=2;s=Pump1.Speed", %{value | value: %{variant | value: 2000}}) ==
+             :ok
+
+    assert Client.read(client, "ns=2;s=Pump1.Speed") == {:ok, 2000}
+    assert_raise FunctionClauseError, fn -> Server.put(space, "ns=2;s=Pump1.Speed", 2100) end
+  end
+
   test "browses children, and pages many of them with continuation points", %{
     server: server,
     client: client

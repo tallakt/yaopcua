@@ -586,6 +586,23 @@ defmodule OPCUA.Server do
 
   def set(server, node, value), do: set(space(server), node, value)
 
+  @doc """
+  Stores an `OPCUA.DataValue` as the value of a variable, as it is. Nothing is
+  checked: a value that doesn't fit the variable, or a node that isn't one,
+  breaks the responses of the clients that read it, where `set/3` raises here.
+
+  For an application that has checked its values itself and sets many of
+  them often, each scan of a control program for one, with `space/1`: what
+  `set/3` checks is most of what setting a value costs.
+  """
+  @spec put(server, node_ref, DataValue.t()) :: :ok
+  def put(%AddressSpace{} = space, node, %DataValue{} = value) do
+    AddressSpace.put_value(space, node_id(node), value)
+    :ok
+  end
+
+  def put(server, node, %DataValue{} = value), do: put(space(server), node, value)
+
   defp type(space, node) do
     case AddressSpace.get(space, node) do
       %Node{class: :variable, attributes: %{data_type: %NodeId{ns: 0, id: id}}}
