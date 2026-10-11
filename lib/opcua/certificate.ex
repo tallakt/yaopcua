@@ -42,6 +42,10 @@ defmodule OPCUA.Certificate do
   Record.defrecordp(:validity, :Validity, Record.extract(:Validity, from_lib: @hrl))
   Record.defrecordp(:extension, :Extension, Record.extract(:Extension, from_lib: @hrl))
 
+  # The NULL parameters an RSA algorithm identifier carries (RFC 4055), DER-encoded: OTP 28's
+  # public_key no longer encodes the atom :NULL, and this form encodes the same on OTP 27.
+  @null {:asn1_OPENTYPE, <<5, 0>>}
+
   @sha256_rsa {1, 2, 840, 113_549, 1, 1, 11}
   @rsa {1, 2, 840, 113_549, 1, 1, 1}
   @common_name {2, 5, 4, 3}
@@ -98,7 +102,7 @@ defmodule OPCUA.Certificate do
       tbs_certificate(
         version: :v3,
         serialNumber: :binary.decode_unsigned(:crypto.strong_rand_bytes(16)),
-        signature: {:SignatureAlgorithm, @sha256_rsa, :NULL},
+        signature: {:SignatureAlgorithm, @sha256_rsa, @null},
         issuer: subject,
         validity:
           validity(
@@ -108,7 +112,7 @@ defmodule OPCUA.Certificate do
         subject: subject,
         subjectPublicKeyInfo:
           key_info(
-            algorithm: {:PublicKeyAlgorithm, @rsa, :NULL},
+            algorithm: {:PublicKeyAlgorithm, @rsa, @null},
             subjectPublicKey: public
           ),
         extensions: [

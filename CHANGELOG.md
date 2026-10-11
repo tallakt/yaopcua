@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1
+
+### Fixed
+
+- `OPCUA.Certificate.self_signed/2` works on OTP 28, whose `public_key` no
+  longer encodes the atom `:NULL` as the parameters of an RSA algorithm
+  identifier. They are written as the DER NULL itself, which OTP 27 encodes
+  the same way.
+
 ## 0.3.0
 
 ### Changed
