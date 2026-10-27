@@ -26,8 +26,11 @@ defmodule OPCUA.PubSub.KeyStore do
   # that are late.
   @past 2
   @retry 1000
-  # Fetches caused by an unknown token are at least this far apart.
+  # Fetches caused by an unknown token are at least @min_between apart, and
+  # further, up to @max_between, while they don't bring the token: anyone can
+  # send a message with any token.
   @min_between 2000
+  @max_between 60_000
   # Other fetches are at least this far apart, whatever times the service
   # gives: each is a session of its own with a service elsewhere.
   @min_fetch 1000
@@ -37,6 +40,8 @@ defmodule OPCUA.PubSub.KeyStore do
   @key_count 5
   # The longest a timer is set for, about 50 days.
   @max_wait 0xFFFF_FFFF
+  # The last SecurityTokenId there is, a UInt32.
+  @max_token 0xFFFF_FFFF
 
   def start_link(security), do: GenServer.start_link(__MODULE__, security)
 
@@ -53,14 +58,17 @@ defmodule OPCUA.PubSub.KeyStore do
     end
   end
 
-  @doc "The keys of a token, or nil. Asks for new keys when it isn't known."
-  def lookup(table, store, token) do
+  @doc """
+  The keys of a token, or nil. Asks for new keys when it isn't known, if
+  `ask`: a message that's of interest has it.
+  """
+  def lookup(table, store, token, ask \\ true) do
     case :ets.lookup(table, token) do
       [{^token, keys}] ->
         keys
 
       [] ->
-        send(store, :unknown_token)
+        if ask, do: send(store, {:unknown_token, token})
         nil
     end
   end
@@ -102,6 +110,11 @@ defmodule OPCUA.PubSub.KeyStore do
       raise ArgumentError,
             "security keys must be fetched over a :sign_and_encrypt session, " <>
               "not #{inspect(sks[:security])}"
+
+    # As OPCUA.Client would say, but now rather than at each fetch.
+    sks[:server] || sks[:trust] || sks[:server_certificate] ||
+      raise ArgumentError,
+            "security :sks needs :server_certificate, or :trust (a list of certificates, or :any)"
   end
 
   defp sks_security(sks) do
@@ -124,6 +137,8 @@ defmodule OPCUA.PubSub.KeyStore do
       current: nil,
       lifetime: nil,
       asked: nil,
+      wanted: nil,
+      between: @min_between,
       fetching: false,
       last_fetch: nil,
       failing: false,
@@ -150,11 +165,13 @@ defmodule OPCUA.PubSub.KeyStore do
   @impl true
   def handle_call(:table, _from, state), do: {:reply, state.table, state}
 
+  # Only a token past the current one can come with a fetch, which starts at
+  # the current key; before the first key, the first fetch is on its way.
   @impl true
-  def handle_info(:unknown_token, state) do
-    if state.sks != nil and state.fetching == false and
-         (state.last_fetch == nil or now() - state.last_fetch >= @min_between),
-       do: {:noreply, start_fetch(state)},
+  def handle_info({:unknown_token, token}, state) do
+    if state.sks != nil and state.fetching == false and state.current != nil and
+         token > state.current and now() - state.last_fetch >= state.between,
+       do: {:noreply, start_fetch(%{state | wanted: token})},
        else: {:noreply, state}
   end
 
@@ -226,6 +243,7 @@ defmodule OPCUA.PubSub.KeyStore do
     # A moment late, so that the service has moved on by then.
     timer = Process.send_after(self(), :switch, ms(answer.time_to_next_key) + 100)
     state = %{state | current: first, lifetime: ms(answer.key_lifetime), timer: timer}
+    state = %{state | wanted: nil, between: between(state)}
 
     # Part 14, 8.3.2: keys are fetched every half key lifetime, so that a
     # subscriber that is late, or a service that was away a moment, don't
@@ -237,7 +255,17 @@ defmodule OPCUA.PubSub.KeyStore do
     unless state.failing,
       do: Logger.warning("OPC UA PubSub can't get security keys: #{inspect(reason)}")
 
-    fetch_after(%{state | failing: true}, @retry)
+    fetch_after(%{state | failing: true, wanted: nil}, @retry)
+  end
+
+  # How far apart fetches for unknown tokens are, after one: further while
+  # they don't bring the token they were for.
+  defp between(%{wanted: nil} = state), do: state.between
+
+  defp between(%{wanted: token} = state) do
+    if :ets.member(state.table, token),
+      do: @min_between,
+      else: min(state.between * 2, @max_between)
   end
 
   # Half the lifetime, but no sooner than @min_fetch; and a minute if the
@@ -267,26 +295,39 @@ defmodule OPCUA.PubSub.KeyStore do
 
   ## Fetching
 
+  # Whatever goes wrong is an error, not the end of the store, which the
+  # task is linked to. Nothing of the answer goes in the error, which is
+  # logged: it may hold keys.
   defp fetch(sks, policy) do
     with {:ok, answer} <- get(sks),
          :ok <- same_policy(answer, policy),
-         {:ok, keys} <- split(answer.keys, policy) do
+         {:ok, keys} <- split(answer, policy) do
       {:ok, %{answer | keys: keys}}
     end
+  rescue
+    e -> {:error, Exception.message(e)}
+  catch
+    :exit, reason -> {:error, {:exit, reason}}
   end
 
   defp same_policy(%{policy_uri: uri}, policy),
     do: if(uri == Security.uri(policy), do: :ok, else: {:error, {:wrong_policy, uri}})
 
-  defp split([], _), do: {:error, :no_keys}
-
-  defp split(keys, policy) do
-    split = Enum.map(keys, &Security.split(policy, &1))
+  # The keys from the token `first` on: no more than were asked for, nor
+  # past the last token there is.
+  defp split(%{first: first, keys: [_ | _] = keys}, policy) when first in 1..@max_token//1 do
+    split =
+      keys
+      |> Enum.take(min(@key_count, @max_token - first + 1))
+      |> Enum.map(&Security.split(policy, &1))
 
     if Enum.all?(split, &match?({:ok, _}, &1)),
       do: {:ok, Enum.map(split, &elem(&1, 1))},
       else: {:error, :bad_key_length}
   end
+
+  defp split(%{keys: []}, _), do: {:error, :no_keys}
+  defp split(_, _), do: {:error, :bad_reply}
 
   defp get(sks) do
     group = Keyword.fetch!(sks, :group)
@@ -351,8 +392,8 @@ defmodule OPCUA.PubSub.KeyStore do
            key_lifetime: lifetime
          }}
 
-      {:ok, other} ->
-        {:error, {:bad_reply, other}}
+      {:ok, _} ->
+        {:error, :bad_reply}
 
       {:error, _} = error ->
         error

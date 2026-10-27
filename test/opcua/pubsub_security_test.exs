@@ -1,23 +1,3 @@
-defmodule CountingSKS do
-  @moduledoc false
-  # Passes the calls to a real key service, noting what was asked.
-  use GenServer
-  def init(state), do: {:ok, state}
-
-  def handle_call({:keys, group, starting, count, user}, _from, {sks, log} = state) do
-    Agent.update(log, &[{group, starting, count} | &1])
-    {:reply, GenServer.call(sks, {:keys, group, starting, count, user}), state}
-  end
-end
-
-defmodule FakeServer do
-  @moduledoc false
-  # Stands in for an OPCUA.Server, which only gives the key service.
-  use GenServer
-  def init(sks), do: {:ok, sks}
-  def handle_call(:sks, _from, sks), do: {:reply, sks, sks}
-end
-
 defmodule OPCUA.PubSubSecurityTest do
   use ExUnit.Case, async: true
 
@@ -33,10 +13,36 @@ defmodule OPCUA.PubSubSecurityTest do
     # An OPCUA.Server and its key service in one, answering what `answer`
     # gives, which may be anything a service elsewhere could.
     use GenServer
+    def start_link(answer), do: GenServer.start_link(__MODULE__, answer)
     def init(answer), do: {:ok, answer}
     def handle_call(:sks, _from, answer), do: {:reply, self(), answer}
     def handle_call({:keys, _, _, _, _}, _from, answer), do: {:reply, {:ok, answer.()}, answer}
   end
+
+  defmodule CountingSKS do
+    @moduledoc false
+    # An OPCUA.Server and its key service in one, passing the calls to a
+    # real key service and noting what was asked in `log`.
+    use GenServer
+    def init(state), do: {:ok, state}
+    def handle_call(:sks, _from, state), do: {:reply, self(), state}
+
+    def handle_call({:keys, group, starting, count, _user} = keys, _from, {sks, log} = state) do
+      Agent.update(log, &[{group, starting, count} | &1])
+      {:reply, GenServer.call(sks, keys), state}
+    end
+  end
+
+  # A server's key service that notes what it's asked, and the calls so far.
+  defp counting(server) do
+    {:ok, log} = Agent.start_link(fn -> [] end)
+    {:ok, counting} = GenServer.start_link(CountingSKS, {GenServer.call(server, :sks), log})
+    {counting, fn -> Agent.get(log, &Enum.reverse/1) end}
+  end
+
+  # As if the store's last fetch were long ago, so it may fetch again now.
+  defp long_ago(store),
+    do: :sys.replace_state(store, &%{&1 | last_fetch: &1.last_fetch - 60_000})
 
   defp url do
     {:ok, socket} = :gen_udp.open(0)
@@ -85,13 +91,15 @@ defmodule OPCUA.PubSubSecurityTest do
     )
   end
 
-  defp eventually_current(table, tries \\ 100) do
+  defp eventually(fun, tries \\ 100) do
     cond do
-      KeyStore.current(table) != nil -> true
+      fun.() -> true
       tries == 0 -> false
-      true -> Process.sleep(20) && eventually_current(table, tries - 1)
+      true -> Process.sleep(20) && eventually(fun, tries - 1)
     end
   end
+
+  defp eventually_current(table), do: eventually(fn -> KeyStore.current(table) != nil end)
 
   defp bytes(policy), do: Security.generate(policy)
 
@@ -170,10 +178,12 @@ defmodule OPCUA.PubSubSecurityTest do
       }
     end
 
-    for policy <- [:aes128_ctr, :aes256_ctr], mode <- [:sign, :sign_and_encrypt] do
+    for policy <- [:aes128_ctr, :aes256_ctr],
+        {mode, other} <- [sign: :sign_and_encrypt, sign_and_encrypt: :sign] do
       test "#{policy} #{mode}: decodes what was encoded, and nothing tampered with" do
         policy = unquote(policy)
         mode = unquote(mode)
+        other = unquote(other)
         {:ok, keys} = Security.split(policy, bytes(policy))
         nonce = Security.message_nonce(<<1, 2, 3, 4>>, 9)
 
@@ -195,7 +205,7 @@ defmodule OPCUA.PubSubSecurityTest do
                  decoded.messages
 
         # The payload isn't readable when it's encrypted, and is when it's only signed.
-        assert String.contains?(binary, "second") == (mode == :sign)
+        assert String.contains?(binary, "second") == unquote(mode == :sign)
 
         # Every byte counts: the header, the payload and the signature.
         for index <- 0..(byte_size(binary) - 1) do
@@ -204,7 +214,6 @@ defmodule OPCUA.PubSubSecurityTest do
           assert {:error, _} = UADP.decode(flipped, %{}, {mode, lookup}), "byte #{index}"
         end
 
-        other = if mode == :sign, do: :sign_and_encrypt, else: :sign
         assert {:error, _} = UADP.decode(binary, %{}, {other, lookup})
         assert {:error, _} = UADP.decode(binary, %{}, nil)
         assert {:error, _} = UADP.decode(binary, %{}, {mode, fn _ -> nil end})
@@ -294,6 +303,15 @@ defmodule OPCUA.PubSubSecurityTest do
           security: [sks: [url: "opc.tcp://localhost:1", group: "g", security: :none]]
         )
       end
+
+      # Not at each fetch, when it's too late.
+      assert_raise ArgumentError, ~r/server_certificate/, fn ->
+        Subscriber.start_link(
+          url: url(),
+          readers: [],
+          security: [sks: [url: "opc.tcp://localhost:1", group: "g"]]
+        )
+      end
     end
   end
 
@@ -304,31 +322,34 @@ defmodule OPCUA.PubSubSecurityTest do
       assert {:error, :already_exists} = SKS.add_group(sks, "g")
 
       assert {:ok, %{first_token_id: 1, keys: [a, b, c], policy: :aes128_ctr} = all} =
-               SKS.keys(sks, "g")
+               SKS.keys(sks, "g", 0, 10)
 
       assert all.key_lifetime == 3_600_000.0
       assert all.time_to_next_key > 0
       assert Enum.all?([a, b, c], &(byte_size(&1) == Security.key_length(:aes128_ctr)))
       assert length(Enum.uniq([a, b, c])) == 3
 
-      assert {:ok, %{first_token_id: 1, keys: [^a]}} = SKS.keys(sks, "g", 0, 1)
+      assert {:ok, %{first_token_id: 1, keys: [^a, ^b]}} = SKS.keys(sks, "g", 0, 2)
       assert {:ok, %{first_token_id: 2, keys: [^b, ^c]}} = SKS.keys(sks, "g", 2, 5)
-      # A token the group doesn't have starts at the current one.
-      assert {:ok, %{first_token_id: 1}} = SKS.keys(sks, "g", 99, 0)
+      # Part 14, 8.3.2: 0 keys asked for is none to come.
+      assert {:ok, %{first_token_id: 1, keys: [^a]}} = SKS.keys(sks, "g")
       assert {:error, :bad_not_found} = SKS.keys(sks, "nobody")
     end
 
     test "moves on to the next key when the lifetime is up, and keeps the old one a while" do
       {:ok, sks} = SKS.start_link()
       :ok = SKS.add_group(sks, "g", key_lifetime: 100, future_keys: 2, past_keys: 1)
-      {:ok, %{keys: [first, second, _]}} = SKS.keys(sks, "g")
+      {:ok, %{keys: [first, second, _]}} = SKS.keys(sks, "g", 0, 3)
       Process.sleep(130)
-      assert {:ok, %{first_token_id: 2, keys: [^second, _, _]}} = SKS.keys(sks, "g")
-      assert {:ok, %{first_token_id: 1, keys: [^first | _]}} = SKS.keys(sks, "g", 1, 0)
+      assert {:ok, %{first_token_id: 2, keys: [^second, _, _]}} = SKS.keys(sks, "g", 0, 3)
+      # From a past token, up to the current one when none to come are asked for.
+      assert {:ok, %{first_token_id: 1, keys: [^first, ^second]}} = SKS.keys(sks, "g", 1, 0)
       Process.sleep(110)
       assert {:ok, %{first_token_id: 3}} = SKS.keys(sks, "g")
-      # Token 1 is more than one past the current, and gone.
-      assert {:ok, %{first_token_id: 3}} = SKS.keys(sks, "g", 1, 0)
+      # Token 1 is more than one past the current, and gone: a token the
+      # group doesn't have starts at the oldest it has (Part 14, 8.3.2).
+      assert {:ok, %{first_token_id: 2}} = SKS.keys(sks, "g", 1, 0)
+      assert {:ok, %{first_token_id: 2}} = SKS.keys(sks, "g", 99, 0)
     end
 
     test "can be told to move on now, and to forget a group" do
@@ -348,6 +369,13 @@ defmodule OPCUA.PubSubSecurityTest do
       assert {:error, :bad_user_access_denied} = SKS.keys(sks, "g", 0, 0, "mallory")
       assert {:error, :bad_user_access_denied} = SKS.keys(sks, "g", 0, 0, :anonymous)
       assert {:ok, _} = SKS.keys(sks, "g", 0, 0, :local)
+
+      # Without users, anyone who logged in, but anonymous sessions only if asked.
+      :ok = SKS.add_group(sks, "open")
+      assert {:ok, _} = SKS.keys(sks, "open", 0, 0, "mallory")
+      assert {:error, :bad_user_access_denied} = SKS.keys(sks, "open", 0, 0, :anonymous)
+      :ok = SKS.add_group(sks, "anyone", users: [:anonymous, "alice"])
+      assert {:ok, _} = SKS.keys(sks, "anyone", 0, 0, :anonymous)
     end
   end
 
@@ -406,20 +434,18 @@ defmodule OPCUA.PubSubSecurityTest do
 
     test "keys are fetched from the current key on, every half lifetime", %{server: server} do
       :ok = Server.add_security_group(server, "half", key_lifetime: 2000, future_keys: 1)
-      {:ok, proxy} = Agent.start_link(fn -> [] end)
-      {:ok, counting} = GenServer.start_link(CountingSKS, {GenServer.call(server, :sks), proxy})
-      {:ok, fake} = GenServer.start_link(FakeServer, counting)
+      {counting, calls} = counting(server)
 
       {:ok, store} =
         KeyStore.start_link(
           mode: :sign,
           policy: :aes128_ctr,
-          sks: [server: fake, group: "half"]
+          sks: [server: counting, group: "half"]
         )
 
       Process.sleep(2500)
       GenServer.stop(store)
-      calls = Agent.get(proxy, & &1)
+      calls = calls.()
 
       # At the start, and at 1 and 2 s, not just when a key runs out; from
       # the current key, asking for keys to come, which 0 wouldn't give.
@@ -428,6 +454,102 @@ defmodule OPCUA.PubSubSecurityTest do
       assert Enum.all?(calls, fn {group, starting, count} ->
                {group, starting} == {"half", 0} and count > 1
              end)
+    end
+
+    test "an unknown token asks for keys only if it's newer, and less often while it doesn't come",
+         %{server: server} do
+      :ok = Server.add_security_group(server, "u", key_lifetime: 60_000, future_keys: 0)
+      :ok = SKS.rotate(GenServer.call(server, :sks), "u")
+      :ok = SKS.rotate(GenServer.call(server, :sks), "u")
+      {counting, calls} = counting(server)
+
+      {:ok, store} =
+        KeyStore.start_link(mode: :sign, policy: :aes128_ctr, sks: [server: counting, group: "u"])
+
+      table = KeyStore.table(store)
+      assert eventually_current(table)
+      assert {3, _} = KeyStore.current(table)
+      long_ago(store)
+
+      # Token 2 is older, which a fetch from the current key can't bring,
+      # and 99 not asked for.
+      assert KeyStore.lookup(table, store, 2) == nil
+      assert KeyStore.lookup(table, store, 99, false) == nil
+      Process.sleep(100)
+      assert length(calls.()) == 1
+
+      # A newer one is asked for; it doesn't come, so the next ask waits longer.
+      assert KeyStore.lookup(table, store, 99) == nil
+      assert eventually(fn -> length(calls.()) == 2 end)
+      assert eventually(fn -> :sys.get_state(store).between == 4000 end)
+      assert KeyStore.lookup(table, store, 99) == nil
+      Process.sleep(100)
+      assert length(calls.()) == 2
+    end
+
+    test "a subscriber asks for keys only for messages it reads", %{server: server} do
+      :ok = Server.add_security_group(server, "r", key_lifetime: 60_000)
+      {counting, calls} = counting(server)
+      url = url()
+      sub = subscriber(url, mode: :sign, policy: :aes128_ctr, sks: [server: counting, group: "r"])
+      {_mode, store, table} = :sys.get_state(sub).security
+      assert eventually_current(table)
+      long_ago(store)
+      unknown = [mode: :sign, policy: :aes128_ctr, keys: [{99, bytes(:aes128_ctr)}]]
+
+      # Another publisher on the address, with a token the subscriber doesn't have.
+      start_supervised!(
+        {Publisher,
+         url: url,
+         publisher_id: 43,
+         interval: 20,
+         security: unknown,
+         writers: [[id: 1, fields: @fields, read: fn -> @values end]]},
+        id: :other
+      )
+
+      Process.sleep(300)
+      assert length(calls.()) == 1
+
+      # The publisher it reads, with that token.
+      publisher(url, unknown)
+      assert eventually(fn -> length(calls.()) == 2 end)
+    end
+
+    @tag :capture_log
+    test "a service's answers that make no sense are survived" do
+      key = bytes(:aes128_ctr)
+
+      good = %{
+        policy: :aes128_ctr,
+        first_token_id: 1,
+        keys: [key],
+        time_to_next_key: 1000.0,
+        key_lifetime: 2000.0
+      }
+
+      answers = [
+        fn -> %{good | first_token_id: "1"} end,
+        fn -> %{good | first_token_id: 0} end,
+        fn -> %{good | first_token_id: 0x1_0000_0000} end,
+        fn -> %{good | first_token_id: 0xFFFF_FFFF, keys: [key, key]} end,
+        fn -> %{good | keys: "keys"} end,
+        fn -> %{good | keys: [<<1, 2, 3>>]} end,
+        fn -> %{good | policy: :nonsense} end,
+        fn -> raise "broken" end
+      ]
+
+      stores =
+        for {answer, index} <- Enum.with_index(answers) do
+          fake = start_supervised!({FakeSKS, answer}, id: index)
+          security = [mode: :sign, policy: :aes128_ctr, sks: [server: fake, group: "g"]]
+          {:ok, store} = KeyStore.start_link(security)
+          store
+        end
+
+      Process.sleep(300)
+      assert Enum.all?(stores, &Process.alive?/1)
+      assert {0xFFFF_FFFF, _} = KeyStore.current(KeyStore.table(Enum.at(stores, 3)))
     end
 
     test "a service that gives no key to come is asked when the key runs out", %{server: server} do
@@ -563,7 +685,7 @@ defmodule OPCUA.PubSubSecurityTest do
       client = [{:security, {:basic256sha256, :sign_and_encrypt}} | client]
 
       assert {:ok, [uri, 1, [a, b, c, d], time_to_next, lifetime]} =
-               get_keys(client, arguments("g"))
+               get_keys(client, arguments("g", 0, 10))
 
       assert uri == Security.uri(:aes128_ctr)
       assert Enum.all?([a, b, c, d], &(byte_size(&1) == 52))
@@ -571,6 +693,7 @@ defmodule OPCUA.PubSubSecurityTest do
       assert lifetime == 3_600_000.0
 
       assert {:ok, [_, 2, [^b, ^c], _, _]} = get_keys(client, arguments("g", 2, 2))
+      assert {:ok, [_, 1, [^a], _, _]} = get_keys(client, arguments("g"))
     end
 
     test "is refused on a channel that isn't encrypted", %{client: client} do
@@ -581,7 +704,7 @@ defmodule OPCUA.PubSubSecurityTest do
     end
 
     test "is refused to users that aren't in the group, and for a group that isn't there",
-         %{client: client} do
+         %{client: client, server: server} do
       client = [{:security, {:basic256sha256, :sign_and_encrypt}} | client]
 
       assert {:error, :bad_user_access_denied} =
@@ -589,6 +712,13 @@ defmodule OPCUA.PubSubSecurityTest do
 
       assert {:error, :bad_not_found} = get_keys(client, arguments("nobody"))
       assert {:error, :bad_arguments_missing} = get_keys(client, Enum.take(arguments("g"), 2))
+
+      # A group for any user, which isn't an anonymous one.
+      :ok = Server.add_security_group(server, "open")
+      assert {:ok, _} = get_keys(client, arguments("open"))
+
+      assert {:error, :bad_user_access_denied} =
+               get_keys(Keyword.delete(client, :user), arguments("open"))
 
       assert {:error, :bad_type_mismatch} =
                get_keys(

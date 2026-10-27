@@ -118,30 +118,38 @@ defmodule OPCUA.PubSub.Subscriber do
   defp publisher_value({_type, value}), do: value
   defp publisher_value(value), do: value
 
-  # The index of the reader of a writer's dataset, going by the network
-  # message's publisher and group, or nil.
-  defp find_reader(readers, message, writer) do
+  # Whether a reader reads the network message's publisher and group.
+  defp reads?(reader, message) do
     publisher = message.publisher_id && publisher_value(message.publisher_id)
-
-    Enum.find_index(
-      readers,
-      &(&1.publisher == publisher and &1.writer == writer and
-          &1.group in [nil, message.writer_group_id])
-    )
+    reader.publisher == publisher and reader.group in [nil, message.writer_group_id]
   end
+
+  # The index of the reader of a writer's dataset in a network message, or nil.
+  defp find_reader(readers, message, writer),
+    do: Enum.find_index(readers, &(&1.writer == writer and reads?(&1, message)))
 
   # Raw fields can only be read knowing their types, which the reader has.
   defp raw_types(readers, message, writer) do
     if index = find_reader(readers, message, writer), do: Enum.at(readers, index).types
   end
 
-  # What the decoder needs to check a message: the mode and the keys by token.
-  defp security(nil), do: nil
-  defp security({mode, store, table}), do: {mode, &KeyStore.lookup(table, store, &1)}
+  # What the decoder needs to check a message: the mode and the keys by
+  # token. Only a token in a message a reader reads asks for new keys, not
+  # those of other publishers or security groups on the same address.
+  defp security(nil, _readers), do: nil
+
+  defp security({mode, store, table}, readers) do
+    {mode,
+     fn token, message ->
+       KeyStore.lookup(table, store, token, Enum.any?(readers, &reads?(&1, message)))
+     end}
+  end
 
   @impl true
   def handle_info({:udp, _, _, _, data}, state) do
-    case UADP.decode(data, &raw_types(state.readers, &1, &2), security(state.security)) do
+    security = security(state.security, state.readers)
+
+    case UADP.decode(data, &raw_types(state.readers, &1, &2), security) do
       {:ok, message} ->
         {:noreply, Enum.reduce(message.messages, state, &dataset(message, &1, &2))}
 

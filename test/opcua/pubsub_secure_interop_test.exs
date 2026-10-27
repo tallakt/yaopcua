@@ -13,8 +13,7 @@ defmodule OPCUA.PubSubSecureInteropTest do
   @fields [{"Counter", :int32}, {"Wave", :double}]
 
   setup_all do
-    {:ok, peer} = OPCUA.Open62541.build_pubsub_peer()
-    %{peer: peer}
+    %{peer: OPCUA.Open62541.build_pubsub_peer!()}
   end
 
   defp free_udp_port do
@@ -25,15 +24,7 @@ defmodule OPCUA.PubSubSecureInteropTest do
   end
 
   defp run(peer, args) do
-    port =
-      Port.open({:spawn_executable, peer}, [
-        :binary,
-        :exit_status,
-        :stderr_to_stdout,
-        args: args
-      ])
-
-    port
+    Port.open({:spawn_executable, peer}, [:binary, :exit_status, :stderr_to_stdout, args: args])
   end
 
   defp output(port, acc \\ "") do
@@ -131,7 +122,10 @@ defmodule OPCUA.PubSubSecureInteropTest do
         other = Base.encode16(Security.generate(unquote(policy)), case: :lower)
 
         port = run(peer, ["subscribe", url, other, "#{unquote(bits)}", unquote(word), "3"])
-        refute output(port) =~ "value 7"
+        output = output(port)
+        # It got the messages, and refused them.
+        assert output =~ "BadSecurityChecksFailed"
+        refute output =~ "value 7"
       end
     end
   end

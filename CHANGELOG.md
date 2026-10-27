@@ -12,7 +12,8 @@
 - A Security Key Service: `OPCUA.Server.add_security_group/3` generates and
   rotates the keys of a group (`OPCUA.PubSub.SKS`), and serves them to
   `GetSecurityKeys` on the PublishSubscribe object, on encrypted channels
-  only. Publishers and subscribers fetch and refresh their keys from it
+  only, to users who logged in (or those of `users:`). Publishers and
+  subscribers fetch and refresh their keys from it
   with `sks:`, over a signed and encrypted session: the current key and
   keys to come, every half key lifetime, as Part 14 says.
 - Interop tests of encrypted PubSub against open62541 (built with mbedTLS), in

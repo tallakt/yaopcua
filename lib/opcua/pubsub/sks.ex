@@ -21,7 +21,8 @@ defmodule OPCUA.PubSub.SKS do
     * `:future_keys` - keys generated ahead (default 3)
     * `:past_keys` - keys kept after they've expired (default 1)
     * `:users` - the users allowed to get the keys, as the session's user
-      name; any when not given
+      name; any user who logged in when not given. `:anonymous` among them
+      lets anonymous sessions have the keys too
   """
 
   use GenServer
@@ -47,11 +48,12 @@ defmodule OPCUA.PubSub.SKS do
   def rotate(sks, id), do: GenServer.call(sks, {:rotate, id})
 
   @doc """
-  The keys of a group, as `GetSecurityKeys` gives them: `count` keys from
-  the token `starting_token`, or from the current one if that's 0 or
-  isn't one the group has. `count` 0 or more than there are is all the keys
-  from there on, the future ones too. `user` is checked against the group's
-  `:users`; `:local` is code in this VM, which is always allowed.
+  The keys of a group, as `GetSecurityKeys` gives them (Part 14, 8.3.2):
+  `count` keys from the token `starting_token`, from the current one for 0,
+  or from the oldest the group has for a token it doesn't have. `count`
+  more than there are is all of them from there on, and 0 none to come:
+  from the first up to the current one. `user` is checked against the
+  group's `:users`; `:local` is code in this VM, which is always allowed.
   """
   @spec keys(GenServer.server(), String.t(), non_neg_integer, non_neg_integer, term) ::
           {:ok,
@@ -132,24 +134,26 @@ defmodule OPCUA.PubSub.SKS do
   end
 
   defp allowed(_group, :local), do: true
-  defp allowed(%{users: nil}, _), do: true
+  defp allowed(%{users: nil}, user), do: user != :anonymous
   defp allowed(%{users: users}, user), do: user in users
 
   defp answer(group, starting, count) do
+    oldest = max(group.current - group.past, 1)
     last = group.current + group.future
 
     first =
-      if starting in (group.current - group.past)..last//1 and starting > 0,
-        do: starting,
-        else: group.current
+      cond do
+        starting == 0 -> group.current
+        starting in oldest..last//1 -> starting
+        true -> oldest
+      end
 
-    available = last - first + 1
-    count = if count in 1..available//1, do: count, else: available
+    until = if count == 0, do: max(first, group.current), else: min(first + count - 1, last)
 
     %{
       policy: group.policy,
       first_token_id: first,
-      keys: for(token <- first..(first + count - 1), do: Map.fetch!(group.keys, token)),
+      keys: for(token <- first..until, do: Map.fetch!(group.keys, token)),
       time_to_next_key: max(group.since + group.lifetime - now(), 0) * 1.0,
       key_lifetime: group.lifetime * 1.0
     }

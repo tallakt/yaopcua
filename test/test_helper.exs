@@ -21,7 +21,7 @@ exclude = if OPCUA.Open62541.flags(), do: exclude, else: [:open62541 | exclude]
 exclude = if OPCUA.Open62541.secure?(), do: exclude, else: [:open62541_secure | exclude]
 
 exclude =
-  if match?({:ok, _}, OPCUA.Open62541.build_pubsub_peer()),
+  if OPCUA.Open62541.pubsub_secure?(),
     do: exclude,
     else: [:open62541_pubsub_secure | exclude]
 

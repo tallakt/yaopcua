@@ -286,6 +286,8 @@ encrypted, and fetched again every half `key_lifetime` as Part 14 says; the serv
 keeps future keys ready and past ones for late subscribers. Without a service,
 `keys: [{token_id, bytes}]` gives fixed keys, and `sks: [server: pid, ...]` an
 `OPCUA.Server` in the same VM. Nothing is sent while a publisher has no key.
+A group without `users:` gives its keys to any user who logged in, but not to
+anonymous sessions unless `:anonymous` is among its `users:`.
 
 The message security is checked against open62541 1.5.9 (built with mbedTLS) in
 both directions, for both policies and both modes. The key service has only been

@@ -233,11 +233,13 @@ defmodule OPCUA.PubSub.UADP do
   `security` is what the reader requires: `nil` for plain messages, which
   then must not be secured, or `{mode, keys}` where `mode` is `:sign` or
   `:sign_and_encrypt` and `keys` a function of the token id returning the
-  `OPCUA.PubSub.Security` keys or nil. Only a message in exactly that mode
-  whose signature is right is decoded; the others are errors.
+  `OPCUA.PubSub.Security` keys or nil, or a function of the token id and the
+  headers decoded so far. Only a message in exactly that mode whose
+  signature is right is decoded; the others are errors.
   """
-  @spec decode(binary, raw_types, nil | {Security.mode(), (non_neg_integer -> map | nil)}) ::
+  @spec decode(binary, raw_types, nil | {Security.mode(), keys}) ::
           {:ok, t} | {:error, :bad_decoding_error}
+        when keys: (non_neg_integer -> map | nil) | (non_neg_integer, t -> map | nil)
   def decode(binary, raw_types \\ %{}, security \\ nil) do
     {:ok, take(binary, raw_types, security)}
   rescue
@@ -286,7 +288,7 @@ defmodule OPCUA.PubSub.UADP do
         rest
       end
 
-    {rest, secured} = unprotect(security, binary, rest)
+    {rest, secured} = unprotect(security, binary, rest, m)
     messages = take_messages(rest, writer_ids, &raw_types(raw_types, m, &1))
 
     %{
@@ -301,9 +303,9 @@ defmodule OPCUA.PubSub.UADP do
 
   # Checks the security header, the signature, and decrypts the payload.
   # `rest` starts at the security header and ends in the signature.
-  defp unprotect(nil, _binary, rest), do: {rest, nil}
+  defp unprotect(nil, _binary, rest, _headers), do: {rest, nil}
 
-  defp unprotect({mode, keys}, binary, rest) do
+  defp unprotect({mode, keys}, binary, rest, headers) do
     {flags, rest} = Binary.take(rest, :byte)
     {token, rest} = Binary.take(rest, :uint32)
     {nonce_length, rest} = Binary.take(rest, :byte)
@@ -315,7 +317,10 @@ defmodule OPCUA.PubSub.UADP do
     check(nonce_length == Security.nonce_size(), "message nonce")
     size = byte_size(rest) - Security.signature_size()
     check(size >= 0, "signature")
-    keys = keys.(token) || raise DecodeError, "unknown security token #{token}"
+
+    keys =
+      token_keys(keys, token, headers) || raise DecodeError, "unknown security token #{token}"
+
     {payload, signature} = bytes(rest, size)
     signed = binary_part(binary, 0, byte_size(binary) - Security.signature_size())
     check(Security.verify(keys, signed, signature), "signature")
@@ -325,6 +330,9 @@ defmodule OPCUA.PubSub.UADP do
 
     {payload, %{mode: mode, token_id: token}}
   end
+
+  defp token_keys(fun, token, _headers) when is_function(fun, 1), do: fun.(token)
+  defp token_keys(fun, token, headers) when is_function(fun, 2), do: fun.(token, headers)
 
   defp raw_types(types, _headers, writer) when is_map(types), do: types[writer]
   defp raw_types(fun, headers, writer) when is_function(fun, 2), do: fun.(headers, writer)
