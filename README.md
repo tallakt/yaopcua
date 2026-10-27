@@ -282,10 +282,17 @@ OPCUA.PubSub.Subscriber.start_link(url: ..., readers: [...], security: security)
 ```
 
 The keys are fetched with `GetSecurityKeys` over a session that is signed and
-encrypted, and fetched again as they rotate every `key_lifetime`; the service
+encrypted, and fetched again every half `key_lifetime` as Part 14 says; the service
 keeps future keys ready and past ones for late subscribers. Without a service,
 `keys: [{token_id, bytes}]` gives fixed keys, and `sks: [server: pid, ...]` an
 `OPCUA.Server` in the same VM. Nothing is sent while a publisher has no key.
+
+The message security is checked against open62541 1.5.9 (built with mbedTLS) in
+both directions, for both policies and both modes. The key service has only been
+used between yaopcua's own server and clients: open62541 1.5 has none that works
+yet. A key service of another vendor should work if it offers `GetSecurityKeys`
+on the PublishSubscribe object (i=14443) over a Basic256Sha256, Aes128_Sha256_RsaOaep
+or Aes256_Sha256_RsaPss endpoint with `SignAndEncrypt`; that is untested.
 
 ## Encoding
 

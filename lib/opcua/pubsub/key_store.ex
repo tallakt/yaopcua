@@ -3,7 +3,7 @@ defmodule OPCUA.PubSub.KeyStore do
   # The keys a publisher or subscriber signs and encrypts with, in an ETS
   # table it can read without asking a process: `{:current, token_id}` and
   # `{token_id, keys}`. The process keeps them there, fetching them from a
-  # Security Key Service and again when the current key runs out.
+  # Security Key Service, and again every half key lifetime.
   #
   # Where the keys come from, as `security:` of Publisher and Subscriber says:
   #
@@ -28,6 +28,15 @@ defmodule OPCUA.PubSub.KeyStore do
   @retry 1000
   # Fetches caused by an unknown token are at least this far apart.
   @min_between 2000
+  # Other fetches are at least this far apart, whatever times the service
+  # gives: each is a session of its own with a service elsewhere.
+  @min_fetch 1000
+  # Keys asked for: the current one and some to come, which are switched to
+  # on time and bridge a service that's away a while. Asking for 0 would get
+  # no keys to come (Part 14, 8.3.2). The service may give fewer.
+  @key_count 5
+  # The longest a timer is set for, about 50 days.
+  @max_wait 0xFFFF_FFFF
 
   def start_link(security), do: GenServer.start_link(__MODULE__, security)
 
@@ -113,12 +122,13 @@ defmodule OPCUA.PubSub.KeyStore do
       policy: policy,
       sks: security[:sks],
       current: nil,
-      switch: nil,
-      next: nil,
+      lifetime: nil,
+      asked: nil,
       fetching: false,
       last_fetch: nil,
       failing: false,
-      timer: nil
+      timer: nil,
+      refresh: nil
     }
 
     case security[:keys] do
@@ -142,10 +152,8 @@ defmodule OPCUA.PubSub.KeyStore do
 
   @impl true
   def handle_info(:unknown_token, state) do
-    now = System.monotonic_time(:millisecond)
-
     if state.sks != nil and state.fetching == false and
-         (state.last_fetch == nil or now - state.last_fetch >= @min_between),
+         (state.last_fetch == nil or now() - state.last_fetch >= @min_between),
        do: {:noreply, start_fetch(state)},
        else: {:noreply, state}
   end
@@ -154,14 +162,21 @@ defmodule OPCUA.PubSub.KeyStore do
   def handle_info(:fetch, %{fetching: ref} = state) when ref != false, do: {:noreply, state}
   def handle_info(:fetch, state), do: {:noreply, start_fetch(state)}
 
-  # The current key's time is up: the next token, which was fetched with it,
-  # takes over, and new keys are fetched.
+  # The current key's time is up: the next one, fetched ahead, takes over
+  # for a lifetime. A service that gave no key to come is asked now, not at
+  # the next refresh, and should it not have moved on yet, again no sooner
+  # than @min_fetch.
   def handle_info(:switch, state) do
-    next = state.current && state.current + 1
+    next = state.current + 1
 
-    if next && :ets.member(state.table, next), do: :ets.insert(state.table, {:current, next})
-    state = %{state | current: next || state.current}
-    {:noreply, start_fetch(%{state | timer: nil})}
+    if :ets.member(state.table, next) do
+      :ets.insert(state.table, {:current, next})
+      timer = Process.send_after(self(), :switch, state.lifetime)
+      {:noreply, %{state | current: next, timer: timer}}
+    else
+      gap = if state.asked == next, do: @min_fetch, else: 0
+      {:noreply, fetch_soon(%{state | timer: nil, asked: next}, gap)}
+    end
   end
 
   def handle_info({ref, result}, %{fetching: ref} = state) when is_reference(ref) do
@@ -179,7 +194,23 @@ defmodule OPCUA.PubSub.KeyStore do
     policy = state.policy
 
     task = Task.async(fn -> fetch(sks, policy) end)
-    %{state | fetching: task.ref, last_fetch: System.monotonic_time(:millisecond)}
+    %{state | fetching: task.ref, last_fetch: now()}
+  end
+
+  # A fetch now, or once `gap` has passed since the last one.
+  defp fetch_soon(%{fetching: false} = state, gap) do
+    case state.last_fetch + gap - now() do
+      wait when wait > 0 -> fetch_after(state, wait)
+      _ -> start_fetch(state)
+    end
+  end
+
+  defp fetch_soon(state, _gap), do: state
+
+  # The next fetch, in place of the one planned.
+  defp fetch_after(state, time) do
+    _ = if state.refresh, do: Process.cancel_timer(state.refresh)
+    %{state | refresh: Process.send_after(self(), :fetch, time)}
   end
 
   defp fetched({:ok, %{first: first, keys: keys} = answer}, state) do
@@ -193,17 +224,36 @@ defmodule OPCUA.PubSub.KeyStore do
     :ok = prune(state.table, first)
     _ = if state.timer, do: Process.cancel_timer(state.timer)
     # A moment late, so that the service has moved on by then.
-    timer = Process.send_after(self(), :switch, round(answer.time_to_next_key) + 100)
-    %{state | current: first, timer: timer, failing: false}
+    timer = Process.send_after(self(), :switch, ms(answer.time_to_next_key) + 100)
+    state = %{state | current: first, lifetime: ms(answer.key_lifetime), timer: timer}
+
+    # Part 14, 8.3.2: keys are fetched every half key lifetime, so that a
+    # subscriber that is late, or a service that was away a moment, don't
+    # leave the group without keys.
+    fetch_after(%{state | failing: false}, refresh_after(answer.key_lifetime))
   end
 
   defp fetched({:error, reason}, state) do
     unless state.failing,
       do: Logger.warning("OPC UA PubSub can't get security keys: #{inspect(reason)}")
 
-    Process.send_after(self(), :fetch, @retry)
-    %{state | failing: true}
+    fetch_after(%{state | failing: true}, @retry)
   end
+
+  # Half the lifetime, but no sooner than @min_fetch; and a minute if the
+  # service gives no lifetime that makes sense.
+  defp refresh_after(lifetime) when is_number(lifetime) and lifetime > 0,
+    do: max(div(ms(lifetime), 2), @min_fetch)
+
+  defp refresh_after(_), do: 60_000
+
+  # A time the service gives, a Double, as the ms of a timer: a negative
+  # time is none, and one past what a timer takes, or NaN or an infinity
+  # (atoms here), is the longest a timer takes; the refresh keeps up then.
+  defp ms(time) when is_number(time), do: time |> max(0) |> min(@max_wait) |> round()
+  defp ms(_), do: @max_wait
+
+  defp now, do: System.monotonic_time(:millisecond)
 
   # Old tokens go.
   defp prune(table, current) do
@@ -248,14 +298,15 @@ defmodule OPCUA.PubSub.KeyStore do
   end
 
   defp get_local(server, group) do
-    case OPCUA.Server.security_keys(server, group) do
+    case OPCUA.Server.security_keys(server, group, 0, @key_count) do
       {:ok, a} ->
         {:ok,
          %{
            policy_uri: Security.uri(a.policy),
            first: a.first_token_id,
            keys: a.keys,
-           time_to_next_key: a.time_to_next_key
+           time_to_next_key: a.time_to_next_key,
+           key_lifetime: a.key_lifetime
          }}
 
       {:error, _} = error ->
@@ -286,12 +337,19 @@ defmodule OPCUA.PubSub.KeyStore do
     args = [
       %Variant{type: :string, value: group},
       %Variant{type: :uint32, value: 0},
-      %Variant{type: :uint32, value: 0}
+      %Variant{type: :uint32, value: @key_count}
     ]
 
     case OPCUA.Client.call(client, @publish_subscribe, @get_security_keys, args) do
-      {:ok, [uri, first, keys, time_to_next, _lifetime]} ->
-        {:ok, %{policy_uri: uri, first: first, keys: keys, time_to_next_key: time_to_next}}
+      {:ok, [uri, first, keys, time_to_next, lifetime]} ->
+        {:ok,
+         %{
+           policy_uri: uri,
+           first: first,
+           keys: keys,
+           time_to_next_key: time_to_next,
+           key_lifetime: lifetime
+         }}
 
       {:ok, other} ->
         {:error, {:bad_reply, other}}

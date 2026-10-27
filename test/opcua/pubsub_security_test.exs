@@ -1,3 +1,23 @@
+defmodule CountingSKS do
+  @moduledoc false
+  # Passes the calls to a real key service, noting what was asked.
+  use GenServer
+  def init(state), do: {:ok, state}
+
+  def handle_call({:keys, group, starting, count, user}, _from, {sks, log} = state) do
+    Agent.update(log, &[{group, starting, count} | &1])
+    {:reply, GenServer.call(sks, {:keys, group, starting, count, user}), state}
+  end
+end
+
+defmodule FakeServer do
+  @moduledoc false
+  # Stands in for an OPCUA.Server, which only gives the key service.
+  use GenServer
+  def init(sks), do: {:ok, sks}
+  def handle_call(:sks, _from, sks), do: {:reply, sks, sks}
+end
+
 defmodule OPCUA.PubSubSecurityTest do
   use ExUnit.Case, async: true
 
@@ -7,6 +27,16 @@ defmodule OPCUA.PubSubSecurityTest do
 
   @fields [{"Speed", :int16}, {"Running", :boolean}]
   @values %{"Speed" => 1500, "Running" => true}
+
+  defmodule FakeSKS do
+    @moduledoc false
+    # An OPCUA.Server and its key service in one, answering what `answer`
+    # gives, which may be anything a service elsewhere could.
+    use GenServer
+    def init(answer), do: {:ok, answer}
+    def handle_call(:sks, _from, answer), do: {:reply, self(), answer}
+    def handle_call({:keys, _, _, _, _}, _from, answer), do: {:reply, {:ok, answer.()}, answer}
+  end
 
   defp url do
     {:ok, socket} = :gen_udp.open(0)
@@ -64,6 +94,15 @@ defmodule OPCUA.PubSubSecurityTest do
   end
 
   defp bytes(policy), do: Security.generate(policy)
+
+  # How many of `message` are waiting.
+  defp count(message, n \\ 0) do
+    receive do
+      ^message -> count(message, n + 1)
+    after
+      0 -> n
+    end
+  end
 
   describe "the policies" do
     test "have the key lengths of Part 14" do
@@ -363,6 +402,95 @@ defmodule OPCUA.PubSubSecurityTest do
       assert Process.alive?(store)
       assert KeyStore.lookup(table, store, 999) == nil
       assert Process.alive?(store)
+    end
+
+    test "keys are fetched from the current key on, every half lifetime", %{server: server} do
+      :ok = Server.add_security_group(server, "half", key_lifetime: 2000, future_keys: 1)
+      {:ok, proxy} = Agent.start_link(fn -> [] end)
+      {:ok, counting} = GenServer.start_link(CountingSKS, {GenServer.call(server, :sks), proxy})
+      {:ok, fake} = GenServer.start_link(FakeServer, counting)
+
+      {:ok, store} =
+        KeyStore.start_link(
+          mode: :sign,
+          policy: :aes128_ctr,
+          sks: [server: fake, group: "half"]
+        )
+
+      Process.sleep(2500)
+      GenServer.stop(store)
+      calls = Agent.get(proxy, & &1)
+
+      # At the start, and at 1 and 2 s, not just when a key runs out; from
+      # the current key, asking for keys to come, which 0 wouldn't give.
+      assert length(calls) in 3..4
+
+      assert Enum.all?(calls, fn {group, starting, count} ->
+               {group, starting} == {"half", 0} and count > 1
+             end)
+    end
+
+    test "a service that gives no key to come is asked when the key runs out", %{server: server} do
+      :ok = Server.add_security_group(server, "one", key_lifetime: 60_000, future_keys: 0)
+
+      {:ok, store} =
+        KeyStore.start_link(mode: :sign, policy: :aes128_ctr, sks: [server: server, group: "one"])
+
+      table = KeyStore.table(store)
+      assert eventually_current(table)
+      assert {1, _} = KeyStore.current(table)
+
+      # The service moves on, and the store's timer says the key's time is up:
+      # it gets the new key now, not at the refresh in 30 s.
+      :ok = SKS.rotate(GenServer.call(server, :sks), "one")
+      send(store, :switch)
+
+      assert Enum.any?(1..20, fn _ ->
+               Process.sleep(20)
+               match?({2, _}, KeyStore.current(table))
+             end)
+    end
+
+    test "odd times from a service are survived, and don't make it asked often" do
+      key = bytes(:aes128_ctr)
+      test = self()
+
+      stores =
+        for {next, lifetime} = times <- [
+              {1000.0, 1.0e300},
+              {1.0e300, 1.0e300},
+              {-5.0, 1000.0},
+              {:nan, :infinity},
+              {:infinity, -1.0},
+              {1.0, 1.0}
+            ] do
+          answer = fn ->
+            send(test, {:asked, times})
+
+            %{
+              policy: :aes128_ctr,
+              first_token_id: 1,
+              keys: [key],
+              time_to_next_key: next,
+              key_lifetime: lifetime
+            }
+          end
+
+          {:ok, fake} = GenServer.start_link(FakeSKS, answer)
+          security = [mode: :sign, policy: :aes128_ctr, sks: [server: fake, group: "g"]]
+          {:ok, store} = KeyStore.start_link(security)
+          {times, store}
+        end
+
+      Process.sleep(1500)
+
+      for {times, store} <- stores do
+        assert KeyStore.current(KeyStore.table(store)) != nil
+        GenServer.stop(store)
+        # The first fetch, one when the key runs out, and then one a second
+        # at most.
+        assert count({:asked, times}) in 1..4, inspect(times)
+      end
     end
 
     test "a group of another policy is refused", %{server: server} do

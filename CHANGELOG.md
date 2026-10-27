@@ -13,7 +13,11 @@
   rotates the keys of a group (`OPCUA.PubSub.SKS`), and serves them to
   `GetSecurityKeys` on the PublishSubscribe object, on encrypted channels
   only. Publishers and subscribers fetch and refresh their keys from it
-  with `sks:`, over a signed and encrypted session.
+  with `sks:`, over a signed and encrypted session: the current key and
+  keys to come, every half key lifetime, as Part 14 says.
+- Interop tests of encrypted PubSub against open62541 (built with mbedTLS), in
+  `test/opcua/pubsub_secure_interop_test.exs`, run where such a build is found
+  (see `test/test_helper.exs`).
 
 ## 0.3.1
 
