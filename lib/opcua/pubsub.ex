@@ -21,8 +21,16 @@ defmodule OPCUA.PubSub do
 
   See `OPCUA.PubSub.UADP` for the message format.
 
-  Not supported: message security and the Security Key Service, network
-  messages chunked over several datagrams, discovery and metadata messages,
+  ## Security
+
+  Messages can be signed, or signed and encrypted, with the policies
+  PubSub-Aes128-CTR and PubSub-Aes256-CTR: give `security:` to the publisher
+  and the subscriber (see `OPCUA.PubSub.Publisher`). The keys of a security
+  group come from a Security Key Service, `OPCUA.Server.add_security_group/3`,
+  or are fixed. See `OPCUA.PubSub.Security` and `OPCUA.PubSub.SKS`.
+
+  Not supported: pushing keys to publishers and subscribers
+  (`SetSecurityKeys`), security footers, network messages chunked over several datagrams, discovery and metadata messages,
   transports other than UDP (Ethernet/TSN, MQTT, AMQP), the JSON mapping,
   configuration as server nodes, and event datasets. IPv4 only.
   """

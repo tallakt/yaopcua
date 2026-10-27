@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Encrypted PubSub (Part 14): `security:` on `OPCUA.PubSub.Publisher` and
+  `Subscriber` signs, or signs and encrypts, UADP messages with
+  PubSub-Aes128-CTR or PubSub-Aes256-CTR (`OPCUA.PubSub.Security`). A
+  subscriber drops messages that aren't in its mode or whose signature is
+  wrong.
+- A Security Key Service: `OPCUA.Server.add_security_group/3` generates and
+  rotates the keys of a group (`OPCUA.PubSub.SKS`), and serves them to
+  `GetSecurityKeys` on the PublishSubscribe object, on encrypted channels
+  only. Publishers and subscribers fetch and refresh their keys from it
+  with `sks:`, over a signed and encrypted session.
+
 ## 0.3.1
 
 ### Fixed

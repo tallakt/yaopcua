@@ -7,6 +7,7 @@ defmodule OPCUA.Server.Services do
   require Logger
 
   alias OPCUA.{Certificate, LocalizedText, NodeId, NodeIds, SecurityPolicy, StatusCode, Variant}
+  alias OPCUA.PubSub.{Security, SKS}
   alias OPCUA.Server.{AddressSpace, Conditions, Node, Session, Subscriptions}
   alias OPCUA.Types
 
@@ -23,6 +24,8 @@ defmodule OPCUA.Server.Services do
   @refresh NodeIds.node_id!("ConditionType_ConditionRefresh")
   @refresh2 NodeIds.node_id!("ConditionType_ConditionRefresh2")
   @acknowledge NodeIds.node_id!("AcknowledgeableConditionType_Acknowledge")
+  @publish_subscribe NodeIds.node_id!("PublishSubscribe")
+  @get_security_keys NodeIds.node_id!("PublishSubscribe_GetSecurityKeys")
   @add_comment NodeIds.node_id!("ConditionType_AddComment")
   @enable NodeIds.node_id!("ConditionType_Enable")
   @disable NodeIds.node_id!("ConditionType_Disable")
@@ -584,7 +587,46 @@ defmodule OPCUA.Server.Services do
     end
   end
 
+  # GetSecurityKeys of the PublishSubscribe object (Part 14, 8.4.2).
+  defp call_method(
+         %{object_id: @publish_subscribe, method_id: @get_security_keys} = call,
+         session,
+         state
+       ),
+       do: {get_security_keys(call.input_arguments || [], session, state), session}
+
   defp call_method(call, session, state), do: {method(state.config.space, call), session}
+
+  # The keys are secrets: only over a channel that's encrypted, so a
+  # session on a None endpoint, or one that's only signed, is refused.
+  defp get_security_keys(args, session, state) do
+    result = fn status -> %Types.CallMethodResult{status_code: StatusCode.code(status)} end
+
+    with {:channel, true} <- {:channel, state.channel.mode == :sign_and_encrypt},
+         {:args, [%Variant{value: group}, %Variant{value: first}, %Variant{value: count}]}
+         when is_binary(group) and is_integer(first) and first >= 0 and is_integer(count) and
+                count >= 0 <-
+           {:args, args},
+         {:ok, keys} <- SKS.keys(state.config.sks, group, first, count, session.user) do
+      %Types.CallMethodResult{
+        status_code: 0,
+        output_arguments: [
+          %Variant{type: :string, value: Security.uri(keys.policy)},
+          %Variant{type: :uint32, value: keys.first_token_id},
+          %Variant{type: :byte_string, value: keys.keys},
+          %Variant{type: :double, value: keys.time_to_next_key},
+          %Variant{type: :double, value: keys.key_lifetime}
+        ]
+      }
+    else
+      {:channel, false} -> result.(:bad_security_mode_insufficient)
+      {:args, args} when length(args) < 3 -> result.(:bad_arguments_missing)
+      {:args, args} when length(args) > 3 -> result.(:bad_too_many_arguments)
+      {:args, _} -> result.(:bad_type_mismatch)
+      {:error, :bad_not_found} -> result.(:bad_not_found)
+      {:error, status} -> result.(status)
+    end
+  end
 
   defp refresh(session, sub, item, space) do
     case Subscriptions.refresh(session, sub, item, Conditions.refresh(space), space) do

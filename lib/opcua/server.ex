@@ -90,6 +90,7 @@ defmodule OPCUA.Server do
   require Logger
 
   alias OPCUA.{DataValue, LocalizedText, NodeId, NodeIds, QualifiedName, Transport, Variant}
+  alias OPCUA.PubSub.SKS
   alias OPCUA.Server.{AddressSpace, Conditions, Connection, Events, Node}
   alias OPCUA.Types
 
@@ -619,6 +620,39 @@ defmodule OPCUA.Server do
   def get(%AddressSpace{} = space, node), do: AddressSpace.value(space, node_id(node))
   def get(server, node), do: get(space(server), node)
 
+  @doc """
+  Adds a security group to the server's Security Key Service (Part 14, 8.4),
+  which hands out the keys that publishers and subscribers of the group sign
+  and encrypt their PubSub messages with. They get them by calling
+  `GetSecurityKeys` on the PublishSubscribe object, over a session on a
+  `:sign_and_encrypt` endpoint, or if they're in the same VM through
+  `security_keys/2`.
+
+      OPCUA.Server.add_security_group(server, "plant", policy: :aes256_ctr,
+        key_lifetime: 600_000, users: ["pubsub"])
+
+  See `OPCUA.PubSub.SKS` for the options. The keys are random, and kept in
+  memory only: a restarted server starts with new ones, which publishers and
+  subscribers fetch again.
+  """
+  @spec add_security_group(GenServer.server(), String.t(), keyword) ::
+          :ok | {:error, :already_exists}
+  def add_security_group(server, id, opts \\ []),
+    do: SKS.add_group(GenServer.call(server, :sks), id, opts)
+
+  @doc "Removes a security group."
+  @spec remove_security_group(GenServer.server(), String.t()) :: :ok
+  def remove_security_group(server, id),
+    do: SKS.remove_group(GenServer.call(server, :sks), id)
+
+  @doc """
+  The keys of a security group, as a client gets them with `GetSecurityKeys`.
+  See `SKS.keys/5`. This is code in the VM of the server, so the
+  `:users` of the group don't apply.
+  """
+  def security_keys(server, group, starting_token \\ 0, count \\ 0),
+    do: SKS.keys(GenServer.call(server, :sks), group, starting_token, count, :local)
+
   @doc "The server's address space, to pass to `set/3` and `get/2`."
   @spec space(GenServer.server()) :: space
   def space(server), do: GenServer.call(server, :space)
@@ -652,6 +686,7 @@ defmodule OPCUA.Server do
         "urn:yaopcua:server"
 
     space = AddressSpace.new()
+    {:ok, sks} = SKS.start_link()
     security = security(opts)
     {certificate, private_key} = own_certificate(opts, security, application_uri, host)
 
@@ -675,7 +710,8 @@ defmodule OPCUA.Server do
       user_certificates: opts[:user_certificates],
       ids: :atomics.new(map_size(@ids), signed: false),
       limits: limits,
-      server: self()
+      server: self(),
+      sks: sks
     }
 
     namespaces = ["http://opcfoundation.org/UA/", application_uri]
@@ -859,6 +895,7 @@ defmodule OPCUA.Server do
   def handle_call(:port, _, state), do: {:reply, state.port, state}
   def handle_call(:endpoint_url, _, state), do: {:reply, state.config.endpoint_url, state}
   def handle_call(:space, _, state), do: {:reply, state.config.space, state}
+  def handle_call(:sks, _, state), do: {:reply, state.config.sks, state}
 
   def handle_call({:namespace, uri}, _, state) do
     case Enum.find_index(state.namespaces, &(&1 == uri)) do

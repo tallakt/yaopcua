@@ -16,13 +16,19 @@ defmodule OPCUA.PubSub.UADP do
   pairs, as each dataset message's `encoding` says. Raw fields carry no type
   on the wire, so `decode/2` needs their types per writer id.
 
-  Not handled: message security, chunked network messages, and discovery
+  A network message is signed, and its payload encrypted, by giving
+  `security: %{mode: :sign | :sign_and_encrypt, token_id: id, nonce: n, keys: keys}`
+  (see `OPCUA.PubSub.Security`). `decode/3` checks and decrypts such messages
+  with the keys of the token the message names.
+
+  Not handled: chunked network messages, security footers, and discovery
   messages.
   """
 
   import Bitwise
 
   alias OPCUA.{Binary, DecodeError}
+  alias OPCUA.PubSub.Security
 
   defmodule DataSetMessage do
     @moduledoc """
@@ -56,6 +62,7 @@ defmodule OPCUA.PubSub.UADP do
             timestamp: nil,
             picoseconds: nil,
             payload_header: true,
+            security: nil,
             messages: []
 
   @type publisher_id ::
@@ -80,7 +87,7 @@ defmodule OPCUA.PubSub.UADP do
 
     messages = Enum.map(m.messages, &encode_message/1)
 
-    [
+    header = [
       <<flags>>,
       optional(extended, fn -> extended_flags(m, publisher_type) end),
       optional(publisher_type, fn -> Binary.encode(publisher, publisher_type) end),
@@ -90,13 +97,37 @@ defmodule OPCUA.PubSub.UADP do
         [<<length(m.messages)>> | Enum.map(m.messages, &<<&1.writer_id::little-16>>)]
       end),
       optional(m.timestamp, fn -> Binary.encode(m.timestamp, :date_time) end),
-      optional(m.picoseconds, fn -> <<m.picoseconds::little-16>> end),
+      optional(m.picoseconds, fn -> <<m.picoseconds::little-16>> end)
+    ]
+
+    payload = [
       # With more than one message, their sizes come first.
       optional(payload_header and length(messages) > 1, fn ->
         Enum.map(messages, &<<IO.iodata_length(&1)::little-16>>)
       end),
       messages
     ]
+
+    protect(m.security, header, payload)
+  end
+
+  defp protect(nil, header, payload), do: [header, payload]
+
+  defp protect(%{mode: mode, token_id: token, nonce: nonce, keys: keys}, header, payload) do
+    encrypt = mode == :sign_and_encrypt
+    flags = 0x01 ||| bit(encrypt, 0x02)
+    payload = IO.iodata_to_binary(payload)
+    payload = if encrypt, do: Security.crypt(keys, nonce, payload), else: payload
+
+    body =
+      IO.iodata_to_binary([
+        header,
+        <<flags, token::little-32, byte_size(nonce)>>,
+        nonce,
+        payload
+      ])
+
+    [body, Security.sign(keys, body)]
   end
 
   defp group?(m),
@@ -104,14 +135,14 @@ defmodule OPCUA.PubSub.UADP do
 
   defp extended?(m, publisher_type) do
     publisher_type not in [nil, :byte] or m.dataset_class_id != nil or m.timestamp != nil or
-      m.picoseconds != nil
+      m.picoseconds != nil or m.security != nil
   end
 
   defp extended_flags(m, publisher_type) do
     index = Enum.find_index(@publisher_types, &(&1 == (publisher_type || :byte)))
 
-    <<index ||| bit(m.dataset_class_id, 0x08) ||| bit(m.timestamp, 0x20) |||
-        bit(m.picoseconds, 0x40)>>
+    <<index ||| bit(m.dataset_class_id, 0x08) ||| bit(m.security, 0x10) |||
+        bit(m.timestamp, 0x20) ||| bit(m.picoseconds, 0x40)>>
   end
 
   # A field that's there only when `present` is.
@@ -198,25 +229,30 @@ defmodule OPCUA.PubSub.UADP do
 
   Writer ids are only unique per publisher, so a subscriber to more than
   one publisher looks the types up by both, with a function.
+
+  `security` is what the reader requires: `nil` for plain messages, which
+  then must not be secured, or `{mode, keys}` where `mode` is `:sign` or
+  `:sign_and_encrypt` and `keys` a function of the token id returning the
+  `OPCUA.PubSub.Security` keys or nil. Only a message in exactly that mode
+  whose signature is right is decoded; the others are errors.
   """
-  @spec decode(binary, raw_types) :: {:ok, t} | {:error, :bad_decoding_error}
-  def decode(binary, raw_types \\ %{}) do
-    {:ok, take(binary, raw_types)}
+  @spec decode(binary, raw_types, nil | {Security.mode(), (non_neg_integer -> map | nil)}) ::
+          {:ok, t} | {:error, :bad_decoding_error}
+  def decode(binary, raw_types \\ %{}, security \\ nil) do
+    {:ok, take(binary, raw_types, security)}
   rescue
     DecodeError -> {:error, :bad_decoding_error}
   end
 
-  defp take(binary, raw_types) do
+  defp take(binary, raw_types, security) do
     {flags, rest} = Binary.take(binary, :byte)
     check((flags &&& 0x0F) == 1, "UADP version")
 
     {extended, rest} = if (flags &&& 0x80) != 0, do: Binary.take(rest, :byte), else: {0, rest}
     {extended2, rest} = if (extended &&& 0x80) != 0, do: Binary.take(rest, :byte), else: {0, rest}
 
-    check(
-      (extended2 &&& 0x1D) == 0 and (extended &&& 0x10) == 0,
-      "chunked, discovery or secured message"
-    )
+    check((extended2 &&& 0x1D) == 0, "chunked or discovery message")
+    check((extended &&& 0x10) != 0 == (security != nil), "message security")
 
     publisher_type = known(@publisher_types, extended &&& 0x07)
     {publisher, rest} = optional(rest, flags &&& 0x10, publisher_type)
@@ -250,15 +286,44 @@ defmodule OPCUA.PubSub.UADP do
         rest
       end
 
+    {rest, secured} = unprotect(security, binary, rest)
     messages = take_messages(rest, writer_ids, &raw_types(raw_types, m, &1))
 
     %{
       m
-      | timestamp: timestamp,
+      | security: secured,
+        timestamp: timestamp,
         picoseconds: picoseconds,
         payload_header: writer_ids != nil,
         messages: messages
     }
+  end
+
+  # Checks the security header, the signature, and decrypts the payload.
+  # `rest` starts at the security header and ends in the signature.
+  defp unprotect(nil, _binary, rest), do: {rest, nil}
+
+  defp unprotect({mode, keys}, binary, rest) do
+    {flags, rest} = Binary.take(rest, :byte)
+    {token, rest} = Binary.take(rest, :uint32)
+    {nonce_length, rest} = Binary.take(rest, :byte)
+    {nonce, rest} = bytes(rest, nonce_length)
+
+    # Bit 0 signed, 1 encrypted, 2 footer, 3 force key reset.
+    check((flags &&& 0x04) == 0, "security footer")
+    check((flags &&& 0x03) == if(mode == :sign_and_encrypt, do: 3, else: 1), "security mode")
+    check(nonce_length == Security.nonce_size(), "message nonce")
+    size = byte_size(rest) - Security.signature_size()
+    check(size >= 0, "signature")
+    keys = keys.(token) || raise DecodeError, "unknown security token #{token}"
+    {payload, signature} = bytes(rest, size)
+    signed = binary_part(binary, 0, byte_size(binary) - Security.signature_size())
+    check(Security.verify(keys, signed, signature), "signature")
+
+    payload =
+      if mode == :sign_and_encrypt, do: Security.crypt(keys, nonce, payload), else: payload
+
+    {payload, %{mode: mode, token_id: token}}
   end
 
   defp raw_types(types, _headers, writer) when is_map(types), do: types[writer]

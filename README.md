@@ -216,8 +216,9 @@ node is an error rather than an exception in the caller.
 
 What's left to the application: `:anonymous` is true by default; every user
 who logs in can read every node and write every writable variable; `trust:
-:any` lets any certificate open a channel; and PubSub has no message
-security, so anyone on the network can publish a dataset. And the limits
+:any` lets any certificate open a channel; and PubSub is in the clear
+unless given `security:` (see [PubSub](#pubsub)), so anyone on the network can
+publish a dataset. And the limits
 protect the machine, not the service: someone who takes all the connections
 keeps other clients out, though the PLC runs on.
 
@@ -255,6 +256,36 @@ fields = [{"Speed", :int16}, {"Level", :double}, {"Running", :boolean}]
 
 Messages are UADP (Part 14), checked against asyncua in both directions. See
 [What's missing](#whats-missing) for what PubSub lacks.
+
+### Encrypted PubSub
+
+Add `security:` to publishers and subscribers to sign, or sign and encrypt,
+their messages with the PubSub-Aes128-CTR or PubSub-Aes256-CTR policy of Part
+14. A subscriber drops what isn't signed (and encrypted) with the keys of its
+security group. The keys come from a Security Key Service, which the server
+runs:
+
+```elixir
+# the server that is the Security Key Service
+OPCUA.Server.add_security_group(server, "plant",
+  policy: :aes256_ctr, key_lifetime: 600_000, users: ["pubsub"])
+
+# on each PLC, publisher or subscriber alike
+security = [
+  mode: :sign_and_encrypt,           # or :sign
+  policy: :aes256_ctr,
+  sks: [url: "opc.tcp://sks:4840", group: "plant", user: {"pubsub", "secret"},
+        trust: [sks_certificate], certificate: cert, private_key: key]]
+
+OPCUA.PubSub.Publisher.start_link(url: ..., publisher_id: 42, writers: [...], security: security)
+OPCUA.PubSub.Subscriber.start_link(url: ..., readers: [...], security: security)
+```
+
+The keys are fetched with `GetSecurityKeys` over a session that is signed and
+encrypted, and fetched again as they rotate every `key_lifetime`; the service
+keeps future keys ready and past ones for late subscribers. Without a service,
+`keys: [{token_id, bytes}]` gives fixed keys, and `sks: [server: pid, ...]` an
+`OPCUA.Server` in the same VM. Nothing is sent while a publisher has no key.
 
 ## Encoding
 
@@ -396,7 +427,8 @@ out on purpose, this is what it doesn't do, by area.
 - No registration with discovery servers, and no mDNS.
 
 **PubSub**
-- Message security and the Security Key Service.
+- Security Key Service push (`SetSecurityKeys`) and SecurityGroups as nodes in
+  the address space; keys are pulled with `GetSecurityKeys`. Security footers.
 - Network messages chunked over several datagrams, discovery messages, and
   dataset metadata; promoted fields are skipped.
 - Transports other than UDP: Ethernet (TSN), MQTT, AMQP; and the JSON
@@ -517,6 +549,7 @@ rare branch.
 | ✅ | Events and alarms in the server: event filters, conditions, acknowledge, ConditionRefresh | Parts 4, 9 |
 | ✅ | Security: Basic256Sha256, Aes128_Sha256_RsaOaep and Aes256_Sha256_RsaPss, encrypted passwords and certificate logins, with OTP's `:crypto` and `:public_key` only | Parts 2, 4, 6, 7 |
 | ✅ | PubSub: UADP over UDP, unicast and multicast, key and delta frames | Part 14 |
+| ✅ | PubSub message security: PubSub-Aes128-CTR and Aes256-CTR, signed or encrypted, with a Security Key Service (`GetSecurityKeys`) and key rotation | Part 14 |
 | ✅ | Fuzzing with [StreamData](https://github.com/whatyouhide/stream_data): random and mutated bytes into the decoder, the secure channel and the server | |
 
 Out of scope on purpose: the XML and JSON encodings. Everything else not

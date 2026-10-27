@@ -26,6 +26,11 @@ defmodule OPCUA.PubSub.Subscriber do
     * `:to` - the process to send to (default the process that calls
       `start_link/1`; under a supervisor that's the supervisor, so pass it)
     * `:interface` - the local address to join multicast on (default any)
+    * `:security` - to accept only messages that are signed, or signed and
+      encrypted, by the publishers; the same options as for
+      `OPCUA.PubSub.Publisher`, whose "Security" has them. Other messages,
+      and those with a bad signature or a key the group doesn't have, are
+      dropped.
     * `:name` - to register the process
   """
 
@@ -34,7 +39,7 @@ defmodule OPCUA.PubSub.Subscriber do
   require Logger
 
   alias OPCUA.{DataValue, StatusCode, Variant}
-  alias OPCUA.PubSub.UADP
+  alias OPCUA.PubSub.{KeyStore, UADP}
 
   # At most this many datagrams wait in the mailbox. Past that the socket's
   # buffer, and then the network, drops them, so that a flood can't take the
@@ -43,13 +48,22 @@ defmodule OPCUA.PubSub.Subscriber do
 
   @doc "Starts receiving. See the module doc for the options."
   @spec start_link(keyword) :: GenServer.on_start()
-  def start_link(opts),
-    do:
-      GenServer.start_link(
-        __MODULE__,
-        Keyword.put_new(opts, :to, self()),
-        Keyword.take(opts, [:name])
-      )
+  def start_link(opts) do
+    opts =
+      case Keyword.fetch(opts, :security) do
+        {:ok, security} when is_list(security) ->
+          Keyword.put(opts, :security, KeyStore.check!(security))
+
+        _ ->
+          opts
+      end
+
+    GenServer.start_link(
+      __MODULE__,
+      Keyword.put_new(opts, :to, self()),
+      Keyword.take(opts, [:name])
+    )
+  end
 
   @impl true
   def init(opts) do
@@ -88,7 +102,16 @@ defmodule OPCUA.PubSub.Subscriber do
           }
         end
 
-      {:ok, %{socket: socket, readers: readers, to: Keyword.fetch!(opts, :to)}}
+      security = opts[:security]
+      {:ok, store} = if security, do: KeyStore.start_link(security), else: {:ok, nil}
+
+      {:ok,
+       %{
+         socket: socket,
+         readers: readers,
+         to: Keyword.fetch!(opts, :to),
+         security: security && {security[:mode], store, KeyStore.table(store)}
+       }}
     end
   end
 
@@ -112,9 +135,13 @@ defmodule OPCUA.PubSub.Subscriber do
     if index = find_reader(readers, message, writer), do: Enum.at(readers, index).types
   end
 
+  # What the decoder needs to check a message: the mode and the keys by token.
+  defp security(nil), do: nil
+  defp security({mode, store, table}), do: {mode, &KeyStore.lookup(table, store, &1)}
+
   @impl true
   def handle_info({:udp, _, _, _, data}, state) do
-    case UADP.decode(data, &raw_types(state.readers, &1, &2)) do
+    case UADP.decode(data, &raw_types(state.readers, &1, &2), security(state.security)) do
       {:ok, message} ->
         {:noreply, Enum.reduce(message.messages, state, &dataset(message, &1, &2))}
 
